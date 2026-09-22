@@ -54,6 +54,7 @@ ERROR_CODES = frozenset(
         "interrupted",
         "output_not_writable",
         "internal_error",
+        "extraction_failed",
     }
 )
 

@@ -15,6 +15,7 @@ and format selection never falls back to interactive input.
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import re
@@ -84,14 +85,33 @@ def derive_name(url: str, info: dict | None, explicit: str | None) -> str:
     return hashlib.sha1(redact_url(url).encode("utf-8")).hexdigest()[:12]
 
 
-def _safe_filename(name: str) -> str:
+def safe_filename(name: str) -> str:
     """A name safe to write to disk. `derive_name` itself must stay unsanitised (its
     result is asserted verbatim in tests) — filesystem safety is applied here, at the
-    one place the name actually reaches a path."""
+    one place the name actually reaches a path. Public (not `_`-prefixed): the download
+    task's `__init__.py` needs this same resolution to pre-check an *explicit* name for
+    a collision or an existing output before ever calling `download_one` — see its
+    module docstring."""
     try:
         return sanitize_batch(name)
     except BatchNameError:
         return hashlib.sha1(name.encode("utf-8")).hexdigest()[:12]
+
+
+def find_existing_output(batch_dir: Path, name: str) -> Path | None:
+    """The already-downloaded file for `name` in `batch_dir`, if any (any extension) —
+    this task's skip/resume check. Spec 9.4 names URL-without-query/fragment as this
+    task's item identity, but what would actually get silently re-fetched on a re-run is
+    the resolved *output name*, so that is what is checked on disk. Ignores in-progress
+    temp files: this project's own `.partial` convention (`core.paths.temp_path`) and
+    yt-dlp's own `.part` download-in-progress suffix — neither is a finished output, and
+    a glob on "<name>.*" would otherwise match both (e.g. "clip.mp4.part")."""
+    for candidate in sorted(batch_dir.glob(f"{glob.escape(name)}.*")):
+        if candidate.suffix in {".part", ".partial"}:
+            continue
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 class _YdlLogger:
@@ -178,10 +198,29 @@ def download_one(
     force: bool = False,
     index: int = 1,
     count: int = 1,
+    claimed: dict[str, tuple[int, str]] | None = None,
 ) -> Outcome:
     """Download one URL. Never raises: any yt-dlp failure becomes a failed Outcome so
-    the batch can continue with the next entry."""
+    the batch can continue with the next entry.
+
+    Skip/resume and output-collision detection both need this entry's resolved output
+    *name*, which is unavailable without extraction when it can only come from the
+    title (`entry.name` is None). When `entry.name` is explicit, the caller resolves it
+    — and checks both — before ever calling this function, so a doomed or
+    already-downloaded entry never touches the network (see `_download_all`'s
+    pre-pass). When the name is title-derived, extraction is unavoidable, so both
+    checks happen here instead, right after the title is known and before the real
+    download starts. `claimed` is the shared name→(owning entry's 1-based `index`,
+    redacted URL) registry those checks use; the caller passes the same dict across
+    every entry in a batch so "first input wins" (spec 7.1) holds across the whole run,
+    not just within one call. Ownership is keyed by *index*, not URL: two different
+    list entries can legitimately share the same source URL (e.g. the same video
+    downloaded twice under different names), and must still be told apart.
+    """
     from yt_dlp import YoutubeDL
+
+    claimed = {} if claimed is None else claimed
+    safe_url = redact_url(entry.url)
 
     logger = _YdlLogger(reporter)
     common_opts = {
@@ -217,8 +256,39 @@ def download_one(
             data={"error": "no information extracted"},
         )
 
-    name = _safe_filename(derive_name(entry.url, info, entry.name))
+    name = safe_filename(derive_name(entry.url, info, entry.name))
+
+    # Output-collision check (spec 7.1: "the first input wins, every other fails with
+    # reason output_collision ... nothing is ever silently overwritten"). Only a
+    # DIFFERENT entry already owning this name is a collision — the entry that itself
+    # registered `name` (an explicit name, pre-registered by `_download_all` before
+    # this call) must not collide with its own claim.
+    owner = claimed.get(name)
+    if owner is not None and owner[0] != index:
+        return Outcome(
+            status="failed",
+            outputs=[],
+            bytes_out=None,
+            reason="output_collision",
+            data={"collides_with": owner[1]},
+        )
+    claimed.setdefault(name, (index, safe_url))
+
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Skip/resume (spec 7.1 / 9.4): a title-derived name can only be checked here,
+    # after extraction — the explicit-name case is already checked, without touching
+    # the network, by `_download_all` before this function is ever called.
+    if not force:
+        existing = find_existing_output(output_dir, name)
+        if existing is not None:
+            return Outcome(
+                status="skipped",
+                outputs=[existing],
+                bytes_out=existing.stat().st_size,
+                reason="exists",
+            )
+
     outtmpl = str(output_dir / f"{name}.%(ext)s")
 
     format_selector, format_sort = _select_format(type_, quality, format_id)

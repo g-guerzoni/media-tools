@@ -13,6 +13,7 @@ consistent contract regardless of task.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -25,12 +26,19 @@ from media_tools.core.events import (
     Reporter,
 )
 from media_tools.core.ffmpeg import ffmpeg_exe
-from media_tools.core.paths import BatchNameError, batch_hash, output_root, sanitize_batch
+from media_tools.core.paths import BatchNameError, output_root, sanitize_batch
 from media_tools.core.redact import redact_text, redact_url
 from media_tools.core.runner import Outcome
 from media_tools.core.state import BatchInUse, BatchTaskMismatch, RunState
 from media_tools.tasks.common import UsageError, add_common_flags
-from media_tools.tasks.download.ytdlp import Entry, download_one, list_formats, load_list
+from media_tools.tasks.download.ytdlp import (
+    Entry,
+    download_one,
+    find_existing_output,
+    list_formats,
+    load_list,
+    safe_filename,
+)
 
 NAME = "download"
 HELP = "Download media from a URL (yt-dlp)."
@@ -84,8 +92,10 @@ def register(subparsers):
 
 
 def run(args) -> int:
-    if args.best and args.format_id:
-        raise UsageError("--best and --format are mutually exclusive")
+    # No mutual-exclusion guard for --best + --format: the help text for --format says
+    # it "overrides --best", and `_select_format` already implements exactly that
+    # precedence (an explicit format id always wins), so raising a UsageError here would
+    # contradict the documented behaviour instead of matching it.
     if args.inputs and args.list_file:
         raise UsageError("pass URLs or --list, not both")
     if args.name and args.list_file:
@@ -131,12 +141,7 @@ def run(args) -> int:
             if args.batch
             else sanitize_batch(args.list_file.stem)
             if args.list_file
-            else batch_hash(
-                task=NAME,
-                options=options,
-                selection={},
-                inputs=[redact_url(e.url) for e in entries],
-            )
+            else _batch_hash(options=options, urls=[redact_url(e.url) for e in entries])
         )
     except BatchNameError as error:
         raise UsageError(str(error)) from error
@@ -160,6 +165,23 @@ def run(args) -> int:
     )
 
 
+def _batch_hash(*, options: dict, urls: list[str]) -> str:
+    """The default batch name when neither --batch nor --list gives one.
+
+    `core.paths.batch_hash` (used by the file tasks) resolves each input against the
+    filesystem (`Path(p).resolve()`), which for a URL string resolves against the
+    process's *current working directory* — so the same command run from two different
+    directories would land in two different batches, and a re-run from a different
+    directory would never see FIX 1's skip/resume kick in. This hashes the URLs
+    themselves instead, with the same canonical serialisation `core.paths.batch_hash`
+    uses (`sort_keys=True, separators=(",", ":")`) so it is exactly as deterministic,
+    just not filesystem-dependent.
+    """
+    payload = {"hash_v": 1, "task": NAME, "options": options, "urls": sorted(urls)}
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
+
+
 def _cell(value) -> str:
     return "-" if value in (None, "") else str(value)
 
@@ -175,22 +197,13 @@ def _list_formats(entries: list[Entry], *, ffmpeg: str, json_mode: bool, reporte
             formats = list_formats(entry.url, ffmpeg=ffmpeg, reporter=reporter)
         except Exception as error:
             exit_code = EXIT_FAILED
-            message = redact_text(str(error))
-            if json_mode:
-                print(
-                    json.dumps(
-                        {
-                            "v": 1,
-                            "type": "error",
-                            "code": "engine_error",
-                            "url": safe_url,
-                            "message": message,
-                        },
-                        ensure_ascii=False,
-                    )
-                )
-            else:
-                print(f"error: {safe_url}: {message}")
+            reporter.error(
+                code="extraction_failed",
+                message=f"could not list formats for {safe_url}: {redact_text(str(error))}",
+                hint="the source may be temporarily unavailable or unsupported; "
+                "retrying later may help",
+                retryable=True,
+            )
             continue
 
         if json_mode:
@@ -268,6 +281,39 @@ def _build_result(state: RunState, batch_dir: Path, exit_code: int) -> dict:
     }
 
 
+def _pre_register_explicit_names(
+    entries: list[Entry], claimed: dict[str, tuple[int, str]]
+) -> dict[int, str]:
+    """Collisions among entries whose name is known without touching the network — an
+    explicit `name`, from `--name` or the list file. Spec 7.1: "the first input wins,
+    every other fails with reason output_collision ... nothing is ever silently
+    overwritten." The first entry to claim a resolved name wins; every later one with
+    the same name is returned here (1-based index → the redacted URL it collides with)
+    so `_download_all` can fail it without ever calling `download_one`.
+
+    `claimed` maps name → (owning entry's 1-based index, its redacted URL); ownership
+    is keyed by index, not URL, because two different entries can legitimately share
+    the same source URL (e.g. the same video downloaded twice under different names)
+    and must still be told apart. It is mutated in place and shared with
+    `download_one`, which does the equivalent check for a title-derived name —
+    unavoidable only after extraction, so it cannot be resolved in this network-free
+    pre-pass (see `download_one`'s docstring). A title-derived entry that happens to
+    collide with a *later*-listed explicit name is not caught here — this pre-pass only
+    knows about explicit names, and the coincidence needed for that specific ordering
+    is vanishingly rare.
+    """
+    collisions: dict[int, str] = {}
+    for index, entry in enumerate(entries, start=1):
+        if not entry.name:
+            continue
+        name = safe_filename(entry.name)
+        if name in claimed:
+            collisions[index] = claimed[name][1]
+        else:
+            claimed[name] = (index, redact_url(entry.url))
+    return collisions
+
+
 def _download_all(
     entries: list[Entry],
     *,
@@ -312,6 +358,12 @@ def _download_all(
         reporter.result(**_empty_result(EXIT_DEPENDENCY))
         return EXIT_DEPENDENCY
 
+    # A shared, mutated-in-place registry: `name -> (owning entry's 1-based index, its
+    # redacted URL)`. Pre-populated now for every entry with an explicit name (FIX 4);
+    # `download_one` reads and extends it for a title-derived name.
+    claimed: dict[str, tuple[int, str]] = {}
+    collisions = _pre_register_explicit_names(entries, claimed)
+
     exit_code = EXIT_OK
     with state_cm as state:
         for entry in entries:
@@ -319,33 +371,60 @@ def _download_all(
 
         try:
             for index, entry in enumerate(entries, start=1):
-                try:
-                    outcome = download_one(
-                        entry,
-                        output_dir=batch_dir,
-                        type_=type_,
-                        quality=quality,
-                        format_id=format_id,
-                        ffmpeg=ffmpeg,
-                        reporter=reporter,
-                        force=force,
-                        index=index,
-                        count=len(entries),
-                    )
-                except Exception as error:
-                    # A single broken download must never take the rest of the batch
-                    # down with it — `download_one` already guards this internally,
-                    # this is the same belt-and-suspenders net `run_items` uses.
+                if index in collisions:
+                    # A name collision detected in the pre-pass: this entry never
+                    # touches the network at all.
                     outcome = Outcome(
                         status="failed",
                         outputs=[],
                         bytes_out=None,
-                        reason="engine_error",
-                        data={
-                            "error_type": type(error).__name__,
-                            "error_message": redact_text(str(error)),
-                        },
+                        reason="output_collision",
+                        data={"collides_with": collisions[index]},
                     )
+                elif (
+                    entry.name
+                    and not force
+                    and (existing := find_existing_output(batch_dir, safe_filename(entry.name)))
+                ):
+                    # Skip/resume for an explicit name: also resolved without touching
+                    # the network. A title-derived name can only be checked once its
+                    # name is known, which needs extraction — that case is handled
+                    # inside `download_one` instead (see its docstring).
+                    outcome = Outcome(
+                        status="skipped",
+                        outputs=[existing],
+                        bytes_out=existing.stat().st_size,
+                        reason="exists",
+                    )
+                else:
+                    try:
+                        outcome = download_one(
+                            entry,
+                            output_dir=batch_dir,
+                            type_=type_,
+                            quality=quality,
+                            format_id=format_id,
+                            ffmpeg=ffmpeg,
+                            reporter=reporter,
+                            force=force,
+                            index=index,
+                            count=len(entries),
+                            claimed=claimed,
+                        )
+                    except Exception as error:
+                        # A single broken download must never take the rest of the batch
+                        # down with it — `download_one` already guards this internally,
+                        # this is the same belt-and-suspenders net `run_items` uses.
+                        outcome = Outcome(
+                            status="failed",
+                            outputs=[],
+                            bytes_out=None,
+                            reason="engine_error",
+                            data={
+                                "error_type": type(error).__name__,
+                                "error_message": redact_text(str(error)),
+                            },
+                        )
 
                 if outcome.status == "failed":
                     exit_code = EXIT_FAILED
@@ -384,7 +463,12 @@ def _download_all(
         except KeyboardInterrupt:
             state.finish("interrupted")
             reporter.error(code="interrupted", message="interrupted by user")
-            reporter.result(**_empty_result(EXIT_INTERRUPTED))
+            # `_empty_result` is for a run that never got to own a batch (an
+            # acquisition failure above); this run does own one, with real progress
+            # already in `state` and on disk, so the final event must reflect that —
+            # exactly what `core/runner.py` does under ruling R19 — not report zero
+            # counts and a null run_file while run.json on disk says otherwise.
+            reporter.result(**_build_result(state, batch_dir, EXIT_INTERRUPTED))
             return EXIT_INTERRUPTED
 
         state.finish("done" if exit_code == EXIT_OK else "failed")
