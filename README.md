@@ -21,6 +21,13 @@ python3.13 -m venv .venv
 
 On macOS, install Python 3.13 first with Homebrew: `brew install python@3.13`.
 
+`--group dev` needs pip >= 25.1. On an older pip (a stock 3.11/3.12 venv, most often),
+install the dev tools directly instead:
+
+```bash
+.venv/bin/pip install -e . pytest ruff
+```
+
 ### pipx
 
 ```bash
@@ -200,8 +207,5 @@ media-tools convert media/lecture --to mp3 --batch lecture-mp3
   never its value.
 - **Calibre missing** — only needed by the future `ebook` command:
   `brew install --cask calibre`.
-- **Your changes under `.claude/` aren't showing up in `git status`** — a global
-  gitignore rule on some machines ignores `.claude/` entirely. Force-add them:
-  `git add -f .claude/...`.
 - Run `media-tools doctor` any time — it checks all of the above and gives an
   install/upgrade hint for anything missing.

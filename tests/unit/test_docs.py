@@ -26,4 +26,5 @@ def test_docs_have_no_local_or_personal_paths():
     for doc in DOCS:
         text = doc.read_text(encoding="utf-8")
         assert "/Users/" not in text
-        assert "Downloads/Livros" not in text
+        assert "/home/" not in text
+        assert "~/Downloads" not in text

@@ -45,6 +45,19 @@ def test_preset_change_creates_a_new_batch(make_video, tmp_path):
     assert len(batches) == 2
 
 
+def test_default_preset_and_its_explicit_crf_equivalent_share_one_batch(make_video, tmp_path):
+    """Spec 6.2's headline claim about `hash_options` returning EFFECTIVE values:
+    `--preset medium` (the default) and an explicit `--crf 28` (medium's own default
+    CRF) must resolve to the SAME batch — only the "a different preset makes a
+    different batch" half (above) was covered before this test."""
+    video = make_video(seconds=1)
+    out = tmp_path / "media"
+    _cli("compress", str(video), "-o", str(out), "-p", "medium")
+    _cli("compress", str(video), "-o", str(out), "--crf", "28")
+    batches = [p.name for p in out.iterdir() if p.is_dir()]
+    assert len(batches) == 1
+
+
 def test_crf_out_of_range_exits_2(make_video, tmp_path):
     video = make_video(seconds=1)
     result = _cli("compress", str(video), "-o", str(tmp_path / "m"), "--crf", "99")
