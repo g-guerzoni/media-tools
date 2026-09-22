@@ -51,12 +51,19 @@ def test_calibre_absence_is_a_warning_not_a_failure(tmp_path):
     assert calibre["status"] in {"ok", "warn"}
 
 
-# -- results go to stdout (R2), never a secret in either stream --------------------
+# -- results go to stdout, never a secret in either stream -------------------------
 
 
 def test_doctor_result_goes_to_stdout_in_json_mode(tmp_path):
     result = _cli("doctor", "--json", "-o", str(tmp_path))
     json.loads(result.stdout)  # a single JSON value on stdout
+
+
+def test_doctor_json_envelope_has_v_and_type(tmp_path):
+    # RULING R27: every query command emits one JSON object with {"v": 1, "type": ...}.
+    payload = json.loads(_cli("doctor", "--json", "-o", str(tmp_path)).stdout)
+    assert payload["v"] == 1
+    assert payload["type"] == "doctor"
 
 
 def test_doctor_human_table_also_goes_to_stdout(tmp_path):
@@ -224,6 +231,32 @@ def test_update_refuses_under_uv(tmp_path, monkeypatch):
 
     code = doctor_task._run_update(Args())
     assert code != 0
+
+
+def test_update_propagates_quiet_but_not_check_updates_to_the_fresh_recheck(monkeypatch):
+    # FIX 4: `doctor --update --quiet` must not suddenly print the full table for the
+    # fresh re-check; --check-updates is deliberately never propagated (the upgrade
+    # itself already answered whether anything was outdated).
+    monkeypatch.setattr(doctor_task, "_install_method", lambda: None)
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(doctor_task.subprocess, "run", fake_run)
+
+    class Args:
+        json_mode = False
+        quiet = True
+        output_dir = None
+
+    code = doctor_task._run_update(Args())
+    assert code == 0
+    fresh_call = calls[-1]  # the pip install is calls[0]; the fresh re-check is last
+    assert "--quiet" in fresh_call
+    assert "--check-updates" not in fresh_call
 
 
 @pytest.mark.network

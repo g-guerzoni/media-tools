@@ -3,9 +3,9 @@
 Checks the interpreter, the package versions, the external tools every task depends on
 (ffmpeg, Deno, Calibre), the OpenRouter key the ebook task's LLM features will need, and
 that the output root is writable. Everything it prints is a *result*, so — like
-`formats` and `status` — it goes to stdout, never stderr (R2); the progress/log stream
-convention (stderr for humans, stdout for `--json`) is for the multi-item file tasks,
-not for a one-shot report like this one.
+`formats` and `status` — it goes to stdout, never stderr: results on stdout, progress
+and logs on stderr. The progress/log stream convention (stderr for humans, stdout for
+`--json`) is for the multi-item file tasks, not for a one-shot report like this one.
 
 `doctor` must never print a secret: the OpenRouter key check reports only whether the
 variable is set, never its value.
@@ -348,7 +348,8 @@ def _install_method() -> str | None:
 
 def _print_update_result(message: str, exit_code: int, *, json_mode: bool) -> None:
     if json_mode:
-        print(json.dumps({"v": 1, "type": "result", "exit_code": exit_code, "message": message}))
+        payload = {"v": 1, "type": "doctor", "exit_code": exit_code, "message": message}
+        print(json.dumps(payload))
     else:
         print(message)
 
@@ -366,7 +367,8 @@ def _run_update(args) -> int:
     if not args.json_mode:
         print("upgrading dependencies with pip ...")
     # Always captured: in --json mode, pip's own progress text must never land on
-    # stdout next to (or instead of) the JSON result (R2).
+    # stdout next to (or instead of) the JSON result — results on stdout, progress
+    # and logs on stderr.
     proc = subprocess.run(
         [
             sys.executable,
@@ -397,10 +399,14 @@ def _run_update(args) -> int:
 
     # Re-run the checks in a fresh interpreter: importlib.metadata caches the versions
     # it read on first use, so re-checking in this same process could still report the
-    # versions from before the upgrade.
+    # versions from before the upgrade. --quiet is propagated so `doctor --update
+    # --quiet` doesn't suddenly print the full table for this half; --check-updates is
+    # deliberately NOT propagated (the upgrade itself already answered that question).
     fresh_argv = [sys.executable, "-m", "media_tools", NAME]
     if args.json_mode:
         fresh_argv.append("--json")
+    if getattr(args, "quiet", False):
+        fresh_argv.append("--quiet")
     if getattr(args, "output_dir", None):
         fresh_argv += ["-o", str(args.output_dir)]
     fresh = subprocess.run(fresh_argv, capture_output=args.json_mode, text=True)
@@ -422,7 +428,7 @@ def run(args) -> int:
     if args.json_mode:
         payload = {
             "v": 1,
-            "type": "result",
+            "type": "doctor",
             "exit_code": exit_code,
             "checks": [asdict(c) for c in checks],
         }

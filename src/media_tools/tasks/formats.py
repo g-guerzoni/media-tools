@@ -95,7 +95,8 @@ def _as_plain_table(rows: list[dict], *, header: bool) -> str:
 def run(args) -> int:
     rows = collect()
     if args.json_mode:
-        print(json.dumps(rows, ensure_ascii=False))
+        envelope = {"v": 1, "type": "formats", "formats": rows}
+        print(json.dumps(envelope, ensure_ascii=False))
     elif args.markdown:
         print(as_markdown(rows), end="")
     else:

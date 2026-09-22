@@ -47,6 +47,11 @@ def _read_one(batch_dir: Path) -> dict:
         data = json.loads(run_file.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         return {"batch": batch_dir.name, "readable": False, "error": str(error)}
+    if not isinstance(data, dict):
+        # Valid JSON (e.g. `[]`, `"hello"`, `null`, `42`) but not the object run.json
+        # is supposed to hold — just as unreadable as a parse failure, not a crash.
+        error = f"run.json did not contain a JSON object (got {type(data).__name__})"
+        return {"batch": batch_dir.name, "readable": False, "error": error}
     data["readable"] = True
     return data
 
@@ -158,7 +163,8 @@ def run(args) -> int:
             )
         payload = _single_batch_payload(_read_one(batch_dir))
         if args.json_mode:
-            print(json.dumps(payload, ensure_ascii=False))
+            envelope = {"v": 1, "type": "status", "batch": payload}
+            print(json.dumps(envelope, ensure_ascii=False))
         else:
             _print_single_human(payload, quiet=args.quiet)
         return EXIT_OK
@@ -166,7 +172,8 @@ def run(args) -> int:
     rows = [_summary_row(d) for d in read_batches(root, include_reserved=args.all)]
     rows.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
     if args.json_mode:
-        print(json.dumps(rows, ensure_ascii=False))
+        envelope = {"v": 1, "type": "status", "batches": rows}
+        print(json.dumps(envelope, ensure_ascii=False))
     else:
         _print_list_human(rows, quiet=args.quiet)
     return EXIT_OK

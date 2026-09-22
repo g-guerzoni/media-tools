@@ -19,12 +19,20 @@ def _cli(*args):
 def test_formats_json_lists_every_engine():
     result = _cli("formats", "--json")
     assert result.returncode == 0
-    rows = json.loads(result.stdout)
+    payload = json.loads(result.stdout)
+    rows = payload["formats"]
     tasks = {row["task"] for row in rows}
     assert {"compress", "convert", "split", "download"} <= tasks
     audio = next(r for r in rows if r["task"] == "convert" and r["engine"] == "audio")
     assert "mp3" in audio["outputs"]
     assert ".m4a" in audio["inputs"]
+
+
+def test_formats_json_envelope_has_v_and_type():
+    # RULING R27: every query command emits one JSON object with {"v": 1, "type": ...}.
+    payload = json.loads(_cli("formats", "--json").stdout)
+    assert payload["v"] == 1
+    assert payload["type"] == "formats"
 
 
 def test_formats_markdown_is_a_table():
@@ -44,7 +52,9 @@ def test_formats_plain_table_lists_every_task_on_stdout():
     assert result.returncode == 0
     assert "compress" in result.stdout
     assert "download" in result.stdout
-    assert result.stderr == ""  # R2: results go to stdout, not stderr
+    # Results go to stdout, progress and logs go to stderr - and formats has no
+    # progress to log, so stderr must be empty.
+    assert result.stderr == ""
 
 
 def test_collect_never_crashes_on_a_task_with_no_engines():
