@@ -55,6 +55,56 @@ def test_named_file_is_accepted_even_outside_extension_filter(tmp_path):
     assert out == [Source(path=named, root=None)]
 
 
+def test_named_file_outside_extension_filter_warns_and_is_still_processed(tmp_path):
+    """I3/R30: an explicitly named file outside -e is processed anyway, but with a
+    warning noting it does not match -e (spec 6.1)."""
+    named = _touch(tmp_path / "clip.mkv")
+    calls: list[tuple[str, str]] = []
+    out = expand_inputs(
+        [named],
+        recursive=False,
+        extensions={".mp4"},
+        accepted=ACCEPTED,
+        output_root=tmp_path / "media",
+        warn=lambda code, message: calls.append((code, message)),
+    )
+    assert out == [Source(path=named, root=None)]
+    assert len(calls) == 1
+    code, message = calls[0]
+    assert code == "extension_filter_bypassed"
+    assert "clip.mkv" in message
+    assert "-e" in message or "--extensions" in message
+
+
+def test_named_file_matching_extension_filter_does_not_warn(tmp_path):
+    named = _touch(tmp_path / "clip.mp4")
+    calls: list[tuple[str, str]] = []
+    expand_inputs(
+        [named],
+        recursive=False,
+        extensions={".mp4"},
+        accepted=ACCEPTED,
+        output_root=tmp_path / "media",
+        warn=lambda code, message: calls.append((code, message)),
+    )
+    assert calls == []
+
+
+def test_named_file_with_no_extensions_flag_given_does_not_warn(tmp_path):
+    """When -e was never given (`extensions=None`), there is nothing to "bypass"."""
+    named = _touch(tmp_path / "clip.mkv")
+    calls: list[tuple[str, str]] = []
+    expand_inputs(
+        [named],
+        recursive=False,
+        extensions=None,
+        accepted=ACCEPTED,
+        output_root=tmp_path / "media",
+        warn=lambda code, message: calls.append((code, message)),
+    )
+    assert calls == []
+
+
 def test_named_file_with_unsupported_extension_raises(tmp_path):
     named = _touch(tmp_path / "notes.txt")
     with pytest.raises(InputError):

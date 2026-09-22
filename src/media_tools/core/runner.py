@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,8 +88,11 @@ def _clear_partials(batch_dir: Path) -> None:
         stale.unlink(missing_ok=True)
 
 
-def _build_result(state: RunState, batch_dir: Path, exit_code: int) -> dict:
-    """The final `result` payload, built from whatever state holds right now."""
+def build_result(state: RunState, batch_dir: Path, exit_code: int) -> dict:
+    """The final `result` payload, built from whatever state holds right now. Public: it
+    has nothing file-task-specific in it (just `state`/`batch_dir`/`exit_code`), so
+    `download`'s own item loop — which does not use `run_items` but emits the same
+    `result` shape by hand — shares this instead of hand-syncing its own copy."""
     return {
         "ok": exit_code == EXIT_OK,
         "exit_code": exit_code,
@@ -104,9 +108,10 @@ def _build_result(state: RunState, batch_dir: Path, exit_code: int) -> dict:
     }
 
 
-def _empty_result(exit_code: int) -> dict:
+def empty_result(exit_code: int) -> dict:
     """The `result` payload for a run that never got to own a batch (a batch conflict):
-    no `run.json` was ever this run's to point at, so `run_file` stays null."""
+    no `run.json` was ever this run's to point at, so `run_file` stays null. Public for
+    the same reason as `build_result` above."""
     return {
         "ok": False,
         "exit_code": exit_code,
@@ -116,6 +121,19 @@ def _empty_result(exit_code: int) -> dict:
         "outputs": [],
         "run_file": None,
     }
+
+
+def write_summary_json(summary_json: Path | None, result: dict) -> None:
+    """`--summary-json PATH`: write the same object as the final `result` event to a
+    file, as `{"v": 1, "type": "result", ...}`. A no-op when `summary_json` is None.
+    Shared by `run_items` and `download`'s own loop so the two never drift apart."""
+    if summary_json is None:
+        return
+    payload = {"v": 1, "type": "result", **result, "run_file": str(result["run_file"])}
+    Path(summary_json).parent.mkdir(parents=True, exist_ok=True)
+    Path(summary_json).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def run_items(
@@ -151,15 +169,19 @@ def run_items(
 
     try:
         state_cm = RunState.open(
-            batch_dir, task=task, options=options, inputs=[str(s.path) for s in sources]
+            batch_dir,
+            task=task,
+            options=options,
+            inputs=[str(s.path) for s in sources],
+            force=force,
         )
     except BatchInUse as error:
         reporter.error(code="batch_in_use", message=str(error))
-        reporter.result(**_empty_result(EXIT_USAGE))
+        reporter.result(**empty_result(EXIT_USAGE))
         return EXIT_USAGE
     except BatchTaskMismatch as error:
         reporter.error(code="batch_task_mismatch", message=str(error))
-        reporter.result(**_empty_result(EXIT_USAGE))
+        reporter.result(**empty_result(EXIT_USAGE))
         return EXIT_USAGE
     except OSError as error:
         reporter.error(
@@ -167,7 +189,7 @@ def run_items(
             message=f"cannot create batch directory {batch_dir}: {error}",
             hint="pass -o/--output-dir to a writable location, or fix permissions on this one",
         )
-        reporter.result(**_empty_result(EXIT_DEPENDENCY))
+        reporter.result(**empty_result(EXIT_DEPENDENCY))
         return EXIT_DEPENDENCY
 
     ctx = Context(
@@ -179,6 +201,13 @@ def run_items(
         total_items=len(planned),
     )
     exit_code = EXIT_OK
+    # `stages` (declared in `start`) is at least [scan/plan-phase, processing-phase];
+    # emit both here since both are generic to every file task. A task with more than
+    # two declared stages (only `split`, today: scan/split/verify) gets its remaining
+    # ones emitted after the per-item loop below, in the same declared order.
+    reporter.stage(stage=stages[0], index=1, count=len(stages))
+    if len(stages) > 1:
+        reporter.stage(stage=stages[1], index=2, count=len(stages))
     with state_cm as state:
         _clear_partials(batch_dir)
         # Register every planned item up front (as "pending") so that items never reached
@@ -227,9 +256,9 @@ def run_items(
                     )
                     continue
 
-                for output in item.outputs:
-                    output.parent.mkdir(parents=True, exist_ok=True)
                 try:
+                    for output in item.outputs:
+                        output.parent.mkdir(parents=True, exist_ok=True)
                     outcome = item.engine.process(item, ctx)
                 except Exception as error:
                     # A single broken engine (a vanished source, a library crash, ...) must
@@ -244,8 +273,15 @@ def run_items(
 
                 if outcome.status == "failed":
                     for output in item.outputs:
-                        temp_path(output).unlink(missing_ok=True)
-                        output.unlink(missing_ok=True)
+                        # Best-effort: now that the mkdir above can itself be the reason
+                        # this item failed (C1), `output.parent` may not exist as a
+                        # directory at all (e.g. a mirrored subfolder that collided with
+                        # a same-named file) — unlink can then raise NotADirectoryError,
+                        # which `missing_ok` does not cover. Cleanup failing must never
+                        # mask the real failure or crash the batch.
+                        for candidate in (temp_path(output), output):
+                            with contextlib.suppress(OSError):
+                                candidate.unlink(missing_ok=True)
                     exit_code = EXIT_FAILED
                 state.update(
                     item.id,
@@ -279,19 +315,21 @@ def run_items(
             _clear_partials(batch_dir)
             state.finish("interrupted")
             reporter.error(code="interrupted", message="interrupted by user")
-            reporter.result(**_build_result(state, batch_dir, EXIT_INTERRUPTED))
+            reporter.result(**build_result(state, batch_dir, EXIT_INTERRUPTED))
             return EXIT_INTERRUPTED
+
+        # Any stage declared beyond the generic scan/processing pair above (only
+        # `split`'s "verify" today) — emitted once the per-item loop is done, in the
+        # order `start` declared it, so `split` reports it without run_items needing to
+        # know that stage's name.
+        for extra_index, stage_name in enumerate(stages[2:], start=3):
+            reporter.stage(stage=stage_name, index=extra_index, count=len(stages))
 
         state.finish("done" if exit_code == EXIT_OK else "failed")
 
-    result = _build_result(state, batch_dir, exit_code)
+    result = build_result(state, batch_dir, exit_code)
     reporter.result(**result)
-    if summary_json is not None:
-        payload = {"v": 1, "type": "result", **result, "run_file": str(result["run_file"])}
-        Path(summary_json).parent.mkdir(parents=True, exist_ok=True)
-        Path(summary_json).write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+    write_summary_json(summary_json, result)
     return exit_code
 
 
@@ -312,10 +350,21 @@ def _report_dry_run(planned: list[tuple[Item, str | None]], reporter: Reporter) 
         if problem is not None:
             exit_code = EXIT_FAILED
             failed.append({"id": item.id, "input": str(item.source), "reason": problem})
+    # Same five keys a real run's `counts` always has (an agent reading `counts.done`
+    # must not get a KeyError just because this was a dry run), plus `planned` as an
+    # extra: nothing actually ran, so `done`/`pending` are 0 and every plannable item is
+    # counted under `skipped` — matching the per-item status this loop already reports.
     reporter.result(
         ok=exit_code == EXIT_OK,
         exit_code=exit_code,
-        counts={"total": len(planned), "planned": len(planned)},
+        counts={
+            "total": len(planned),
+            "done": 0,
+            "skipped": len(planned) - len(failed),
+            "failed": len(failed),
+            "pending": 0,
+            "planned": len(planned),
+        },
         failed=failed,
         pending=[],
         outputs=[],

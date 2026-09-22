@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,6 +56,7 @@ def expand_inputs(
     include: str | None = None,
     exclude: str | None = None,
     limit: int | None = None,
+    warn: Callable[[str, str], None] | None = None,
 ) -> list[Source]:
     sources: list[Source] = []
     for given in paths:
@@ -70,6 +72,21 @@ def expand_inputs(
             if given.suffix.lower() not in accepted:
                 raise InputError(
                     f"unsupported input: {given.name} (supported: {', '.join(sorted(accepted))})"
+                )
+            # Spec 6.1/R30: -e/--extensions filters FOLDER scans only. An explicitly
+            # named file that an engine accepts is still processed even when it does not
+            # match an explicitly given -e — just with a warning, since naming a file
+            # directly is a stronger signal of intent than a folder scan's filter.
+            if (
+                extensions is not None
+                and given.suffix.lower() not in extensions
+                and warn is not None
+            ):
+                warn(
+                    "extension_filter_bypassed",
+                    f"{given} does not match -e/--extensions "
+                    f"({', '.join(sorted(extensions))}); processing it anyway because "
+                    f"it was named explicitly",
                 )
             sources.append(Source(path=given, root=None))
             continue

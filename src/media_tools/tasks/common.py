@@ -11,6 +11,18 @@ from media_tools.core.engine import missing_dependencies, select_engine
 from media_tools.core.events import EXIT_DEPENDENCY, EXIT_USAGE, Reporter
 from media_tools.core.inputs import InputError, Source, expand_inputs, parse_extensions
 from media_tools.core.paths import BatchNameError, batch_hash, output_root, sanitize_batch
+from media_tools.core.state import resolve_batch_name
+
+
+def _positive_limit(value: str) -> int:
+    """--limit's argparse `type`: 0 matches nothing (silently, if not rejected here) and
+    a negative value means `sources[:-N]`, which *drops* the last N items instead of
+    limiting anything — both are surprising enough to reject outright rather than do
+    what Python slicing happens to do with them."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"--limit must be a positive integer, got {value!r}")
+    return parsed
 
 
 class UsageError(Exception):
@@ -44,6 +56,7 @@ def add_common_flags(
     *,
     inputs_type: Callable[[str], object] = Path,
     metavar: str = "INPUT",
+    scan_flags: bool = True,
 ) -> None:
     parser.add_argument(
         "inputs",
@@ -52,16 +65,23 @@ def add_common_flags(
         metavar=metavar,
         help="URLs to process." if metavar == "URL" else "Files and/or folders to process.",
     )
-    parser.add_argument("-r", "--recursive", action="store_true", help="Scan subfolders.")
-    parser.add_argument(
-        "-e",
-        "--extensions",
-        default=None,
-        help="Comma-separated extensions to pick from folders.",
-    )
+    if scan_flags:
+        # -r/--recursive and -e/--extensions only mean something for a folder scan of
+        # local files; `download`'s inputs are URLs, so it passes scan_flags=False and
+        # never sees these two (they would otherwise show up in --help and silently do
+        # nothing, since download.run() never reads args.recursive/args.extensions).
+        parser.add_argument("-r", "--recursive", action="store_true", help="Scan subfolders.")
+        parser.add_argument(
+            "-e",
+            "--extensions",
+            default=None,
+            help="Comma-separated extensions to pick from folders.",
+        )
     parser.add_argument("--include", default=None, help="Only paths containing this text.")
     parser.add_argument("--exclude", default=None, help="Skip paths containing this text.")
-    parser.add_argument("--limit", type=int, default=None, help="Process at most N items.")
+    parser.add_argument(
+        "--limit", type=_positive_limit, default=None, help="Process at most N items (> 0)."
+    )
     parser.add_argument(
         "-o",
         "--output-dir",
@@ -110,6 +130,9 @@ def prepare(args, *, task: str, engines: list, to: str | None = None) -> Prepare
     if to is not None and not accepted:
         raise UsageError(f"nothing can produce {to!r}; run `media-tools formats`")
 
+    def warn(code: str, message: str) -> None:
+        reporter.warning(code=code, message=message)
+
     try:
         sources = expand_inputs(
             args.inputs,
@@ -120,6 +143,7 @@ def prepare(args, *, task: str, engines: list, to: str | None = None) -> Prepare
             include=args.include,
             exclude=args.exclude,
             limit=args.limit,
+            warn=warn,
         )
     except InputError as error:
         raise UsageError(str(error)) from error
@@ -156,13 +180,18 @@ def prepare(args, *, task: str, engines: list, to: str | None = None) -> Prepare
     }
     root = output_root(args.output_dir)
     try:
-        name = (
-            sanitize_batch(args.batch)
-            if args.batch
-            else batch_hash(
+        if args.batch:
+            name = sanitize_batch(args.batch)
+        else:
+            base_name = batch_hash(
                 task=task, options=options, selection=selection, inputs=list(args.inputs)
             )
-        )
+            # Spec 7.1: a generated name whose run.json belongs to a different task or
+            # options is not this run's batch to silently reuse or collide with —
+            # append -2, -3, ... until a free or matching one is found. An explicit
+            # --batch is never adjusted this way; RunState.open refuses (or, with
+            # --force, updates) it instead.
+            name = resolve_batch_name(root, base_name, task=task, options=options)
     except BatchNameError as error:
         raise UsageError(str(error)) from error
 

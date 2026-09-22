@@ -6,7 +6,7 @@ import argparse
 import sys
 
 from media_tools import __version__
-from media_tools.core.events import EXIT_USAGE, Reporter
+from media_tools.core.events import EXIT_FAILED, EXIT_USAGE, Reporter
 from media_tools.tasks import compress, convert, doctor, download, ebook, formats, split, status
 from media_tools.tasks.common import UsageError
 
@@ -65,6 +65,22 @@ def main(argv: list[str] | None = None) -> int:
         return error.exit_code
     except KeyboardInterrupt:
         return 130
+    except Exception as error:
+        # The net beneath every task-specific handler above: anything a task's own code
+        # did not anticipate (a real bug, not a usage problem) must still leave an agent
+        # driving `--json` with a `result`-shaped final line instead of a bare traceback
+        # on stderr and a silent, event-less stdout.
+        reporter = Reporter(
+            json_mode=getattr(args, "json_mode", False),
+            quiet=getattr(args, "quiet", False),
+        )
+        reporter.error(
+            code="internal_error",
+            message=f"{type(error).__name__}: {error}",
+            hint="this is a bug in media-tools",
+            retryable=False,
+        )
+        return EXIT_FAILED
 
 
 if __name__ == "__main__":

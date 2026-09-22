@@ -154,12 +154,209 @@ def test_runner_refuses_output_equal_to_input(tmp_path):
     assert src.read_bytes() == b"x"
 
 
+def test_mkdir_failure_fails_only_that_item_and_batch_continues(tmp_path):
+    """C1: `output.parent.mkdir(...)` must sit INSIDE the per-item try, not outside it —
+    otherwise a mirrored subfolder that already exists as a regular FILE raises
+    FileExistsError past the try/except, which skips this item's `result` entirely and
+    takes the rest of the batch down with it (CLAUDE.md promises: once `start` has been
+    printed, `result` is guaranteed to follow)."""
+    root = tmp_path / "in"
+    blocked_src = root / "sub" / "a.src"
+    blocked_src.parent.mkdir(parents=True)
+    blocked_src.write_bytes(b"x")
+    good_src = tmp_path / "z.src"
+    good_src.write_bytes(b"y")
+
+    batch = tmp_path / "b"
+    batch.mkdir(parents=True)
+    # "sub" exists as a FILE where the mirrored output would need a directory.
+    (batch / "sub").write_bytes(b"blocking file")
+
+    sources = [Source(path=blocked_src, root=root), Source(path=good_src, root=None)]
+    out = io.StringIO()
+    reporter = Reporter(json_mode=True, quiet=True, stdout=out, stderr=io.StringIO())
+    code = run_items(
+        sources,
+        task="fake",
+        engines=[FakeEngine()],
+        args=object(),
+        reporter=reporter,
+        batch_dir=batch,
+        stages=["process"],
+        options={},
+    )
+
+    assert code == EXIT_FAILED
+    lines = _json_lines(out)
+    assert lines[-1]["type"] == "result"
+    items = {Path(e["input"]).name: e for e in lines if e["type"] == "item"}
+    assert items["a.src"]["status"] == "failed"
+    assert items["a.src"]["reason"] == "engine_error"
+    # the batch continued: the second item, unaffected by the blocked subfolder, ran fine
+    assert items["z.src"]["status"] == "done"
+    assert (batch / "z.out").read_bytes() == b"y"
+
+
+def test_reusing_a_batch_with_different_options_is_refused_unless_forced(tmp_path):
+    """I4/R29: reusing a batch name (here, the caller's chosen name — the file tasks and
+    download both resolve an EXPLICIT --batch straight through to RunState.open with no
+    adjustment) with different options must not silently rewrite run.json's recorded
+    options out from under the files already on disk."""
+    src = tmp_path / "a.src"
+    src.write_bytes(b"x")
+    batch = tmp_path / "b"
+
+    reporter1 = Reporter(json_mode=False, quiet=True, stdout=io.StringIO(), stderr=io.StringIO())
+    assert (
+        run_items(
+            _sources(src),
+            task="fake",
+            engines=[FakeEngine()],
+            args=object(),
+            reporter=reporter1,
+            batch_dir=batch,
+            stages=["process"],
+            options={"quality": "high"},
+        )
+        == EXIT_OK
+    )
+
+    out = io.StringIO()
+    reporter2 = Reporter(json_mode=True, quiet=True, stdout=out, stderr=io.StringIO())
+    code = run_items(
+        _sources(src),
+        task="fake",
+        engines=[FakeEngine()],
+        args=object(),
+        reporter=reporter2,
+        batch_dir=batch,
+        stages=["process"],
+        options={"quality": "low"},
+    )
+    assert code == EXIT_USAGE
+    events = _json_lines(out)
+    (error,) = [e for e in events if e["type"] == "error"]
+    assert error["code"] == "batch_task_mismatch"
+    assert "high" in error["message"] and "low" in error["message"]
+    data = json.loads((batch / "run.json").read_text())
+    assert data["engine_options"] == {"quality": "high"}  # unchanged by the refused run
+
+    # --force: proceeds and updates the recorded options.
+    reporter3 = Reporter(json_mode=False, quiet=True, stdout=io.StringIO(), stderr=io.StringIO())
+    code = run_items(
+        _sources(src),
+        task="fake",
+        engines=[FakeEngine()],
+        args=object(),
+        reporter=reporter3,
+        batch_dir=batch,
+        stages=["process"],
+        options={"quality": "low"},
+        force=True,
+    )
+    assert code == EXIT_OK
+    data = json.loads((batch / "run.json").read_text())
+    assert data["engine_options"] == {"quality": "low"}
+
+
+def test_run_items_emits_a_stage_event_per_declared_stage(tmp_path):
+    """I2/R28: `stages` in `start` must not be a promise nobody keeps — run_items emits
+    one `stage` event for the scan/plan phase and one for the processing phase, in the
+    order `stages` declared, and any further declared stage (only `split`'s "verify"
+    today) once the per-item loop is done."""
+    src = tmp_path / "a.src"
+    src.write_bytes(b"x")
+    out = io.StringIO()
+    reporter = Reporter(json_mode=True, quiet=True, stdout=out, stderr=io.StringIO())
+
+    code = run_items(
+        _sources(src),
+        task="fake",
+        engines=[FakeEngine()],
+        args=object(),
+        reporter=reporter,
+        batch_dir=tmp_path / "b",
+        stages=["scan", "encode"],
+        options={},
+    )
+    assert code == EXIT_OK
+    stages = [e for e in _json_lines(out) if e["type"] == "stage"]
+    assert [(s["stage"], s["index"], s["count"]) for s in stages] == [
+        ("scan", 1, 2),
+        ("encode", 2, 2),
+    ]
+
+
+def test_run_items_emits_a_trailing_stage_for_a_three_stage_task(tmp_path):
+    src = tmp_path / "a.src"
+    src.write_bytes(b"x")
+    out = io.StringIO()
+    reporter = Reporter(json_mode=True, quiet=True, stdout=out, stderr=io.StringIO())
+
+    code = run_items(
+        _sources(src),
+        task="fake",
+        engines=[FakeEngine()],
+        args=object(),
+        reporter=reporter,
+        batch_dir=tmp_path / "b",
+        stages=["scan", "split", "verify"],
+        options={},
+    )
+    assert code == EXIT_OK
+    stages = [e for e in _json_lines(out) if e["type"] == "stage"]
+    assert [(s["stage"], s["index"], s["count"]) for s in stages] == [
+        ("scan", 1, 3),
+        ("split", 2, 3),
+        ("verify", 3, 3),
+    ]
+    # the trailing stage is reported after items finish, not before
+    item_index = next(i for i, e in enumerate(_json_lines(out)) if e["type"] == "item")
+    verify_index = next(
+        i for i, e in enumerate(_json_lines(out)) if e["type"] == "stage" and e["stage"] == "verify"
+    )
+    assert verify_index > item_index
+
+
 def test_dry_run_writes_nothing(tmp_path):
     src = tmp_path / "a.src"
     src.write_bytes(b"x")
     batch = tmp_path / "b"
     assert _run(_sources(src), batch, dry_run=True) == EXIT_OK
     assert not batch.exists()
+
+
+def test_dry_run_counts_have_the_same_keys_as_a_real_run(tmp_path):
+    """A dry run's `counts` used to be `{"total", "planned"}` while a real run's is
+    `{total, done, skipped, failed, pending}` — an agent reading `counts.done` after a
+    dry run got a KeyError. Both must carry the same five keys; `planned` may still
+    appear as an extra."""
+    good = tmp_path / "a.src"
+    bad = tmp_path / "b.other"  # no engine handles ".other": a planning failure
+    good.write_bytes(b"x")
+    bad.write_bytes(b"x")
+    out = io.StringIO()
+    reporter = Reporter(json_mode=True, quiet=True, stdout=out, stderr=io.StringIO())
+
+    code = run_items(
+        _sources(good, bad),
+        task="fake",
+        engines=[FakeEngine()],
+        args=object(),
+        reporter=reporter,
+        batch_dir=tmp_path / "b",
+        stages=["process"],
+        options={},
+        dry_run=True,
+    )
+    assert code == EXIT_FAILED
+    (result,) = [e for e in _json_lines(out) if e["type"] == "result"]
+    assert result["counts"].keys() >= {"total", "done", "skipped", "failed", "pending"}
+    assert result["counts"]["total"] == 2
+    assert result["counts"]["failed"] == 1
+    assert result["counts"]["skipped"] == 1
+    assert result["counts"]["done"] == 0
+    assert result["counts"]["pending"] == 0
 
 
 def test_temp_files_are_removed_on_failure(tmp_path):

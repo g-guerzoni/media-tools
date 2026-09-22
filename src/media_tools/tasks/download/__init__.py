@@ -28,8 +28,8 @@ from media_tools.core.events import (
 from media_tools.core.ffmpeg import ffmpeg_exe
 from media_tools.core.paths import BatchNameError, output_root, sanitize_batch
 from media_tools.core.redact import redact_text, redact_url
-from media_tools.core.runner import Outcome
-from media_tools.core.state import BatchInUse, BatchTaskMismatch, RunState
+from media_tools.core.runner import Outcome, build_result, empty_result, write_summary_json
+from media_tools.core.state import BatchInUse, BatchTaskMismatch, RunState, resolve_batch_name
 from media_tools.tasks.common import UsageError, add_common_flags
 from media_tools.tasks.download.ytdlp import (
     Entry,
@@ -47,8 +47,8 @@ ENGINES: list = []
 
 def register(subparsers):
     parser = subparsers.add_parser(NAME, help=HELP, description=HELP)
-    # Downloads take URLs, not local paths.
-    add_common_flags(parser, inputs_type=str, metavar="URL")
+    # Downloads take URLs, not local paths: no folder scan, so no -r/-e either.
+    add_common_flags(parser, inputs_type=str, metavar="URL", scan_flags=False)
     group = parser.add_argument_group("download options")
     group.add_argument(
         "--list",
@@ -136,13 +136,16 @@ def run(args) -> int:
 
     root = output_root(args.output_dir)
     try:
-        batch_name = (
-            sanitize_batch(args.batch)
-            if args.batch
-            else sanitize_batch(args.list_file.stem)
-            if args.list_file
-            else _batch_hash(options=options, urls=[redact_url(e.url) for e in entries])
-        )
+        if args.batch:
+            batch_name = sanitize_batch(args.batch)
+        elif args.list_file:
+            batch_name = sanitize_batch(args.list_file.stem)
+        else:
+            base_name = _batch_hash(options=options, urls=[redact_url(e.url) for e in entries])
+            # Same spec 7.1 rule the file tasks apply in tasks/common.py::prepare(): a
+            # generated name whose run.json belongs to a different task or options gets
+            # -2, -3, ... appended instead of being silently reused or colliding.
+            batch_name = resolve_batch_name(root, base_name, task=NAME, options=options)
     except BatchNameError as error:
         raise UsageError(str(error)) from error
     batch_dir = root / batch_name
@@ -233,7 +236,7 @@ def _dry_run(entries: list[Entry], *, batch_dir: Path, reporter: Reporter, optio
         tool=NAME,
         batch=batch_dir.name,
         output_dir=batch_dir,
-        stages=["download"],
+        stages=["resolve", "download"],
         items=len(entries),
         options=options,
     )
@@ -241,44 +244,25 @@ def _dry_run(entries: list[Entry], *, batch_dir: Path, reporter: Reporter, optio
         reporter.item(
             id=index, status="skipped", input=entry.url, outputs=[], bytes_in=None, reason=None
         )
+    # Same five keys a real run's `counts` always has, plus `planned` as an extra — see
+    # core.runner._report_dry_run's identical fix.
     reporter.result(
         ok=True,
         exit_code=EXIT_OK,
-        counts={"total": len(entries), "planned": len(entries)},
+        counts={
+            "total": len(entries),
+            "done": 0,
+            "skipped": len(entries),
+            "failed": 0,
+            "pending": 0,
+            "planned": len(entries),
+        },
         failed=[],
         pending=[],
         outputs=[],
         run_file=None,
     )
     return EXIT_OK
-
-
-def _empty_result(exit_code: int) -> dict:
-    return {
-        "ok": False,
-        "exit_code": exit_code,
-        "counts": {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0},
-        "failed": [],
-        "pending": [],
-        "outputs": [],
-        "run_file": None,
-    }
-
-
-def _build_result(state: RunState, batch_dir: Path, exit_code: int) -> dict:
-    return {
-        "ok": exit_code == EXIT_OK,
-        "exit_code": exit_code,
-        "counts": state.counts(),
-        "failed": [
-            {"id": i["id"], "input": i["input"], "reason": i["reason"]}
-            for i in state.data["items"]
-            if i["status"] == "failed"
-        ],
-        "pending": [i["input"] for i in state.data["items"] if i["status"] == "pending"],
-        "outputs": [str(batch_dir / o["path"]) for i in state.data["items"] for o in i["outputs"]],
-        "run_file": state.path,
-    }
 
 
 def _pre_register_explicit_names(
@@ -298,9 +282,13 @@ def _pre_register_explicit_names(
     `download_one`, which does the equivalent check for a title-derived name —
     unavoidable only after extraction, so it cannot be resolved in this network-free
     pre-pass (see `download_one`'s docstring). A title-derived entry that happens to
-    collide with a *later*-listed explicit name is not caught here — this pre-pass only
-    knows about explicit names, and the coincidence needed for that specific ordering
-    is vanishingly rare.
+    collide with a *later*-listed explicit name IS still caught — just not here, and
+    not in the earlier entry's favour: because this pre-pass claims every explicit name
+    up front regardless of list position, `download_one` sees the name already owned by
+    the later entry once the earlier, title-derived one finishes extraction, and rejects
+    that EARLIER entry as `output_collision` instead. That inverts "first input wins"
+    for this one ordering. The coincidence needed for it is vanishingly rare, so this is
+    left as is rather than reworked to always favour list order.
     """
     collisions: dict[int, str] = {}
     for index, entry in enumerate(entries, start=1):
@@ -328,26 +316,31 @@ def _download_all(
     stop_on_error: bool,
     summary_json: Path | None,
 ) -> int:
+    stages = ["resolve", "download"]
     reporter.start(
         tool=NAME,
         batch=batch_dir.name,
         output_dir=batch_dir,
-        stages=["download"],
+        stages=stages,
         items=len(entries),
         options=options,
     )
 
     try:
         state_cm = RunState.open(
-            batch_dir, task=NAME, options=options, inputs=[redact_url(e.url) for e in entries]
+            batch_dir,
+            task=NAME,
+            options=options,
+            inputs=[redact_url(e.url) for e in entries],
+            force=force,
         )
     except BatchInUse as error:
         reporter.error(code="batch_in_use", message=str(error))
-        reporter.result(**_empty_result(EXIT_USAGE))
+        reporter.result(**empty_result(EXIT_USAGE))
         return EXIT_USAGE
     except BatchTaskMismatch as error:
         reporter.error(code="batch_task_mismatch", message=str(error))
-        reporter.result(**_empty_result(EXIT_USAGE))
+        reporter.result(**empty_result(EXIT_USAGE))
         return EXIT_USAGE
     except OSError as error:
         reporter.error(
@@ -355,7 +348,7 @@ def _download_all(
             message=f"cannot create batch directory {batch_dir}: {error}",
             hint="pass -o/--output-dir to a writable location, or fix permissions on this one",
         )
-        reporter.result(**_empty_result(EXIT_DEPENDENCY))
+        reporter.result(**empty_result(EXIT_DEPENDENCY))
         return EXIT_DEPENDENCY
 
     # A shared, mutated-in-place registry: `name -> (owning entry's 1-based index, its
@@ -363,6 +356,12 @@ def _download_all(
     # `download_one` reads and extends it for a title-derived name.
     claimed: dict[str, tuple[int, str]] = {}
     collisions = _pre_register_explicit_names(entries, claimed)
+
+    # Mirrors `core.runner.run_items`: both declared stages are generic to the whole
+    # batch (`download_one` does its own per-entry resolve-then-download), so both are
+    # reported once, up front, rather than per item.
+    reporter.stage(stage=stages[0], index=1, count=len(stages))
+    reporter.stage(stage=stages[1], index=2, count=len(stages))
 
     exit_code = EXIT_OK
     with state_cm as state:
@@ -463,22 +462,17 @@ def _download_all(
         except KeyboardInterrupt:
             state.finish("interrupted")
             reporter.error(code="interrupted", message="interrupted by user")
-            # `_empty_result` is for a run that never got to own a batch (an
+            # `empty_result` is for a run that never got to own a batch (an
             # acquisition failure above); this run does own one, with real progress
             # already in `state` and on disk, so the final event must reflect that —
             # exactly what `core/runner.py` does under ruling R19 — not report zero
             # counts and a null run_file while run.json on disk says otherwise.
-            reporter.result(**_build_result(state, batch_dir, EXIT_INTERRUPTED))
+            reporter.result(**build_result(state, batch_dir, EXIT_INTERRUPTED))
             return EXIT_INTERRUPTED
 
         state.finish("done" if exit_code == EXIT_OK else "failed")
 
-    result = _build_result(state, batch_dir, exit_code)
+    result = build_result(state, batch_dir, exit_code)
     reporter.result(**result)
-    if summary_json is not None:
-        payload = {"v": 1, "type": "result", **result, "run_file": str(result["run_file"])}
-        Path(summary_json).parent.mkdir(parents=True, exist_ok=True)
-        Path(summary_json).write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+    write_summary_json(summary_json, result)
     return exit_code

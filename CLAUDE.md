@@ -87,15 +87,18 @@ the `Reporter` class (`core/events.py`) actually emits:
 | type | when | key fields |
 | --- | --- | --- |
 | `start` | once, at the beginning of a run that got past argument/input validation | `tool`, `batch`, `output_dir`, `stages` (list of names), `items` (count), `options` |
+| `stage` | once per entry in `start`'s `stages` list, in that order — a run's first two ("scan"/plan, then per-item processing) fire before any `item`; any further one (only `split`'s "verify") fires once every item is done | `stage`, `index`, `count` |
 | `progress` | zero or more times per item, while an engine is working | `stage`, `item: {index, count, path}`, `percent`, `eta_s` |
 | `item` | once per item, when it finishes | `id`, `status`, `input`, `outputs`, `bytes_in`, `bytes_out`, `reason`, `warnings` |
 | `warning` | rarely, for a warning not tied to one item | `code`, `message` |
 | `error` | on a hard failure | `code`, `message`, `hint`, `retryable` |
 | `result` | once, at the very end of a run that started | `ok`, `exit_code`, `counts`, `failed`, `pending`, `outputs`, `run_file`, `elapsed_s` |
 
-`Reporter` also defines a `stage` event type (distinct from `progress`'s `stage` field
-and from the `stages` list in `start`), but **no task currently emits it** — don't wait
-for one.
+`stage`'s own `stage` field is distinct both from `progress`'s `stage` field (which
+names the sub-step an individual item is in, e.g. `"encode"`) and from the `stages` list
+in `start` (which only declares the names up front) — `stage` events are what actually
+walks through that list as the run progresses. `--dry-run` never emits `stage` (nothing
+is actually processed, so there is no "processing phase" to announce).
 
 **Two contract details that are easy to get wrong:**
 
@@ -178,13 +181,18 @@ Item statuses (`item.status`, and `run.json`'s per-item `status`):
 reserved for the future `ebook` task and not produced by anything today; they're listed
 because the set is closed and this is the authoritative source.)
 
+`-e/--extensions` only filters a **folder** scan. A file named directly on the command
+line is still processed as long as some engine accepts it, even when its extension is
+not in an explicitly given `-e` list — with an `extension_filter_bypassed` warning
+noting the mismatch, not a silent pass-through.
+
 ### Exit codes
 
 | code | meaning |
 | --- | --- |
 | 0 | success (items with status `skipped` still count as success) |
 | 1 | at least one item failed |
-| 2 | usage error: bad flags, invalid input, nothing matched, or a batch name/task conflict |
+| 2 | usage error: bad flags, invalid input, nothing matched, or a batch name/task/options conflict |
 | 3 | missing dependency or configuration (includes the `ebook` stub) |
 | 130 | interrupted (Ctrl+C / SIGINT) |
 
@@ -240,6 +248,18 @@ by default, a deterministic 8-character hash of the task, its effective options 
 inputs (same inputs + same flags ⇒ same batch ⇒ a re-run resumes it, skipping items
 whose output already exists, unless `--force`). `.cache/` and `_kindle/` directly under
 the root are reserved; never point an input at them.
+
+**Reusing a batch name with different options is not silent.** An explicit `-b/--batch
+NAME` whose `run.json` already recorded different effective options than this run's
+(e.g. a different `--preset`) exits 2 with `batch_task_mismatch`, naming both option
+sets, instead of quietly rewriting the record to describe options that never actually
+produced the files on disk — pass `--force` to proceed anyway (this updates the
+recorded options). A corrupt or non-object `run.json` (from disk corruption, or hand
+editing — don't) gets the same treatment: `batch_task_mismatch`, not a crash. This does
+not apply to a plain re-run with the *same* options, which resumes normally. A
+**default, hash-derived** batch name is handled differently on the same collision: since
+you never chose that name yourself, it is not yours to force through or refuse —
+`-2`, `-3`, ... is appended instead until a free or matching name is found.
 
 **The editable-install fallback is keyed off the installed package's own location, not
 your current directory** (`core/paths.py:_checkout_root`, via `__file__`). If you `cd`

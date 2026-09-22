@@ -16,7 +16,11 @@ def register(subparsers):
 
 
 def run(args) -> int:
+    # "config_missing", not "dependency_missing": nothing is missing from this machine
+    # to go install — the task itself just doesn't exist yet, and "dependency_missing"
+    # would tell an agent to go find and install something for a problem no install
+    # fixes. The registry is closed, so this is the nearest honest code available.
     Reporter(json_mode=args.json_mode, quiet=args.quiet).error(
-        code="dependency_missing", message="the ebook task is not implemented yet"
+        code="config_missing", message="the ebook task is not implemented yet"
     )
     return EXIT_DEPENDENCY
