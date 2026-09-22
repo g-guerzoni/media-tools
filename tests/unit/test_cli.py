@@ -81,13 +81,17 @@ def test_convert_requires_to_and_exits_2(tmp_path):
     assert result.returncode == 2
 
 
-def test_convert_with_to_but_no_engine_reports_usage(tmp_path):
+def test_convert_with_garbage_input_fails_the_item_not_the_command(tmp_path):
+    # Since Task 11, the audio engine handles .mp3 -> mp3, so this is no longer a usage
+    # error (no engine) but a per-item failure: ffmpeg cannot decode the garbage bytes.
     named = tmp_path / "clip.mp3"
     named.write_bytes(b"x")
     result = _run(["convert", str(named), "--to", "mp3", "--json", "-o", str(tmp_path / "out")])
-    assert result.returncode == 2
+    assert result.returncode == 1
     events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
-    assert any(e["type"] == "error" and e["code"] == "usage" for e in events)
+    (item,) = [e for e in events if e["type"] == "item"]
+    assert item["status"] == "failed"
+    assert item["reason"] == "engine_error"
 
 
 @pytest.mark.parametrize("task", ["ebook", "formats", "doctor", "status"])

@@ -52,11 +52,18 @@ def make_video(tmp_path, ffmpeg_path):
     return _make
 
 
+# Every container only accepts certain audio codecs (an .mp3 muxer rejects AAC, for
+# example), so the encoder must match the fixture's own target extension rather than
+# defaulting to AAC for every name.
+_AUDIO_CODEC_FOR_SUFFIX = {".mp3": "libmp3lame", ".flac": "flac", ".wav": "pcm_s16le"}
+
+
 @pytest.fixture
 def make_audio(tmp_path, ffmpeg_path):
     def _make(seconds: int = 2, name: str = "clip.m4a"):
         target = tmp_path / name
         target.parent.mkdir(parents=True, exist_ok=True)
+        codec = _AUDIO_CODEC_FOR_SUFFIX.get(target.suffix.lower(), "aac")
         subprocess.run(
             [
                 ffmpeg_path,
@@ -68,7 +75,7 @@ def make_audio(tmp_path, ffmpeg_path):
                 "-t",
                 str(seconds),
                 "-c:a",
-                "aac",
+                codec,
                 str(target),
             ],
             check=True,
