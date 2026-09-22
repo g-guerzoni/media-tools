@@ -119,3 +119,73 @@ def test_keyboard_interrupt_in_a_task_exits_130(monkeypatch):
     compress_task = next(t for t in TASKS if t.NAME == "compress")
     monkeypatch.setattr(compress_task, "run", boom)
     assert main(["compress", "x"]) == 130
+
+
+def test_named_file_with_unsupported_extension_exits_2_with_usage(tmp_path):
+    # R21's actual path: a real file, an extension no engine accepts, and to=None
+    # (unlike --to, which short-circuits earlier; and unlike a missing path, which hits
+    # the not-found branch instead of expand_inputs's suffix rejection).
+    named = tmp_path / "notes.txt"
+    named.write_text("hi")
+    result = _run(["compress", str(named), "--json", "-o", str(tmp_path / "out")])
+    assert result.returncode == 2
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert any(e["type"] == "error" and e["code"] == "usage" for e in events)
+
+
+# -- R22: argparse's own errors (bypassing prepare/UsageError entirely) must still reach
+# stdout as a JSON `error` event when --json is present, so an agent never sees an empty
+# stdout on a usage error argparse rejects on its own (unknown subcommand, a missing
+# required flag, a bad flag type, ...). --------------------------------------------------
+
+
+def test_convert_missing_to_reports_usage_as_json_on_stdout(tmp_path):
+    named = tmp_path / "clip.mp3"
+    named.write_bytes(b"x")
+    result = _run(["convert", str(named), "--json", "-o", str(tmp_path / "out")])
+    assert result.returncode == 2
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["type"] == "error"
+    assert event["code"] == "usage"
+    assert "--to" in result.stderr
+
+
+def test_unknown_subcommand_reports_usage_as_json_on_stdout():
+    result = _run(["nope", "--json"])
+    assert result.returncode == 2
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["type"] == "error"
+    assert event["code"] == "usage"
+    assert "invalid choice" in result.stderr
+
+
+def test_bad_limit_type_reports_usage_as_json_on_stdout(tmp_path):
+    named = tmp_path / "clip.mp3"
+    named.write_bytes(b"x")
+    result = _run(["compress", str(named), "--limit", "abc", "--json", "-o", str(tmp_path / "out")])
+    assert result.returncode == 2
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["type"] == "error"
+    assert event["code"] == "usage"
+    assert "--limit" in result.stderr
+
+
+def test_argparse_usage_errors_leave_stdout_empty_without_json_flag(tmp_path):
+    named = tmp_path / "clip.mp3"
+    named.write_bytes(b"x")
+    commands = [
+        ["convert", str(named), "-o", str(tmp_path / "out")],
+        ["nope"],
+        ["compress", str(named), "--limit", "abc", "-o", str(tmp_path / "out")],
+    ]
+    for argv in commands:
+        result = _run(argv)
+        assert result.returncode == 2
+        assert result.stdout == ""
+        assert result.stderr  # argparse's usual text is still there
