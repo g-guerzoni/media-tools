@@ -1,0 +1,283 @@
+"""The per-item loop every file task shares."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from media_tools.core.engine import Engine, select_engine
+from media_tools.core.events import (
+    EXIT_FAILED,
+    EXIT_INTERRUPTED,
+    EXIT_OK,
+    EXIT_USAGE,
+    Reporter,
+)
+from media_tools.core.inputs import Source
+from media_tools.core.paths import mirror_output, temp_path
+from media_tools.core.state import BatchInUse, BatchTaskMismatch, RunState
+
+
+@dataclass
+class Item:
+    id: int
+    source: Path
+    root: Path | None
+    outputs: list[Path]
+    engine: Engine | None = None
+
+
+@dataclass
+class Context:
+    batch_dir: Path
+    reporter: Reporter
+    dry_run: bool = False
+    force: bool = False
+    deps: dict[str, Any] = field(default_factory=dict)
+    total_items: int = 0
+
+
+@dataclass
+class Outcome:
+    status: str
+    outputs: list[Path]
+    bytes_out: int | None
+    reason: str | None = None
+    warnings: list[str] | None = None
+    data: dict | None = None
+
+
+def _plan(
+    sources: list[Source], engines: list[Engine], to: str | None, args, batch_dir: Path
+) -> list[tuple[Item, str | None]]:
+    """Build items, pick each one's engine, and flag the ones that cannot run."""
+    planned: list[tuple[Item, str | None]] = []
+    claimed: dict[Path, Path] = {}
+    for index, source in enumerate(sources, start=1):
+        engine = select_engine(engines, source.path, to)
+        if engine is None:
+            planned.append(
+                (
+                    Item(id=index, source=source.path, root=source.root, outputs=[]),
+                    "unsupported_input",
+                )
+            )
+            continue
+        names = engine.output_names(source.path, args)
+        outputs = [mirror_output(source.path, source.root, batch_dir, name) for name in names]
+        item = Item(id=index, source=source.path, root=source.root, outputs=outputs, engine=engine)
+        problem = None
+        for output in outputs:
+            if output.resolve() == source.path.resolve():
+                problem = "output_equals_input"
+            elif output in claimed:
+                problem = "output_collision"
+            else:
+                claimed[output] = source.path
+        planned.append((item, problem))
+    return planned
+
+
+def _clear_partials(batch_dir: Path) -> None:
+    """Remove any leftover `.partial` temp file left by a crashed or interrupted run."""
+    for stale in batch_dir.rglob(".*.partial"):
+        stale.unlink(missing_ok=True)
+
+
+def run_items(
+    sources: list[Source],
+    *,
+    task: str,
+    engines: list[Engine],
+    to: str | None = None,
+    args: Any,
+    reporter: Reporter,
+    batch_dir: Path,
+    stages: list[str],
+    options: dict,
+    dry_run: bool = False,
+    force: bool = False,
+    stop_on_error: bool = False,
+    deps: dict[str, Any] | None = None,
+    summary_json: Path | None = None,
+) -> int:
+    """Plan every source, then process it through its engine, updating state as it goes."""
+    planned = _plan(sources, engines, to, args, batch_dir)
+    reporter.start(
+        tool=task,
+        batch=batch_dir.name,
+        output_dir=batch_dir,
+        stages=stages,
+        items=len(planned),
+        options=options,
+    )
+
+    if dry_run:
+        return _report_dry_run(planned, reporter)
+
+    try:
+        state_cm = RunState.open(
+            batch_dir, task=task, options=options, inputs=[str(s.path) for s in sources]
+        )
+    except BatchInUse as error:
+        reporter.error(code="batch_in_use", message=str(error))
+        return EXIT_USAGE
+    except BatchTaskMismatch as error:
+        reporter.error(code="batch_task_mismatch", message=str(error))
+        return EXIT_USAGE
+
+    ctx = Context(
+        batch_dir=batch_dir,
+        reporter=reporter,
+        dry_run=dry_run,
+        force=force,
+        deps=deps or {},
+        total_items=len(planned),
+    )
+    exit_code = EXIT_OK
+    with state_cm as state:
+        _clear_partials(batch_dir)
+        # Register every planned item up front (as "pending") so that items never reached
+        # because of --stop-on-error, or because Ctrl+C landed before them, stay pending
+        # in run.json instead of being missing from it.
+        for item, _ in planned:
+            state.add_item(str(item.source))
+
+        try:
+            for item, problem in planned:
+                bytes_in = item.source.stat().st_size if item.source.exists() else None
+
+                if problem is not None:
+                    state.update(item.id, status="failed", reason=problem, bytes_in=bytes_in)
+                    reporter.item(
+                        id=item.id,
+                        status="failed",
+                        input=item.source,
+                        outputs=[],
+                        bytes_in=bytes_in,
+                        reason=problem,
+                    )
+                    exit_code = EXIT_FAILED
+                    if stop_on_error:
+                        break
+                    continue
+
+                if not force and all(o.exists() for o in item.outputs):
+                    state.update(
+                        item.id,
+                        status="skipped",
+                        reason="exists",
+                        bytes_in=bytes_in,
+                        outputs=[
+                            {"path": str(o.relative_to(batch_dir)), "bytes": o.stat().st_size}
+                            for o in item.outputs
+                        ],
+                    )
+                    reporter.item(
+                        id=item.id,
+                        status="skipped",
+                        input=item.source,
+                        outputs=item.outputs,
+                        bytes_in=bytes_in,
+                        reason="exists",
+                    )
+                    continue
+
+                for output in item.outputs:
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                outcome = item.engine.process(item, ctx)
+
+                if outcome.status == "failed":
+                    for output in item.outputs:
+                        temp_path(output).unlink(missing_ok=True)
+                        output.unlink(missing_ok=True)
+                    exit_code = EXIT_FAILED
+                state.update(
+                    item.id,
+                    status=outcome.status,
+                    reason=outcome.reason,
+                    bytes_in=bytes_in,
+                    warnings=outcome.warnings or [],
+                    data=outcome.data or {},
+                    outputs=[
+                        {
+                            "path": str(Path(o).relative_to(batch_dir)),
+                            "bytes": Path(o).stat().st_size,
+                        }
+                        for o in outcome.outputs
+                        if Path(o).exists()
+                    ],
+                )
+                reporter.item(
+                    id=item.id,
+                    status=outcome.status,
+                    input=item.source,
+                    outputs=outcome.outputs,
+                    bytes_in=bytes_in,
+                    bytes_out=outcome.bytes_out,
+                    reason=outcome.reason,
+                    warnings=outcome.warnings,
+                )
+                if outcome.status == "failed" and stop_on_error:
+                    break
+        except KeyboardInterrupt:
+            _clear_partials(batch_dir)
+            state.finish("interrupted")
+            reporter.error(code="interrupted", message="interrupted by user")
+            return EXIT_INTERRUPTED
+
+        counts = state.counts()
+        state.finish("done" if exit_code == EXIT_OK else "failed")
+
+    result = {
+        "ok": exit_code == EXIT_OK,
+        "exit_code": exit_code,
+        "counts": counts,
+        "failed": [
+            {"id": i["id"], "input": i["input"], "reason": i["reason"]}
+            for i in state.data["items"]
+            if i["status"] == "failed"
+        ],
+        "pending": [i["input"] for i in state.data["items"] if i["status"] == "pending"],
+        "outputs": [str(batch_dir / o["path"]) for i in state.data["items"] for o in i["outputs"]],
+        "run_file": state.path,
+    }
+    reporter.result(**result)
+    if summary_json is not None:
+        payload = {"v": 1, "type": "result", **result, "run_file": str(result["run_file"])}
+        Path(summary_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(summary_json).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    return exit_code
+
+
+def _report_dry_run(planned: list[tuple[Item, str | None]], reporter: Reporter) -> int:
+    """--dry-run: plan and report only. Nothing is written anywhere, not even run.json."""
+    exit_code = EXIT_OK
+    failed = []
+    for item, problem in planned:
+        status = "skipped" if problem is None else "failed"
+        reporter.item(
+            id=item.id,
+            status=status,
+            input=item.source,
+            outputs=item.outputs,
+            bytes_in=None,
+            reason=problem,
+        )
+        if problem is not None:
+            exit_code = EXIT_FAILED
+            failed.append({"id": item.id, "input": str(item.source), "reason": problem})
+    reporter.result(
+        ok=exit_code == EXIT_OK,
+        exit_code=exit_code,
+        counts={"total": len(planned), "planned": len(planned)},
+        failed=failed,
+        pending=[],
+        outputs=[],
+        run_file=None,
+    )
+    return exit_code
