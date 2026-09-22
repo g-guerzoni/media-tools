@@ -2,8 +2,6 @@ import json
 import subprocess
 import sys
 
-import pytest
-
 from media_tools.cli import TASKS, main
 
 
@@ -94,9 +92,10 @@ def test_convert_with_garbage_input_fails_the_item_not_the_command(tmp_path):
     assert item["reason"] == "engine_error"
 
 
-@pytest.mark.parametrize("task", ["ebook", "formats", "doctor", "status"])
-def test_minimal_stub_tasks_report_not_implemented(task):
-    result = _run([task, "--json"])
+def test_ebook_stub_task_reports_not_implemented():
+    # ebook is the only task still a Task 8 stub; formats/doctor/status were replaced
+    # by Task 14/15 and are covered by their own test modules.
+    result = _run(["ebook", "--json"])
     assert result.returncode == 3
     events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     assert any(e["type"] == "error" and e["code"] == "dependency_missing" for e in events)
