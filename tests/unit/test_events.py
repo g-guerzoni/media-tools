@@ -125,3 +125,37 @@ def test_urls_in_json_stream_also_redacted():
     json_str = json.dumps(events)
     assert "SECRET123" not in json_str
     assert "https://host/video" in json_str
+
+
+def test_error_messages_are_redacted():
+    out, err = io.StringIO(), io.StringIO()
+    reporter = Reporter(json_mode=False, quiet=False, stdout=out, stderr=err)
+    reporter.error(
+        code="usage",
+        message="download failed: https://host/x.m3u8?sjwt=SECRET&uid=9",
+        hint="check https://host/help?token=ABC",
+    )
+
+    error_output = err.getvalue()
+    # Tokens must be stripped
+    assert "SECRET" not in error_output
+    assert "ABC" not in error_output
+    # URLs' paths must still appear
+    assert "https://host/x.m3u8" in error_output
+    assert "https://host/help" in error_output
+
+
+def test_error_written_even_when_quiet_or_json():
+    # Error should be visible even under --quiet
+    err = io.StringIO()
+    reporter = Reporter(json_mode=False, quiet=True, stderr=err)
+    reporter.error(code="usage", message="fatal error")
+    assert "fatal error" in err.getvalue()
+
+    # Error should be visible even under --json
+    out, err = io.StringIO(), io.StringIO()
+    reporter = Reporter(json_mode=True, quiet=False, stdout=out, stderr=err)
+    reporter.error(code="usage", message="fatal error")
+    assert "fatal error" in err.getvalue()
+    # JSON event also present
+    assert json.loads(out.getvalue())["type"] == "error"

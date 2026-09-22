@@ -158,7 +158,9 @@ class Reporter:
     def error(self, *, code, message, hint=None, retryable=False) -> None:
         self._check(code, ERROR_CODES, "error code")
         self._emit("error", code=code, message=message, hint=hint, retryable=retryable)
-        text = f"error: {message}" + (f"\n  hint: {hint}" if hint else "")
+        redacted_msg = redact_text(message)
+        redacted_hint = redact_text(hint) if hint else None
+        text = f"error: {redacted_msg}" + (f"\n  hint: {redacted_hint}" if redacted_hint else "")
         self.stderr.write(text + "\n")
         self.stderr.flush()
 
