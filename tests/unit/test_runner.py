@@ -1,8 +1,18 @@
 import io
 import json
+import os
 from pathlib import Path
 
-from media_tools.core.events import EXIT_FAILED, EXIT_INTERRUPTED, EXIT_OK, EXIT_USAGE, Reporter
+import pytest
+
+from media_tools.core.events import (
+    EXIT_DEPENDENCY,
+    EXIT_FAILED,
+    EXIT_INTERRUPTED,
+    EXIT_OK,
+    EXIT_USAGE,
+    Reporter,
+)
 from media_tools.core.inputs import Source
 from media_tools.core.paths import temp_path
 from media_tools.core.runner import Context, Item, Outcome, run_items
@@ -32,6 +42,21 @@ class FakeEngine:
         target = item.outputs[0]
         target.write_bytes(item.source.read_bytes())
         return Outcome(status="done", outputs=[target], bytes_out=target.stat().st_size)
+
+
+class MessyEngine(FakeEngine):
+    """Writes real leftovers at both the temp name and the final path, then fails anyway.
+
+    Unlike FakeEngine's 'bad' branch (which fails without writing anything), this proves
+    the runner's failure cleanup actually removes what was on disk, not just that the
+    assertion happens to hold when nothing was ever written."""
+
+    def process(self, item: Item, ctx: Context) -> Outcome:
+        temp = temp_path(item.outputs[0])
+        temp.parent.mkdir(parents=True, exist_ok=True)
+        temp.write_bytes(b"temp leftovers")
+        item.outputs[0].write_bytes(b"partial final output")
+        return Outcome(status="failed", outputs=[], bytes_out=None, reason="engine_error")
 
 
 def _sources(*paths: Path) -> list[Source]:
@@ -143,6 +168,23 @@ def test_temp_files_are_removed_on_failure(tmp_path):
     batch = tmp_path / "b"
     _run(_sources(bad), batch)
     assert list(batch.glob(".*.partial")) == []
+
+
+def test_failure_cleanup_removes_both_temp_and_partial_final_output(tmp_path):
+    """FakeEngine's 'bad' branch never writes anything, so test_temp_files_are_removed_on_failure
+    above would pass even if the cleanup block were deleted. MessyEngine writes real leftovers
+    at both the temp name and the final path before failing, so this one actually exercises it."""
+    src = tmp_path / "a.src"
+    src.write_bytes(b"x")
+    batch = tmp_path / "b"
+
+    code = _run(_sources(src), batch, engines=[MessyEngine()])
+
+    assert code == EXIT_FAILED
+    assert list(batch.rglob(".*.partial")) == []
+    assert not (batch / "a.out").exists()
+    data = json.loads((batch / "run.json").read_text())
+    assert data["items"][0]["status"] == "failed"
 
 
 def test_dry_run_reports_failure_for_unsupported_input(tmp_path):
@@ -310,3 +352,89 @@ def test_batch_conflict_emits_a_final_result_event_with_null_run_file(tmp_path):
     assert lines[-1]["ok"] is False
     assert lines[-1]["run_file"] is None
     assert lines[-1]["counts"]["total"] == 0
+
+
+class CrashOnFirstEngine(FakeEngine):
+    """Raises on the first item it sees, then behaves normally for the rest."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def process(self, item, ctx):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("boom")
+        return super().process(item, ctx)
+
+
+def test_engine_exception_fails_only_that_item_and_the_batch_continues(tmp_path):
+    """R20: a raised exception (a vanished source, a library crash, ...) must not kill the
+    rest of the batch, must be recorded as engine_error with the exception preserved in the
+    item's data (not its reason), and the run must still end with a final result event."""
+    first = tmp_path / "a.src"
+    second = tmp_path / "b.src"
+    first.write_bytes(b"1")
+    second.write_bytes(b"2")
+    batch = tmp_path / "b"
+    out = io.StringIO()
+    reporter = Reporter(json_mode=True, quiet=True, stdout=out, stderr=io.StringIO())
+
+    code = run_items(
+        _sources(first, second),
+        task="fake",
+        engines=[CrashOnFirstEngine()],
+        args=object(),
+        reporter=reporter,
+        batch_dir=batch,
+        stages=["process"],
+        options={},
+    )
+
+    assert code == EXIT_FAILED
+    data = json.loads((batch / "run.json").read_text())
+    items = {Path(item["input"]).name: item for item in data["items"]}
+    assert items["a.src"]["status"] == "failed"
+    assert items["a.src"]["reason"] == "engine_error"
+    assert "boom" in items["a.src"]["data"]["error_message"]
+    # the second item still ran and produced its output
+    assert items["b.src"]["status"] == "done"
+    assert (batch / "b.out").read_bytes() == b"2"
+
+    lines = _json_lines(out)
+    assert lines[-1]["type"] == "result"
+    assert lines[-1]["exit_code"] == EXIT_FAILED
+
+
+def test_unwritable_output_root_exits_with_dependency_code(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+
+    root = tmp_path / "readonly"
+    root.mkdir()
+    os.chmod(root, 0o500)
+    batch = root / "b"
+    src = tmp_path / "a.src"
+    src.write_bytes(b"x")
+    out = io.StringIO()
+    reporter = Reporter(json_mode=True, quiet=True, stdout=out, stderr=io.StringIO())
+
+    try:
+        code = run_items(
+            _sources(src),
+            task="fake",
+            engines=[FakeEngine()],
+            args=object(),
+            reporter=reporter,
+            batch_dir=batch,
+            stages=["process"],
+            options={},
+        )
+    finally:
+        os.chmod(root, 0o700)
+
+    assert code == EXIT_DEPENDENCY
+    events = _json_lines(out)
+    assert any(e["type"] == "error" and e["code"] == "output_not_writable" for e in events)
+    assert events[-1]["type"] == "result"
+    assert events[-1]["exit_code"] == EXIT_DEPENDENCY
+    assert events[-1]["run_file"] is None

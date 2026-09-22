@@ -52,6 +52,8 @@ ERROR_CODES = frozenset(
         "device_busy",
         "backup_failed",
         "interrupted",
+        "output_not_writable",
+        "internal_error",
     }
 )
 

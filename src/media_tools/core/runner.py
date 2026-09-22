@@ -9,6 +9,7 @@ from typing import Any
 
 from media_tools.core.engine import Engine, select_engine
 from media_tools.core.events import (
+    EXIT_DEPENDENCY,
     EXIT_FAILED,
     EXIT_INTERRUPTED,
     EXIT_OK,
@@ -160,6 +161,14 @@ def run_items(
         reporter.error(code="batch_task_mismatch", message=str(error))
         reporter.result(**_empty_result(EXIT_USAGE))
         return EXIT_USAGE
+    except OSError as error:
+        reporter.error(
+            code="output_not_writable",
+            message=f"cannot create batch directory {batch_dir}: {error}",
+            hint="pass -o/--output-dir to a writable location, or fix permissions on this one",
+        )
+        reporter.result(**_empty_result(EXIT_DEPENDENCY))
+        return EXIT_DEPENDENCY
 
     ctx = Context(
         batch_dir=batch_dir,
@@ -220,7 +229,18 @@ def run_items(
 
                 for output in item.outputs:
                     output.parent.mkdir(parents=True, exist_ok=True)
-                outcome = item.engine.process(item, ctx)
+                try:
+                    outcome = item.engine.process(item, ctx)
+                except Exception as error:
+                    # A single broken engine (a vanished source, a library crash, ...) must
+                    # never take the rest of the batch down with it.
+                    outcome = Outcome(
+                        status="failed",
+                        outputs=[],
+                        bytes_out=None,
+                        reason="engine_error",
+                        data={"error_type": type(error).__name__, "error_message": str(error)},
+                    )
 
                 if outcome.status == "failed":
                     for output in item.outputs:
