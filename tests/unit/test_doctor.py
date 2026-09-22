@@ -123,6 +123,29 @@ def test_unwritable_output_root_is_reported_missing(tmp_path):
         os.chmod(root, 0o700)
 
 
+def test_venv_hint_matches_the_readme_python_version(monkeypatch):
+    # README.md and .claude/settings.json both tell a human/agent to use python3.13;
+    # doctor's own hint must not disagree and say python3.11 (the *minimum* supported,
+    # not what anyone is told to actually install).
+    monkeypatch.setattr(doctor_task.sys, "prefix", "/usr")
+    monkeypatch.setattr(doctor_task.sys, "base_prefix", "/usr", raising=False)
+    check = doctor_task._venv_check()
+    assert check.status == "warn"
+    assert "python3.13" in check.hint
+    assert "python3.11" not in check.hint
+
+
+# -- deno's "found but did not run" branch must hint like its ffmpeg twin ----------
+
+
+def test_deno_found_but_not_running_carries_a_hint(monkeypatch):
+    monkeypatch.setattr(doctor_task, "_deno_exe", lambda: "/usr/local/bin/deno")
+    monkeypatch.setattr(doctor_task, "_run_version", lambda argv, **kwargs: (False, ""))
+    check = doctor_task._deno_check()
+    assert check.status == "missing"
+    assert check.hint
+
+
 # -- in-process: check_all() and its dataclass --------------------------------------
 
 

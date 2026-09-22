@@ -108,7 +108,10 @@ def _venv_check() -> Check:
         "venv",
         "warn",
         "not running inside a virtualenv",
-        hint="python3.11 -m venv .venv && .venv/bin/pip install -e . --group dev",
+        # Matches README.md's clone+venv instructions and .claude/settings.json's own
+        # hook message: python3.13 (Python >= 3.11 is only the minimum this project
+        # supports, not the version anyone is actually told to install).
+        hint="python3.13 -m venv .venv && .venv/bin/pip install -e . --group dev",
     )
 
 
@@ -173,7 +176,12 @@ def _deno_check() -> Check:
         )
     ok, detail = _run_version([exe, "--version"])
     if not ok:
-        return Check("deno-runtime", "missing", f"found at {exe} but it did not run")
+        return Check(
+            "deno-runtime",
+            "missing",
+            f"found at {exe} but it did not run",
+            hint="reinstall: pip install -e . (deno ships with yt-dlp[deno])",
+        )
     return Check("deno-runtime", "ok", detail or exe)
 
 
