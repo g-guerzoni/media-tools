@@ -14,6 +14,7 @@ from pathlib import Path
 
 from media_tools.core.ffmpeg import FFMPEG, probe, run_ffmpeg
 from media_tools.core.media_formats import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
+from media_tools.core.paths import temp_path
 from media_tools.core.runner import Context, Item, Outcome
 from media_tools.core.sizes import parse_size
 
@@ -108,8 +109,22 @@ class MediaSplitEngine:
         try:
             os.link(source, placed)
         except OSError:
-            shutil.copyfile(source, placed)
             how = "copy"
+            # os.link raises EXDEV whenever -o points at a different filesystem (an
+            # external drive, a network share — exactly where a large split's output
+            # is likely to go), making this the realistic path, not a rare fallback.
+            # Unlike the hard link, a copy is not atomic: stage it through the same
+            # `.partial` temp name and `Path.replace()` every other write in this
+            # codebase uses, so an interruption mid-copy never leaves a truncated file
+            # sitting at the real output name (which a re-run would then see as
+            # "already done" and skip forever, silently passing corruption through).
+            temp = temp_path(placed)
+            try:
+                shutil.copyfile(source, temp)
+            except Exception:
+                temp.unlink(missing_ok=True)
+                raise
+            temp.replace(placed)
         return Outcome(
             status="done",
             outputs=[placed],

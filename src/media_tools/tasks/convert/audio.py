@@ -27,7 +27,7 @@ class AudioEngine:
         )
 
     def hash_options(self, args) -> dict:
-        return {"bitrate": QUALITY[args.quality]}
+        return {"to": args.to, "bitrate": QUALITY[args.quality]}
 
     def output_names(self, src: Path, args) -> list[str]:
         return [f"{src.stem}.mp3"]

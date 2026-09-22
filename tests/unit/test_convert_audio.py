@@ -49,9 +49,18 @@ def test_inputs_accept_both_video_and_audio_extensions():
 
 
 def test_hash_options_maps_quality_to_bitrate():
-    assert AudioEngine().hash_options(_args(quality="low")) == {"bitrate": "96k"}
-    assert AudioEngine().hash_options(_args(quality="medium")) == {"bitrate": "192k"}
-    assert AudioEngine().hash_options(_args(quality="high")) == {"bitrate": QUALITY["high"]}
+    assert AudioEngine().hash_options(_args(quality="low")) == {"to": "mp3", "bitrate": "96k"}
+    assert AudioEngine().hash_options(_args(quality="medium")) == {"to": "mp3", "bitrate": "192k"}
+    assert AudioEngine().hash_options(_args(quality="high")) == {
+        "to": "mp3",
+        "bitrate": QUALITY["high"],
+    }
+
+
+def test_hash_options_includes_the_target_format_so_a_future_second_target_gets_its_own_batch():
+    # The batch name is derived from these options; without "to", converting the same
+    # input to two different formats at the same bitrate would collide on one batch.
+    assert AudioEngine().hash_options(_args(to="mp3")) == {"to": "mp3", "bitrate": "320k"}
 
 
 def test_output_names_replaces_extension_with_mp3():

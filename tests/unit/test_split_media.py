@@ -84,6 +84,8 @@ def test_under_limit_file_is_hard_linked_into_the_batch(tmp_path, monkeypatch):
 
 
 def test_under_limit_file_falls_back_to_copy_when_link_fails(tmp_path, monkeypatch):
+    # os.link raises EXDEV whenever -o points at a different filesystem (an external
+    # drive, a network share) — the realistic path, not a rare fallback.
     engine = MediaSplitEngine()
     item = _item(tmp_path, source_size=100)
     ctx = _context(tmp_path, max_bytes=1_000_000)
@@ -103,6 +105,41 @@ def test_under_limit_file_falls_back_to_copy_when_link_fails(tmp_path, monkeypat
     assert outcome.reason == "under_limit"
     assert outcome.data == {"parts": 1, "placed": "copy"}
     assert outcome.outputs[0].read_bytes() == item.source.read_bytes()
+    assert not list((tmp_path / "out").glob(".*.partial"))
+
+
+def test_copy_failure_midway_leaves_neither_the_output_nor_a_partial(tmp_path, monkeypatch):
+    # A copy (unlike the hard link) is not atomic: an interruption partway through must
+    # not leave a truncated file at the real output name — that would be indistinguishable
+    # from a finished split on the next run and silently pass corruption through.
+    engine = MediaSplitEngine()
+    item = _item(tmp_path, source_size=100)
+    ctx = _context(tmp_path, max_bytes=1_000_000)
+
+    monkeypatch.setattr(
+        "media_tools.tasks.split.media.probe", lambda p: Probe(duration_s=1.0, bitrate_bps=None)
+    )
+    monkeypatch.setattr(
+        "media_tools.tasks.split.media.os.link",
+        lambda _src, _dst: (_ for _ in ()).throw(OSError("cross-device link")),
+    )
+
+    def half_written_then_boom(_src, dst):
+        Path(dst).write_bytes(b"partial bytes")
+        raise OSError("disk full")
+
+    monkeypatch.setattr("media_tools.tasks.split.media.shutil.copyfile", half_written_then_boom)
+
+    try:
+        engine.process(item, ctx)
+        raised = False
+    except OSError:
+        raised = True
+
+    assert raised
+    out_dir = tmp_path / "out"
+    assert not (out_dir / item.source.name).exists()
+    assert not list(out_dir.glob(".*.partial"))
 
 
 def test_unreadable_file_fails_even_when_its_bytes_are_under_the_limit(tmp_path, monkeypatch):
