@@ -14,7 +14,7 @@ from pathlib import Path
 
 from media_tools.core.ffmpeg import FFMPEG, probe, run_ffmpeg
 from media_tools.core.media_formats import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
-from media_tools.core.paths import temp_path
+from media_tools.core.paths import fsync_replace, temp_path
 from media_tools.core.runner import Context, Item, Outcome
 from media_tools.core.sizes import parse_size
 
@@ -114,7 +114,7 @@ class MediaSplitEngine:
             # external drive, a network share — exactly where a large split's output
             # is likely to go), making this the realistic path, not a rare fallback.
             # Unlike the hard link, a copy is not atomic: stage it through the same
-            # `.partial` temp name and `Path.replace()` every other write in this
+            # `.partial` temp name and `fsync_replace()` every other write in this
             # codebase uses, so an interruption mid-copy never leaves a truncated file
             # sitting at the real output name (which a re-run would then see as
             # "already done" and skip forever, silently passing corruption through).
@@ -124,7 +124,7 @@ class MediaSplitEngine:
             except Exception:
                 temp.unlink(missing_ok=True)
                 raise
-            temp.replace(placed)
+            fsync_replace(temp, placed)
         return Outcome(
             status="done",
             outputs=[placed],
@@ -228,7 +228,7 @@ class MediaSplitEngine:
         finals: list[Path] = []
         for number, temp in enumerate(parts, start=1):
             final = batch_dir / f"{source.stem}.part{number:0{width}d}{source.suffix}"
-            temp.replace(final)
+            fsync_replace(temp, final)
             finals.append(final)
 
         covered = sum(durations)

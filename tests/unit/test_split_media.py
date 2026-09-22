@@ -316,6 +316,31 @@ def test_final_parts_are_zero_padded_to_the_part_count(tmp_path, monkeypatch):
     assert all(len(n.split("part")[1].split(".")[0]) == 2 for n in names)
 
 
-def test_margin_ratio_and_max_attempts_match_the_documented_contract():
-    assert MARGIN_RATIO == 0.02
-    assert MAX_ATTEMPTS == 3
+def test_first_attempts_budget_is_the_limit_shrunk_by_margin_ratio(tmp_path, monkeypatch):
+    """Replaces a tautological test that only compared the constants to their own
+    literals (still green even with the algorithm rewritten to ignore them). This
+    exercises what MARGIN_RATIO actually drives: the very first `-fs` budget handed to
+    ffmpeg for a part is `limit * (1 - MARGIN_RATIO)`, not the raw limit."""
+    engine = MediaSplitEngine()
+    item = _item(tmp_path, source_size=5_000_000)
+    limit = 1_000_000
+    ctx = _context(tmp_path, max_bytes=limit)
+
+    # A 2.0s total that a single part fully advances past, so the loop runs once.
+    monkeypatch.setattr(
+        "media_tools.tasks.split.media.probe", lambda p: Probe(duration_s=2.0, bitrate_bps=None)
+    )
+
+    budgets_seen = []
+
+    def fake_run_ffmpeg(argv, *, total_s=None, on_progress=None):
+        budgets_seen.append(int(argv[argv.index("-fs") + 1]))
+        Path(argv[-1]).write_bytes(b"y" * 500_000)
+        return 0, ""
+
+    monkeypatch.setattr("media_tools.tasks.split.media.run_ffmpeg", fake_run_ffmpeg)
+
+    outcome = engine.process(item, ctx)
+
+    assert outcome.status == "done"
+    assert budgets_seen == [int(limit * (1 - MARGIN_RATIO))]

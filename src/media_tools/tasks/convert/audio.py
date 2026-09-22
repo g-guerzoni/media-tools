@@ -6,7 +6,7 @@ from pathlib import Path
 
 from media_tools.core.ffmpeg import FFMPEG, probe, run_ffmpeg
 from media_tools.core.media_formats import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
-from media_tools.core.paths import temp_path
+from media_tools.core.paths import fsync_replace, temp_path
 from media_tools.core.runner import Context, Item, Outcome
 
 QUALITY = {"low": "96k", "medium": "192k", "high": "320k"}
@@ -70,5 +70,5 @@ class AudioEngine:
                 reason="engine_error",
                 data={"stderr": stderr},
             )
-        temp.replace(target)
+        fsync_replace(temp, target)
         return Outcome(status="done", outputs=[target], bytes_out=target.stat().st_size)

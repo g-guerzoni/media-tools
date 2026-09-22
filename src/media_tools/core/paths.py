@@ -85,6 +85,20 @@ def temp_path(final: Path) -> Path:
     return final.parent / f".{final.name}.partial"
 
 
+def fsync_replace(temp: Path, target: Path) -> None:
+    """`temp.replace(target)`, but `fsync`ed first (spec 7.1/7.5: "partial outputs never
+    count as done", via "temp + fsync + rename"). A bare `Path.replace()` only renames —
+    the directory entry can land on disk before the file's own content does, so a power
+    loss between an engine finishing and the rename leaves a truncated file sitting at
+    the FINAL name, which a later run then skips as already `exists` instead of redoing
+    it. `core.state.RunState._write` already does this for `run.json`; every engine that
+    writes a final output through a temp name must go through this, not a bare
+    `.replace()`, for the same guarantee."""
+    with open(temp, "rb") as handle:
+        os.fsync(handle.fileno())
+    temp.replace(target)
+
+
 def truncate_name(name: str, limit: int) -> str:
     if len(name) <= limit:
         return name

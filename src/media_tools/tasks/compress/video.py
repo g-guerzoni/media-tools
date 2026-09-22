@@ -6,7 +6,7 @@ from pathlib import Path
 
 from media_tools.core.ffmpeg import FFMPEG, probe, run_ffmpeg
 from media_tools.core.media_formats import VIDEO_EXTENSIONS
-from media_tools.core.paths import temp_path
+from media_tools.core.paths import fsync_replace, temp_path
 from media_tools.core.runner import Context, Item, Outcome
 
 PRESETS = {
@@ -105,7 +105,7 @@ class VideoEngine:
                 data={"stderr": stderr},
             )
 
-        temp.replace(target)
+        fsync_replace(temp, target)
         size_in = item.source.stat().st_size
         size_out = target.stat().st_size
         warnings = ["no_gain"] if size_out >= size_in else []

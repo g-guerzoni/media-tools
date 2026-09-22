@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -5,6 +6,7 @@ import pytest
 from media_tools.core.paths import (
     BatchNameError,
     batch_hash,
+    fsync_replace,
     mirror_output,
     output_root,
     sanitize_batch,
@@ -110,6 +112,39 @@ def test_mirror_output_flattens_named_files(tmp_path):
 
 def test_temp_path_keeps_extension_before_partial(tmp_path):
     assert temp_path(tmp_path / "a.mp4").name == ".a.mp4.partial"
+
+
+def test_fsync_replace_moves_content_to_the_final_name(tmp_path):
+    temp = tmp_path / ".a.mp4.partial"
+    target = tmp_path / "a.mp4"
+    temp.write_bytes(b"hello")
+    fsync_replace(temp, target)
+    assert not temp.exists()
+    assert target.read_bytes() == b"hello"
+
+
+def test_fsync_replace_fsyncs_before_renaming(tmp_path, monkeypatch):
+    temp = tmp_path / ".a.mp4.partial"
+    target = tmp_path / "a.mp4"
+    temp.write_bytes(b"hello")
+
+    calls: list[str] = []
+    real_fsync = os.fsync
+    real_replace = Path.replace
+
+    def spy_fsync(fd):
+        calls.append("fsync")
+        return real_fsync(fd)
+
+    def spy_replace(self, other):
+        calls.append("replace")
+        return real_replace(self, other)
+
+    monkeypatch.setattr("media_tools.core.paths.os.fsync", spy_fsync)
+    monkeypatch.setattr(Path, "replace", spy_replace)
+
+    fsync_replace(temp, target)
+    assert calls == ["fsync", "replace"]
 
 
 def test_truncate_name_preserves_extension_and_marks_hash():
