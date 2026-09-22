@@ -10,7 +10,14 @@ def redact_url(value: str) -> str:
     if "://" not in value:
         return value
     parts = urlsplit(value)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    # Rebuild netloc from hostname (+ port) rather than reusing `parts.netloc` verbatim:
+    # netloc also carries any "user:password@" userinfo, which a bare scheme+netloc+path
+    # would let straight through even though the query string right next to it gets
+    # stripped a line below.
+    netloc = parts.hostname or ""
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def redact_text(text: str) -> str:
