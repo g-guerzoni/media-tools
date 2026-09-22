@@ -73,6 +73,12 @@ media-tools status <batch> --json
 media-tools doctor --json
 ```
 
+`split --max-size` units matter: `MB`/`GB` (and a bare number, e.g. `25`) are decimal
+(10^6/10^9 bytes); `MiB`/`GiB` are binary (2^20/2^30). The old script this replaces used
+binary sizing, so a part it called "25MB" was actually 26,214,400 bytes — enough to be
+rejected by a service with a real (decimal) 25 MB limit. Use `MiB`/`GiB` only when you
+actually mean binary.
+
 ### The JSON Lines event contract (file tasks and `download`)
 
 Every line is one JSON object with `"v": 1` and a `"type"`. These are the event types

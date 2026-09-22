@@ -16,9 +16,10 @@ def test_docs_embed_the_generated_formats_table():
 
 
 def test_docs_document_the_list_file_shapes():
-    readme = Path("README.md").read_text(encoding="utf-8")
-    for shape in ('["https://', '{"url"', '{"urls"'):
-        assert shape in readme
+    for doc in DOCS:
+        text = doc.read_text(encoding="utf-8")
+        for shape in ('["https://', '{"url"', '{"urls"'):
+            assert shape in text, f"{doc} is missing the {shape!r} list-file shape"
 
 
 def test_docs_have_no_local_or_personal_paths():

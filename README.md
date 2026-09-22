@@ -81,6 +81,12 @@ media-tools status
 media-tools doctor
 ```
 
+`split --max-size` units matter: `MB`/`GB` (and a bare number, e.g. `25`) are decimal
+(10^6/10^9 bytes); `MiB`/`GiB` are binary (2^20/2^30). The old script this replaces used
+binary sizing, so a part it called "25MB" was actually 26,214,400 bytes — enough to be
+rejected by a service with a real (decimal) 25 MB limit. Use `MiB`/`GiB` only when you
+actually mean binary.
+
 `media-tools ebook` is a registered stub for the next piece of work: it exits 3 with
 "the ebook task is not implemented yet" rather than pretending to do something.
 
