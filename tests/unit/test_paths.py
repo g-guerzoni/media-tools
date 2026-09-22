@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from media_tools.core.paths import (
@@ -19,8 +21,19 @@ def test_output_root_prefers_cli_then_env(tmp_path, monkeypatch):
 
 def test_output_root_falls_back_to_cwd_media(tmp_path, monkeypatch):
     monkeypatch.delenv("MEDIA_TOOLS_OUT", raising=False)
+    monkeypatch.setattr("media_tools.core.paths._checkout_root", lambda: None)
     monkeypatch.chdir(tmp_path)
     assert output_root(None) == tmp_path / "media"
+
+
+def test_output_root_uses_checkout_root_when_detected(tmp_path, monkeypatch):
+    fake_repo = tmp_path / "repo"
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    monkeypatch.delenv("MEDIA_TOOLS_OUT", raising=False)
+    monkeypatch.setattr("media_tools.core.paths._checkout_root", lambda: fake_repo)
+    monkeypatch.chdir(other_dir)
+    assert output_root(None) == fake_repo / "media"
 
 
 def test_sanitize_batch():
@@ -70,6 +83,17 @@ def test_batch_hash_ignores_key_order():
     one = batch_hash(task="t", options={"a": 1, "b": 2}, selection={}, inputs=[])
     two = batch_hash(task="t", options={"b": 2, "a": 1}, selection={}, inputs=[])
     assert one == two
+
+
+def test_batch_hash_canonical_serialization():
+    # Pins canonical serialisation; change only deliberately.
+    digest = batch_hash(
+        task="compress",
+        options={"crf": 28},
+        selection={"recursive": False},
+        inputs=[Path("/tmp/in")],
+    )
+    assert digest == "c9351634"
 
 
 def test_mirror_output_keeps_subfolders(tmp_path):

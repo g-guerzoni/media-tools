@@ -62,6 +62,11 @@ def expand_inputs(
         if not given.exists():
             raise InputError(f"input not found: {given}")
         if given.is_file():
+            if any(part in RESERVED_ROOT_ENTRIES for part in given.parts):
+                raise InputError(
+                    f"cannot use files from internal directories: {given} "
+                    f"({', '.join(RESERVED_ROOT_ENTRIES)} are reserved)"
+                )
             if given.suffix.lower() not in accepted:
                 raise InputError(
                     f"unsupported input: {given.name} (supported: {', '.join(sorted(accepted))})"
@@ -85,6 +90,7 @@ def expand_inputs(
                 continue
             sources.append(Source(path=candidate, root=given))
 
+    sources.sort(key=lambda s: str(s.path).lower())
     if include:
         needle = include.lower()
         sources = [s for s in sources if needle in str(s.path).lower()]

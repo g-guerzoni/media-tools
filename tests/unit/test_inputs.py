@@ -131,3 +131,31 @@ def test_missing_path_raises(tmp_path):
             accepted=ACCEPTED,
             output_root=tmp_path / "media",
         )
+
+
+def test_named_file_in_reserved_dir_raises(tmp_path):
+    reserved_file = _touch(tmp_path / ".cache" / "clip.mp4")
+    with pytest.raises(InputError) as exc_info:
+        expand_inputs(
+            [reserved_file],
+            recursive=False,
+            extensions=None,
+            accepted=ACCEPTED,
+            output_root=tmp_path / "media",
+        )
+    assert "internal" in str(exc_info.value).lower()
+
+
+def test_results_sorted_before_limit(tmp_path):
+    for name in ("zebra.mp4", "alpha.mp4"):
+        _touch(tmp_path / "z" / name)
+        _touch(tmp_path / "a" / name)
+    out = expand_inputs(
+        [tmp_path / "z", tmp_path / "a"],
+        recursive=False,
+        extensions=ACCEPTED,
+        accepted=ACCEPTED,
+        output_root=tmp_path / "media",
+        limit=1,
+    )
+    assert [s.path.name for s in out] == ["alpha.mp4"]

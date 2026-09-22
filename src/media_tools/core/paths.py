@@ -43,11 +43,7 @@ def output_root(cli_value: Path | None, env: Mapping[str, str] | None = None) ->
         return Path(from_env)
     repo = _checkout_root()
     if repo is not None:
-        try:
-            Path.cwd().relative_to(repo)
-            return repo / "media"
-        except ValueError:
-            pass
+        return repo / "media"
     return Path.cwd() / "media"
 
 
