@@ -30,6 +30,27 @@ def test_redact_url_leaves_a_plain_url_unchanged_in_shape():
     assert redact_url("https://cdn.example.com/v/x.m3u8") == "https://cdn.example.com/v/x.m3u8"
 
 
+def test_redact_url_keeps_ipv6_brackets_with_credentials_and_port():
+    # Residual of I1: rebuilding netloc from `.hostname` strips the brackets an IPv6
+    # literal needs to tell its own colons apart from a trailing ":port" — without them
+    # "::1" (host) + "8443" (port) reads back as a single, wrong host "::1:8443".
+    out = redact_url("https://alice:pw@[::1]:8443/path?token=x")
+    assert out == "https://[::1]:8443/path"
+    assert "alice" not in out
+    assert "pw" not in out
+
+
+def test_redact_url_keeps_ipv6_brackets_without_credentials_or_port():
+    out = redact_url("https://[2001:db8::1]/path?token=x")
+    assert out == "https://[2001:db8::1]/path"
+
+
+def test_redact_url_plain_hostname_still_unbracketed():
+    # Confirms the IPv6 fix does not affect an ordinary hostname.
+    out = redact_url("https://alice:pw@cdn.example.com:8443/path?token=x")
+    assert out == "https://cdn.example.com:8443/path"
+
+
 def test_redact_text_strips_credentials_from_an_embedded_url():
     text = "download failed: https://alice:hunter2@host/x.m3u8?sjwt=SECRET see logs"
     out = redact_text(text)

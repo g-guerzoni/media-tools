@@ -14,7 +14,13 @@ def redact_url(value: str) -> str:
     # netloc also carries any "user:password@" userinfo, which a bare scheme+netloc+path
     # would let straight through even though the query string right next to it gets
     # stripped a line below.
-    netloc = parts.hostname or ""
+    host = parts.hostname or ""
+    if ":" in host:
+        # An IPv6 literal: `.hostname` strips the brackets a URL's authority needs to
+        # tell the address's own colons apart from a trailing ":port" — put them back,
+        # or "::1" (host) + "8443" (port) reads back as the single, wrong host "::1:8443".
+        host = f"[{host}]"
+    netloc = host
     if parts.port is not None:
         netloc = f"{netloc}:{parts.port}"
     return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
