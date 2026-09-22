@@ -283,33 +283,70 @@ def run_items(
                             with contextlib.suppress(OSError):
                                 candidate.unlink(missing_ok=True)
                     exit_code = EXIT_FAILED
-                state.update(
-                    item.id,
-                    status=outcome.status,
-                    reason=outcome.reason,
-                    bytes_in=bytes_in,
-                    warnings=outcome.warnings or [],
-                    data=outcome.data or {},
-                    outputs=[
-                        {
-                            "path": str(Path(o).relative_to(batch_dir)),
-                            "bytes": Path(o).stat().st_size,
-                        }
-                        for o in outcome.outputs
-                        if Path(o).exists()
-                    ],
-                )
-                reporter.item(
-                    id=item.id,
-                    status=outcome.status,
-                    input=item.source,
-                    outputs=outcome.outputs,
-                    bytes_in=bytes_in,
-                    bytes_out=outcome.bytes_out,
-                    reason=outcome.reason,
-                    warnings=outcome.warnings,
-                )
-                if outcome.status == "failed" and stop_on_error:
+                item_failed = outcome.status == "failed"
+                try:
+                    state.update(
+                        item.id,
+                        status=outcome.status,
+                        reason=outcome.reason,
+                        bytes_in=bytes_in,
+                        warnings=outcome.warnings or [],
+                        data=outcome.data or {},
+                        outputs=[
+                            {
+                                "path": str(Path(o).relative_to(batch_dir)),
+                                "bytes": Path(o).stat().st_size,
+                            }
+                            for o in outcome.outputs
+                            if Path(o).exists()
+                        ],
+                    )
+                    reporter.item(
+                        id=item.id,
+                        status=outcome.status,
+                        input=item.source,
+                        outputs=outcome.outputs,
+                        bytes_in=bytes_in,
+                        bytes_out=outcome.bytes_out,
+                        reason=outcome.reason,
+                        warnings=outcome.warnings,
+                    )
+                except Exception as error:
+                    # The engine's own Outcome was malformed (a status/reason/warning
+                    # code outside the closed registry `Reporter` enforces, or an output
+                    # path this item's bookkeeping choked on) — the engine's fault just
+                    # as much as a raised exception above, and must not escape run_items
+                    # entirely: unlike an exception from `process()` itself, this one
+                    # happens after `state`/`reporter` already started describing the
+                    # item, so left uncaught it unwinds past `with state_cm as state:`
+                    # (marking the whole batch "failed" on the way out) and past
+                    # `reporter.result(...)` below, leaving `start`/`stage` printed with
+                    # no matching `result` — exactly the guarantee this module exists to
+                    # keep. Overwrite whatever the state.update() above may have already
+                    # written with an honest failure instead, and still emit a
+                    # registry-safe `item` event so no item silently vanishes from the
+                    # stream.
+                    exit_code = EXIT_FAILED
+                    item_failed = True
+                    state.update(
+                        item.id,
+                        status="failed",
+                        reason="engine_error",
+                        bytes_in=bytes_in,
+                        warnings=[],
+                        data={"error_type": type(error).__name__, "error_message": str(error)},
+                        outputs=[],
+                    )
+                    reporter.item(
+                        id=item.id,
+                        status="failed",
+                        input=item.source,
+                        outputs=[],
+                        bytes_in=bytes_in,
+                        reason="engine_error",
+                        warnings=[],
+                    )
+                if item_failed and stop_on_error:
                     break
         except KeyboardInterrupt:
             _clear_partials(batch_dir)

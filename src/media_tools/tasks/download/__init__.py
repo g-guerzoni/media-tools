@@ -431,33 +431,67 @@ def _download_all(
                 # There is no local "before" size for a URL. 0 (not None) is used so
                 # Reporter.item's "in→out" human summary — which calls format_size on
                 # bytes_in whenever bytes_out is set — never crashes on a real download.
-                state.update(
-                    index,
-                    status=outcome.status,
-                    reason=outcome.reason,
-                    bytes_in=0,
-                    warnings=outcome.warnings or [],
-                    data=outcome.data or {},
-                    outputs=[
-                        {
-                            "path": str(Path(o).relative_to(batch_dir)),
-                            "bytes": Path(o).stat().st_size,
-                        }
-                        for o in outcome.outputs
-                        if Path(o).exists()
-                    ],
-                )
-                reporter.item(
-                    id=index,
-                    status=outcome.status,
-                    input=entry.url,
-                    outputs=outcome.outputs,
-                    bytes_in=0,
-                    bytes_out=outcome.bytes_out,
-                    reason=outcome.reason,
-                    warnings=outcome.warnings,
-                )
-                if outcome.status == "failed" and stop_on_error:
+                item_failed = outcome.status == "failed"
+                try:
+                    state.update(
+                        index,
+                        status=outcome.status,
+                        reason=outcome.reason,
+                        bytes_in=0,
+                        warnings=outcome.warnings or [],
+                        data=outcome.data or {},
+                        outputs=[
+                            {
+                                "path": str(Path(o).relative_to(batch_dir)),
+                                "bytes": Path(o).stat().st_size,
+                            }
+                            for o in outcome.outputs
+                            if Path(o).exists()
+                        ],
+                    )
+                    reporter.item(
+                        id=index,
+                        status=outcome.status,
+                        input=entry.url,
+                        outputs=outcome.outputs,
+                        bytes_in=0,
+                        bytes_out=outcome.bytes_out,
+                        reason=outcome.reason,
+                        warnings=outcome.warnings,
+                    )
+                except Exception as error:
+                    # Mirrors core.runner.run_items's identical guard: the Outcome (from
+                    # download_one, or this module's own branches above) had a status/
+                    # reason/warning code outside the closed registry, or an output path
+                    # this item's bookkeeping choked on. Left uncaught this unwinds past
+                    # `with state_cm as state:` and past `reporter.result(...)` below,
+                    # breaking "once start is printed, result follows" for a `--json`
+                    # caller. Overwrite whatever the state.update() above may have
+                    # already written with an honest failure instead.
+                    exit_code = EXIT_FAILED
+                    item_failed = True
+                    state.update(
+                        index,
+                        status="failed",
+                        reason="engine_error",
+                        bytes_in=0,
+                        warnings=[],
+                        data={
+                            "error_type": type(error).__name__,
+                            "error_message": redact_text(str(error)),
+                        },
+                        outputs=[],
+                    )
+                    reporter.item(
+                        id=index,
+                        status="failed",
+                        input=entry.url,
+                        outputs=[],
+                        bytes_in=0,
+                        reason="engine_error",
+                        warnings=[],
+                    )
+                if item_failed and stop_on_error:
                     break
         except KeyboardInterrupt:
             state.finish("interrupted")

@@ -602,6 +602,75 @@ def test_engine_exception_fails_only_that_item_and_the_batch_continues(tmp_path)
     assert lines[-1]["exit_code"] == EXIT_FAILED
 
 
+class BadRegistryCodeOnFirstEngine(FakeEngine):
+    """Returns an Outcome with a `reason` outside the closed registry for the first
+    item it sees (never raises), then behaves normally for the rest."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def process(self, item, ctx):
+        self.calls += 1
+        if self.calls == 1:
+            target = item.outputs[0]
+            target.write_bytes(item.source.read_bytes())
+            return Outcome(
+                status="done",
+                outputs=[target],
+                bytes_out=target.stat().st_size,
+                reason="not_a_real_reason",
+            )
+        return super().process(item, ctx)
+
+
+def test_out_of_registry_outcome_code_fails_only_that_item_and_the_batch_continues(tmp_path):
+    """Residual of C3: `Reporter.item` raises KeyError on a status/reason/warning code
+    outside the closed registry - unlike a raised exception from `process()` itself,
+    this used to happen OUTSIDE any guarding try, so it escaped run_items entirely and
+    landed in cli.py's top-level `except Exception` net, which has no `state` to build a
+    `result` from. The stream was `[start, stage, stage, error]` with no trailing
+    `result`, contradicting CLAUDE.md's "once start is printed, result is guaranteed to
+    follow". The runner must instead catch this itself, record the item failed with
+    reason engine_error, and let the batch (and the run's normal end) continue."""
+    first = tmp_path / "a.src"
+    second = tmp_path / "b.src"
+    first.write_bytes(b"1")
+    second.write_bytes(b"2")
+    batch = tmp_path / "b"
+    out = io.StringIO()
+    reporter = Reporter(json_mode=True, quiet=True, stdout=out, stderr=io.StringIO())
+
+    code = run_items(
+        _sources(first, second),
+        task="fake",
+        engines=[BadRegistryCodeOnFirstEngine()],
+        args=object(),
+        reporter=reporter,
+        batch_dir=batch,
+        stages=["process"],
+        options={},
+    )
+
+    assert code == EXIT_FAILED
+    lines = _json_lines(out)
+    assert lines[-1]["type"] == "result"
+    assert lines[-1]["exit_code"] == EXIT_FAILED
+
+    data = json.loads((batch / "run.json").read_text())
+    items = {Path(item["input"]).name: item for item in data["items"]}
+    assert items["a.src"]["status"] == "failed"
+    assert items["a.src"]["reason"] == "engine_error"
+    # the second, well-behaved item in the same batch still completed
+    assert items["b.src"]["status"] == "done"
+    assert (batch / "b.out").read_bytes() == b"2"
+
+    # every item event on the stream used only registry-safe codes
+    item_events = [e for e in lines if e["type"] == "item"]
+    assert len(item_events) == 2
+    assert item_events[0]["status"] == "failed"
+    assert item_events[0]["reason"] == "engine_error"
+
+
 def test_unwritable_output_root_exits_with_dependency_code(tmp_path):
     if os.geteuid() == 0:
         pytest.skip("root ignores directory permissions")
