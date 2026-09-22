@@ -231,3 +231,82 @@ def test_interrupt_removes_partial_files_and_exits_130(tmp_path):
     )
     assert code == EXIT_INTERRUPTED
     assert list(batch.glob(".*.partial")) == []
+
+
+def _json_lines(buffer: io.StringIO) -> list[dict]:
+    return [json.loads(line) for line in buffer.getvalue().splitlines() if line.strip()]
+
+
+def test_interrupted_run_emits_a_final_result_event(tmp_path):
+    """Spec 7.3: `result` is always the last line, including on interruption."""
+
+    class InterruptOnSecondEngine(FakeEngine):
+        def __init__(self):
+            self.calls = 0
+
+        def process(self, item, ctx):
+            self.calls += 1
+            if self.calls == 2:
+                temp = temp_path(item.outputs[0])
+                temp.parent.mkdir(parents=True, exist_ok=True)
+                temp.write_bytes(b"partial")
+                raise KeyboardInterrupt
+            return super().process(item, ctx)
+
+    first = tmp_path / "a.src"
+    second = tmp_path / "b.src"
+    first.write_bytes(b"1")
+    second.write_bytes(b"2")
+    batch = tmp_path / "b"
+    out = io.StringIO()
+    reporter = Reporter(json_mode=True, quiet=True, stdout=out, stderr=io.StringIO())
+
+    code = run_items(
+        _sources(first, second),
+        task="fake",
+        engines=[InterruptOnSecondEngine()],
+        args=object(),
+        reporter=reporter,
+        batch_dir=batch,
+        stages=["process"],
+        options={},
+    )
+
+    assert code == EXIT_INTERRUPTED
+    lines = _json_lines(out)
+    assert lines[-1]["type"] == "result"
+    assert lines[-1]["exit_code"] == EXIT_INTERRUPTED
+    assert lines[-1]["ok"] is False
+    # the first item's work is not lost, and nothing partial is left behind
+    assert (batch / "a.out").read_bytes() == b"1"
+    assert list(batch.glob(".*.partial")) == []
+
+
+def test_batch_conflict_emits_a_final_result_event_with_null_run_file(tmp_path):
+    """Spec 7.3: `result` is always the last line, including on failure. A run that never
+    got to own the batch (another run holds it) has no run.json of its own to point at."""
+    src = tmp_path / "a.src"
+    src.write_bytes(b"x")
+    batch = tmp_path / "b"
+    out = io.StringIO()
+    reporter = Reporter(json_mode=True, quiet=True, stdout=out, stderr=io.StringIO())
+
+    with RunState.open(batch, task="fake", options={}, inputs=[]):
+        code = run_items(
+            _sources(src),
+            task="fake",
+            engines=[FakeEngine()],
+            args=object(),
+            reporter=reporter,
+            batch_dir=batch,
+            stages=["process"],
+            options={},
+        )
+
+    assert code == EXIT_USAGE
+    lines = _json_lines(out)
+    assert lines[-1]["type"] == "result"
+    assert lines[-1]["exit_code"] == EXIT_USAGE
+    assert lines[-1]["ok"] is False
+    assert lines[-1]["run_file"] is None
+    assert lines[-1]["counts"]["total"] == 0

@@ -86,6 +86,37 @@ def _clear_partials(batch_dir: Path) -> None:
         stale.unlink(missing_ok=True)
 
 
+def _build_result(state: RunState, batch_dir: Path, exit_code: int) -> dict:
+    """The final `result` payload, built from whatever state holds right now."""
+    return {
+        "ok": exit_code == EXIT_OK,
+        "exit_code": exit_code,
+        "counts": state.counts(),
+        "failed": [
+            {"id": i["id"], "input": i["input"], "reason": i["reason"]}
+            for i in state.data["items"]
+            if i["status"] == "failed"
+        ],
+        "pending": [i["input"] for i in state.data["items"] if i["status"] == "pending"],
+        "outputs": [str(batch_dir / o["path"]) for i in state.data["items"] for o in i["outputs"]],
+        "run_file": state.path,
+    }
+
+
+def _empty_result(exit_code: int) -> dict:
+    """The `result` payload for a run that never got to own a batch (a batch conflict):
+    no `run.json` was ever this run's to point at, so `run_file` stays null."""
+    return {
+        "ok": False,
+        "exit_code": exit_code,
+        "counts": {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0},
+        "failed": [],
+        "pending": [],
+        "outputs": [],
+        "run_file": None,
+    }
+
+
 def run_items(
     sources: list[Source],
     *,
@@ -123,9 +154,11 @@ def run_items(
         )
     except BatchInUse as error:
         reporter.error(code="batch_in_use", message=str(error))
+        reporter.result(**_empty_result(EXIT_USAGE))
         return EXIT_USAGE
     except BatchTaskMismatch as error:
         reporter.error(code="batch_task_mismatch", message=str(error))
+        reporter.result(**_empty_result(EXIT_USAGE))
         return EXIT_USAGE
 
     ctx = Context(
@@ -226,24 +259,12 @@ def run_items(
             _clear_partials(batch_dir)
             state.finish("interrupted")
             reporter.error(code="interrupted", message="interrupted by user")
+            reporter.result(**_build_result(state, batch_dir, EXIT_INTERRUPTED))
             return EXIT_INTERRUPTED
 
-        counts = state.counts()
         state.finish("done" if exit_code == EXIT_OK else "failed")
 
-    result = {
-        "ok": exit_code == EXIT_OK,
-        "exit_code": exit_code,
-        "counts": counts,
-        "failed": [
-            {"id": i["id"], "input": i["input"], "reason": i["reason"]}
-            for i in state.data["items"]
-            if i["status"] == "failed"
-        ],
-        "pending": [i["input"] for i in state.data["items"] if i["status"] == "pending"],
-        "outputs": [str(batch_dir / o["path"]) for i in state.data["items"] for o in i["outputs"]],
-        "run_file": state.path,
-    }
+    result = _build_result(state, batch_dir, exit_code)
     reporter.result(**result)
     if summary_json is not None:
         payload = {"v": 1, "type": "result", **result, "run_file": str(result["run_file"])}
