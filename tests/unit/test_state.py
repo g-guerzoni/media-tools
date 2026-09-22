@@ -52,3 +52,31 @@ def test_interrupted_runs_keep_pending_items(tmp_path):
     data = json.loads((tmp_path / "b" / "run.json").read_text())
     assert data["status"] == "interrupted"
     assert data["counts"]["pending"] == 1
+
+
+def test_input_urls_are_redacted_in_run_json(tmp_path):
+    with RunState.open(tmp_path / "b", task="compress", options={}, inputs=[]) as state:
+        state.add_item("https://host/v/x.m3u8?sjwt=SECRET&uid=9")
+        state.finish("done")
+    data = json.loads((tmp_path / "b" / "run.json").read_text())
+    assert "SECRET" not in json.dumps(data)
+    assert "https://host/v/x.m3u8" in data["items"][0]["input"]
+
+
+def test_finish_releases_lock_for_immediate_reopen(tmp_path):
+    state = RunState.open(tmp_path / "b", task="compress", options={}, inputs=[])
+    state.add_item("/in/a.mp4")
+    state.finish("done")
+    # Should not raise BatchInUse; lock was released by finish()
+    state2 = RunState.open(tmp_path / "b", task="compress", options={}, inputs=[])
+    state2.finish("done")
+
+
+def test_update_with_invalid_item_id_raises(tmp_path):
+    state = RunState.open(tmp_path / "b", task="compress", options={}, inputs=[])
+    state.add_item("/in/a.mp4")
+    with pytest.raises(ValueError, match="item_id must be >= 1"):
+        state.update(0, status="done")
+    # Verify no item was modified by checking data in memory
+    assert state.data["items"][0]["status"] == "pending"
+    state.finish("done")

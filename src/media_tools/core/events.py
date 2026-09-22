@@ -7,7 +7,7 @@ import sys
 import time
 from typing import Any
 
-from media_tools.core.redact import redact
+from media_tools.core.redact import redact, redact_text
 from media_tools.core.sizes import format_size
 
 EXIT_OK = 0
@@ -91,7 +91,7 @@ class Reporter:
     def _say(self, text: str) -> None:
         if self.json_mode or self.quiet:
             return
-        self.stderr.write(text + "\n")
+        self.stderr.write(redact_text(text) + "\n")
         self.stderr.flush()
 
     @staticmethod

@@ -81,3 +81,47 @@ def test_urls_are_redacted_everywhere():
     line = out.getvalue()
     assert "SECRET" not in line
     assert "https://host/v/x.m3u8" in line
+
+
+def test_urls_in_progress_and_options_are_redacted_on_both_streams():
+    out, err = io.StringIO(), io.StringIO()
+    reporter = Reporter(json_mode=False, quiet=False, stdout=out, stderr=err)
+    reporter.start(
+        tool="download",
+        batch="b",
+        output_dir="/out",
+        stages=["fetch"],
+        items=1,
+        options={"url": "https://host/video?token=SECRET123"},
+    )
+    reporter.progress(
+        stage="fetch",
+        index=1,
+        count=1,
+        path="https://host/file?auth=HIDDEN",
+        percent=50.0,
+    )
+
+    human_output = err.getvalue()
+    assert "SECRET123" not in human_output
+    assert "HIDDEN" not in human_output
+    assert "https://host/video" in human_output
+    assert "https://host/file" in human_output
+
+
+def test_urls_in_json_stream_also_redacted():
+    out, err = io.StringIO(), io.StringIO()
+    reporter = Reporter(json_mode=True, quiet=False, stdout=out, stderr=err)
+    reporter.start(
+        tool="download",
+        batch="b",
+        output_dir="/out",
+        stages=["fetch"],
+        items=1,
+        options={"url": "https://host/video?token=SECRET123"},
+    )
+
+    events = _lines(out)
+    json_str = json.dumps(events)
+    assert "SECRET123" not in json_str
+    assert "https://host/video" in json_str

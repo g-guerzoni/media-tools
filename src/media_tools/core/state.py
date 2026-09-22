@@ -9,6 +9,8 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from media_tools.core.redact import redact
+
 WRITE_EVERY_SECONDS = 5.0
 WRITE_EVERY_ITEMS = 25
 
@@ -58,6 +60,7 @@ class RunState:
                 )
 
         cls._acquire(batch_dir)
+        # Rebuild from scratch on each run; resumption uses disk outputs, not item list.
         data = {
             "v": 1,
             "task": task,
@@ -116,7 +119,7 @@ class RunState:
         self.data["items"].append(
             {
                 "id": item_id,
-                "input": str(input),
+                "input": redact(str(input)),
                 "status": "pending",
                 "reason": None,
                 "outputs": [],
@@ -130,8 +133,10 @@ class RunState:
         return item_id
 
     def update(self, item_id: int, **fields) -> None:
+        if item_id < 1:
+            raise ValueError(f"item_id must be >= 1, got {item_id}")
         item = self.data["items"][item_id - 1]
-        item.update(fields)
+        item.update(redact(fields))
         self._touch()
 
     def counts(self) -> dict:
@@ -150,6 +155,7 @@ class RunState:
         self.data["status"] = status
         self.data["owner"] = None
         self._write(force=True)
+        self.release()
 
     # -- persistence ------------------------------------------------------
     def _touch(self) -> None:
