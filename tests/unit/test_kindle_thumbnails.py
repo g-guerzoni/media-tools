@@ -1,24 +1,26 @@
 """`tasks.ebook.kindle.thumbnails`: the file name a device's own firmware expects for
 a book's cover, and `install()`, which writes it.
 
-Nothing here touches a real device — a tiny in-memory `FakeBackend` stands in for
-`DeviceBackend`, exercising only the three methods `install()` actually calls
-(`read`, `write`, `exists`). Real ffmpeg IS used, through the same `ffmpeg_path`
-fixture `tests/conftest.py` already gives every other unit test that needs it
-(`test_compress_video.py` and friends) — generating a synthetic cover with the
-`lavfi` `color` source, never a checked-in fixture image.
+Nothing here spawns a real device OR a real ffmpeg process — a tiny in-memory
+`FakeBackend` stands in for `DeviceBackend`, and `_resize` is monkeypatched the same
+way `tests/unit/test_compress_video.py` monkeypatches `run_ffmpeg` for its own engine
+tests, per CLAUDE.md's "fast, no real media required" rule for `tests/unit/`. Real
+ffmpeg — actual resize dimensions, and the full on-device-extraction pipeline against
+a real embedded image — is exercised in `tests/integration/test_kindle_thumbnails.py`
+instead.
 """
 
 from __future__ import annotations
 
 import struct
-import subprocess
 from pathlib import Path
 
+from media_tools.tasks.ebook import exth
 from media_tools.tasks.ebook.covers import cache_path
 from media_tools.tasks.ebook.kindle import thumbnails
 
 BOOK_ID = "TESTBOOKID0001"
+_FAKE_JPEG = b"\xff\xd8\xff" + b"0" * 50  # enough to pass `_looks_like_image`
 
 
 class FakeBackend:
@@ -27,6 +29,9 @@ class FakeBackend:
     `reject_writes_to` simulates a Colorsoft-style device that accepts a write and
     then silently discards it — `write()` runs, but the path never shows up as
     existing afterward, exactly the divergence `install()` is meant to detect.
+    `fail_writes_to` simulates a GENUINE device fault (a full disk, a yanked cable,
+    `DeviceWriteProtected`) — the write call itself raises, which is a different
+    thing from a clean, silent rejection.
     """
 
     def __init__(
@@ -34,18 +39,24 @@ class FakeBackend:
         files: dict[str, bytes] | None = None,
         *,
         reject_writes_to: frozenset[str] = frozenset(),
+        fail_writes_to: frozenset[str] = frozenset(),
     ) -> None:
         self.files = dict(files or {})
         self.written: dict[str, bytes] = {}
         self.reject_writes_to = set(reject_writes_to)
+        self.fail_writes_to = set(fail_writes_to)
+        self.read_calls: list[str] = []
 
     def read(self, path: str, dest: Path) -> None:
+        self.read_calls.append(path)
         if path not in self.files:
             raise FileNotFoundError(path)
         Path(dest).parent.mkdir(parents=True, exist_ok=True)
         Path(dest).write_bytes(self.files[path])
 
     def write(self, local: Path, path: str) -> None:
+        if path in self.fail_writes_to:
+            raise RuntimeError("the device refused the write (simulated fault)")
         if path in self.reject_writes_to:
             return  # accepted, then silently dropped — never lands in `written`
         self.written[path] = Path(local).read_bytes()
@@ -54,60 +65,25 @@ class FakeBackend:
         return path in self.written
 
 
-def _make_image(
-    path: Path, ffmpeg_path: str, *, width: int, height: int, color: str = "blue"
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            ffmpeg_path,
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            f"color=c={color}:s={width}x{height}",
-            "-frames:v",
-            "1",
-            str(path),
-        ],
-        check=True,
-        capture_output=True,
-    )
+def _stub_resize(source: Path, dest: Path, *, ffmpeg: str, target_height: int = 500) -> bool:
+    """Stands in for `thumbnails._resize`: writes a fixed, valid-enough JPEG to
+    `dest` without spawning ffmpeg. What `install()`'s own orchestration does with
+    the result (write, verify, map to a status) is what these tests are about — real
+    resize/decode correctness is `tests/integration/test_kindle_thumbnails.py`'s job.
+    """
+    Path(dest).write_bytes(_FAKE_JPEG + b"1" * 2000)
+    return True
 
 
-def _jpeg_size(data: bytes) -> tuple[int, int]:
-    """(width, height) read straight out of a JPEG's own SOF marker — good enough to
-    confirm ffmpeg's resize did what it claims without a new dependency or ffprobe
-    (the bundled ffmpeg ships none, per `core.ffmpeg`'s own docstring)."""
-    i = 2  # past the SOI marker (FFD8)
-    while i + 4 <= len(data):
-        if data[i] != 0xFF:
-            i += 1
-            continue
-        marker = data[i + 1]
-        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
-            i += 2
-            continue
-        length = struct.unpack(">H", data[i + 2 : i + 4])[0]
-        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
-            height, width = struct.unpack(">HH", data[i + 5 : i + 9])
-            return width, height
-        i += 2 + length
-    raise ValueError("no SOF marker found")
-
-
-def _mobi_with_cover(book_id: str, image_bytes: bytes, *, cdetype: str = "EBOK") -> bytes:
+def _mobi_with_image(exth_entries: list[tuple[int, bytes]], image_bytes: bytes) -> bytes:
     """A byte blob shaped like a real MOBI file with THREE PalmDB records: the usual
     header+EXTH record (record0, mirroring `test_kindle_backup.py`'s own
-    `mobi_bytes` helper), a text record, and — new here — an IMAGE record holding
-    `image_bytes`, with EXTH 201 (cover offset) pointing at it via the MOBI header's
-    own "first image record" field. This is the ONLY way to exercise the on-device
-    extraction fallback end to end without a real Kindle."""
-    exth_entries = [
-        (113, book_id.encode()),
-        (501, cdetype.encode()),
-        (201, struct.pack(">I", 0)),  # the cover is the FIRST image record
-    ]
+    `mobi_bytes` helper), a text record, and an IMAGE record holding `image_bytes` —
+    the MOBI header's own "first image record" field points PalmDB record 2 at it,
+    so an EXTH cover/thumb offset of 0 resolves to this record. `image_bytes` need
+    only pass `_looks_like_image` (a magic-byte check), not decode as a real
+    image — these tests are about the OFFSET MATH, not ffmpeg.
+    """
     blob = b"".join(struct.pack(">II", tag, 8 + len(v)) + v for tag, v in exth_entries)
     exth_block = (
         b"EXTH" + struct.pack(">I", 12 + len(blob)) + struct.pack(">I", len(exth_entries)) + blob
@@ -135,7 +111,7 @@ def _mobi_with_cover(book_id: str, image_bytes: bytes, *, cdetype: str = "EBOK")
     return bytes(palm) + record0 + text_record + image_bytes
 
 
-# --- thumbnail_name -------------------------------------------------------------
+# --- thumbnail_name ---------------------------------------------------------------
 
 
 def test_thumbnail_name_matches_the_device_naming_scheme():
@@ -149,12 +125,14 @@ def test_thumbnail_name_matches_the_device_naming_scheme():
     )
 
 
-# --- install: cached cover -------------------------------------------------------
+# --- install: cached cover (orchestration, `_resize` stubbed) --------------------
 
 
-def test_a_cached_cover_is_resized_and_written_to_system_thumbnails(tmp_path, ffmpeg_path):
+def test_a_cached_cover_is_installed_and_written_to_system_thumbnails(tmp_path, monkeypatch):
+    monkeypatch.setattr(thumbnails, "_resize", _stub_resize)
     cache_dir = tmp_path / "cache"
-    _make_image(cache_path(cache_dir, BOOK_ID), ffmpeg_path, width=400, height=800)
+    cache_path(cache_dir, BOOK_ID).parent.mkdir(parents=True)
+    cache_path(cache_dir, BOOK_ID).write_bytes(_FAKE_JPEG + b"2" * 2000)
 
     backend = FakeBackend()
     book = thumbnails.Book(device_path="documents/en/Book.azw3", book_id=BOOK_ID, cdetype="EBOK")
@@ -164,14 +142,15 @@ def test_a_cached_cover_is_resized_and_written_to_system_thumbnails(tmp_path, ff
     assert statuses == {BOOK_ID: "installed"}
     device_path = f"system/thumbnails/thumbnail_{BOOK_ID}_EBOK_portrait.jpg"
     assert device_path in backend.written
-    width, height = _jpeg_size(backend.written[device_path])
-    assert height == 500
-    assert width == 250  # 400 * 500/800, preserving the source's aspect ratio
+    # The book file itself was never fetched: a cached cover means no device read.
+    assert backend.read_calls == []
 
 
-def test_install_reports_progress_once_per_book(tmp_path, ffmpeg_path):
+def test_install_reports_progress_once_per_book(tmp_path, monkeypatch):
+    monkeypatch.setattr(thumbnails, "_resize", _stub_resize)
     cache_dir = tmp_path / "cache"
-    _make_image(cache_path(cache_dir, BOOK_ID), ffmpeg_path, width=400, height=800)
+    cache_path(cache_dir, BOOK_ID).parent.mkdir(parents=True)
+    cache_path(cache_dir, BOOK_ID).write_bytes(_FAKE_JPEG + b"2" * 2000)
     backend = FakeBackend()
     book = thumbnails.Book(device_path="documents/en/Book.azw3", book_id=BOOK_ID)
 
@@ -183,27 +162,14 @@ def test_install_reports_progress_once_per_book(tmp_path, ffmpeg_path):
     assert calls == [(1, 1)]
 
 
-# --- install: resize preserves aspect ratio --------------------------------------
+# --- install: device silently discards the write ----------------------------------
 
 
-def test_resize_preserves_aspect_ratio(tmp_path, ffmpeg_path):
-    source = tmp_path / "source.jpg"
-    _make_image(source, ffmpeg_path, width=400, height=1000)
-    dest = tmp_path / "resized.jpg"
-
-    assert thumbnails._resize(source, dest, ffmpeg=ffmpeg_path) is True
-
-    width, height = _jpeg_size(dest.read_bytes())
-    assert height == 500
-    assert width == 200  # 400 * 500/1000, exactly
-
-
-# --- install: device silently discards the write ---------------------------------
-
-
-def test_a_device_that_discards_the_write_reports_rejected(tmp_path, ffmpeg_path):
+def test_a_device_that_discards_the_write_reports_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr(thumbnails, "_resize", _stub_resize)
     cache_dir = tmp_path / "cache"
-    _make_image(cache_path(cache_dir, BOOK_ID), ffmpeg_path, width=400, height=800)
+    cache_path(cache_dir, BOOK_ID).parent.mkdir(parents=True)
+    cache_path(cache_dir, BOOK_ID).write_bytes(_FAKE_JPEG + b"2" * 2000)
     device_path = f"system/thumbnails/thumbnail_{BOOK_ID}_EBOK_portrait.jpg"
     backend = FakeBackend(reject_writes_to=frozenset({device_path}))
     book = thumbnails.Book(device_path="documents/en/Book.azw3", book_id=BOOK_ID)
@@ -214,7 +180,7 @@ def test_a_device_that_discards_the_write_reports_rejected(tmp_path, ffmpeg_path
     assert device_path not in backend.written
 
 
-# --- install: no cover anywhere --------------------------------------------------
+# --- install: no cover anywhere ----------------------------------------------------
 
 
 def test_a_book_with_no_cover_anywhere_reports_no_cover_and_writes_nothing(tmp_path):
@@ -240,7 +206,57 @@ def test_a_book_vanished_from_the_device_reports_no_cover_not_a_crash(tmp_path):
     assert statuses == {"GONEBOOK000001": "no_cover"}
 
 
-# --- install: no EXTH 113 at all -------------------------------------------------
+def test_resize_returning_false_reports_no_cover(tmp_path, monkeypatch):
+    """`_resize` itself returning False (ffmpeg ran but produced nothing usable —
+    a corrupt or undecodable cached/extracted source) is a clean, non-exceptional
+    "no cover", not a "failed" device fault. Faked at the `run_ffmpeg` layer, the
+    same seam `test_compress_video.py` uses, so no real ffmpeg process is spawned."""
+    monkeypatch.setattr(thumbnails, "run_ffmpeg", lambda argv, **kw: (1, "decode error"))
+    cache_dir = tmp_path / "cache"
+    cache_path(cache_dir, BOOK_ID).parent.mkdir(parents=True)
+    cache_path(cache_dir, BOOK_ID).write_bytes(b"not really a jpeg" * 100)  # > 1000 bytes
+    backend = FakeBackend()
+    book = thumbnails.Book(device_path="documents/en/Book.azw3", book_id=BOOK_ID)
+
+    statuses = thumbnails.install(backend, [book], cache_dir=cache_dir)
+
+    assert statuses == {BOOK_ID: "no_cover"}
+    assert backend.written == {}
+
+
+# --- install: a genuine device fault is isolated per book (C1) --------------------
+
+
+def test_install_isolates_a_per_book_device_fault_and_still_reports_the_rest(tmp_path, monkeypatch):
+    """A device fault mid-write on ONE book (a full disk, a yanked cable,
+    `DeviceWriteProtected`, an MTP `CalibreError`) must not propagate out of
+    `install()` — that would abort every book still queued and discard whatever
+    already succeeded. Three books: the first and third have a usable cache and
+    succeed; the second's write raises."""
+    monkeypatch.setattr(thumbnails, "_resize", _stub_resize)
+    cache_dir = tmp_path / "cache"
+    for book_id in ("GOODBOOK0001", "FAILBOOK0001", "GOODBOOK0002"):
+        cache_path(cache_dir, book_id).parent.mkdir(parents=True, exist_ok=True)
+        cache_path(cache_dir, book_id).write_bytes(_FAKE_JPEG + b"9" * 2000)
+
+    fail_path = f"system/thumbnails/{thumbnails.thumbnail_name('FAILBOOK0001')}"
+    backend = FakeBackend(fail_writes_to=frozenset({fail_path}))
+    books = [
+        thumbnails.Book(device_path="documents/en/A.azw3", book_id="GOODBOOK0001"),
+        thumbnails.Book(device_path="documents/en/B.azw3", book_id="FAILBOOK0001"),
+        thumbnails.Book(device_path="documents/en/C.azw3", book_id="GOODBOOK0002"),
+    ]
+
+    statuses = thumbnails.install(backend, books, cache_dir=cache_dir)
+
+    assert statuses == {
+        "GOODBOOK0001": "installed",
+        "FAILBOOK0001": "failed",
+        "GOODBOOK0002": "installed",
+    }
+
+
+# --- install: no EXTH 113 at all ---------------------------------------------------
 
 
 def test_a_book_with_no_book_id_is_handled_without_crashing(tmp_path):
@@ -254,27 +270,113 @@ def test_a_book_with_no_book_id_is_handled_without_crashing(tmp_path):
     assert backend.written == {}
 
 
-# --- install: extracted from the book itself when nothing is cached --------------
+# --- install: an unsafe EXTH value is rejected, not sanitized (C2) ----------------
 
 
-def test_extracts_the_books_own_embedded_cover_when_nothing_is_cached(tmp_path, ffmpeg_path):
-    source_image = tmp_path / "source.jpg"
-    _make_image(source_image, ffmpeg_path, width=400, height=800)
-    mobi_bytes = _mobi_with_cover("EMBEDDEDCOVER1", source_image.read_bytes())
-
-    backend = FakeBackend(files={"documents/en/Book.azw3": mobi_bytes})
-    book = thumbnails.Book(device_path="documents/en/Book.azw3", book_id="EMBEDDEDCOVER1")
+def test_a_book_with_an_unsafe_book_id_is_rejected_not_sanitized(tmp_path):
+    """A book id containing a path separator (or `..`) must never reach a device
+    write path OR a host cache lookup built from it — rejected outright as
+    `"no_cover"`, never silently renamed into a different-but-still-wrong name."""
+    backend = FakeBackend()
+    book = thumbnails.Book(device_path="documents/en/Evil.azw3", book_id="../../audible/x")
 
     statuses = thumbnails.install(backend, [book], cache_dir=tmp_path / "cache")
 
-    assert statuses == {"EMBEDDEDCOVER1": "installed"}
-    device_path = "system/thumbnails/thumbnail_EMBEDDEDCOVER1_EBOK_portrait.jpg"
-    width, height = _jpeg_size(backend.written[device_path])
-    assert height == 500
-    assert width == 250  # 400 * 500/800
+    assert statuses == {"../../audible/x": "no_cover"}
+    assert backend.written == {}
+    assert backend.read_calls == []  # never even attempted extraction
+
+
+def test_a_book_with_an_unsafe_cdetype_is_rejected_not_sanitized(tmp_path):
+    backend = FakeBackend()
+    book = thumbnails.Book(
+        device_path="documents/en/Evil.azw3", book_id="OKBOOKID0001", cdetype="../system"
+    )
+
+    statuses = thumbnails.install(backend, [book], cache_dir=tmp_path / "cache")
+
+    assert statuses == {"OKBOOKID0001": "no_cover"}
+    assert backend.written == {}
+
+
+# --- install: an already-materialised local copy is reused, not re-fetched (I2) ---
+
+
+def test_a_book_with_a_local_path_is_never_fetched_a_second_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(thumbnails, "_resize", _stub_resize)
+    local = tmp_path / "already-fetched.azw3"
+    local.write_bytes(
+        _mobi_with_image(
+            [(113, b"LOCALPATHBOOK1"), (501, b"EBOK"), (201, struct.pack(">I", 0))], _FAKE_JPEG
+        )
+    )
+    # A backend whose `read` always raises: if `install()` fetched the book again
+    # instead of reusing `local_path`, this test would fail on that call.
+    backend = FakeBackend(files={})
+    book = thumbnails.Book(
+        device_path="documents/en/Already.azw3", book_id="LOCALPATHBOOK1", local_path=local
+    )
+
+    statuses = thumbnails.install(backend, [book], cache_dir=tmp_path / "cache")
+
+    assert statuses == {"LOCALPATHBOOK1": "installed"}
+    assert backend.read_calls == []
+
+
+# --- _read_cover_image: the offset math, without ffmpeg ---------------------------
 
 
 def test_read_cover_image_returns_none_for_a_plain_non_mobi_file(tmp_path):
     plain = tmp_path / "plain.txt"
     plain.write_bytes(b"just some bytes, not a PalmDB file at all")
     assert thumbnails._read_cover_image(plain) is None
+
+
+def test_read_cover_image_extracts_via_the_cover_offset(tmp_path):
+    mobi = tmp_path / "book.azw3"
+    mobi.write_bytes(
+        _mobi_with_image(
+            [(113, b"COVEROFFSET01"), (501, b"EBOK"), (201, struct.pack(">I", 0))], _FAKE_JPEG
+        )
+    )
+    assert thumbnails._read_cover_image(mobi) == _FAKE_JPEG
+
+
+def test_read_cover_image_falls_back_to_the_thumb_offset_when_the_cover_offset_is_absent(
+    tmp_path,
+):
+    """EXTH 201 (the full cover) is the preferred source; every other fixture in
+    this file sets it, so without this test the EXTH 202 fallback branch never
+    runs at all. Here 201 is absent entirely and only 202 is set."""
+    mobi = tmp_path / "book.azw3"
+    mobi.write_bytes(
+        _mobi_with_image(
+            [(113, b"THUMBOFFSET01"), (501, b"EBOK"), (202, struct.pack(">I", 0))], _FAKE_JPEG
+        )
+    )
+    assert thumbnails._read_cover_image(mobi) == _FAKE_JPEG
+
+
+def test_read_cover_image_falls_back_to_thumb_offset_when_cover_offset_is_the_no_cover_sentinel(
+    tmp_path,
+):
+    """EXTH 201 present but explicitly `0xFFFFFFFF` ("no cover" per the format) must
+    fall through to 202, not be treated as a real (if odd) record index."""
+    mobi = tmp_path / "book.azw3"
+    mobi.write_bytes(
+        _mobi_with_image(
+            [
+                (113, b"NOCOVERSENTIN1"),
+                (501, b"EBOK"),
+                (201, struct.pack(">I", 0xFFFFFFFF)),
+                (202, struct.pack(">I", 0)),
+            ],
+            _FAKE_JPEG,
+        )
+    )
+    assert thumbnails._read_cover_image(mobi) == _FAKE_JPEG
+
+
+def test_image_record_index_returns_none_for_the_no_cover_sentinel():
+    records = {exth.TAG_COVER_OFFSET: struct.pack(">I", 0xFFFFFFFF)}
+    assert thumbnails._image_record_index(records, exth.TAG_COVER_OFFSET, 5) is None

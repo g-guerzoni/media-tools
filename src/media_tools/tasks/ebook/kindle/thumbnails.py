@@ -24,6 +24,7 @@ project's own bundled ffmpeg (`core.ffmpeg`), never a platform-specific tool lik
 
 from __future__ import annotations
 
+import re
 import struct
 import tempfile
 from collections.abc import Callable
@@ -49,6 +50,15 @@ _MIN_SOURCE_BYTES = 1000
 _FIRST_IMAGE_INDEX_OFFSET = 92
 _NO_OFFSET = 0xFFFFFFFF
 
+# A book id / cdetype trusted enough to become part of a device WRITE path or a
+# HOST cache lookup. Both are EXTH values read off a sideloaded file nobody here
+# produced, so anything outside this conservative charset is REJECTED outright
+# (never sanitized into a different-but-still-wrong name the device will never
+# look for, and never even used to build `covers.cache_path` on the host, since
+# the same untrusted bytes could escape `cache_dir` there just as easily as they
+# could escape the device tree) — see `_is_safe_component`.
+_SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
+
 
 @dataclass(frozen=True)
 class Book:
@@ -60,12 +70,17 @@ class Book:
     EXTH 113 id; a book with none (`book_id == ""`) cannot be named a thumbnail at
     all and is reported `"no_cover"` without ever touching the device. `cdetype` is
     the book's own EXTH 501 content-type tag (`"EBOK"`, `"PDOC"`, ...), defaulting to
-    `"EBOK"` like the device itself does for a book that carries none.
+    `"EBOK"` like the device itself does for a book that carries none. `local_path`,
+    when the caller already has the book materialised on the host (over MTP,
+    `cli._materialize_for_scan` already fetched it once to read its EXTH records),
+    is used directly for the on-device-extraction fallback instead of fetching the
+    book a second time — one MTP round trip per book instead of two.
     """
 
     device_path: str
     book_id: str
     cdetype: str = DEFAULT_CDETYPE
+    local_path: Path | None = None
 
 
 def thumbnail_name(book_id: str, cdetype: str = DEFAULT_CDETYPE) -> str:
@@ -84,8 +99,8 @@ def install(
     on_progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, str]:
     """Install one thumbnail per book. Returns `{book id: "installed" | "rejected" |
-    "no_cover"}` — a book with no id at all is keyed by its `device_path` instead,
-    since there is no id to key it by.
+    "no_cover" | "failed"}` — a book with no id at all is keyed by its `device_path`
+    instead, since there is no id to key it by.
 
     Per book: the cover comes from the shared library cache first
     (`covers.cache_path(cache_dir, book_id)`); when that has nothing (missing, or too
@@ -96,25 +111,36 @@ def install(
     VERIFIED with `backend.exists` — a device that accepted the write and silently
     dropped it (Colorsoft and newer, by design) reports `"rejected"` rather than
     `"installed"`; a book with no cover anywhere (cache miss AND no embedded image,
-    or a source ffmpeg cannot decode) reports `"no_cover"` and nothing is written for
-    it. Neither case raises: one broken book must never abort the rest of the batch.
+    or a source ffmpeg cannot decode) reports `"no_cover"` and nothing is written
+    for it.
+
+    **Every one of those outcomes is a clean, non-exceptional answer about ONE
+    book — none of them can abort the batch.** A genuine device fault mid-write
+    (a full disk, a yanked cable, `DeviceWriteProtected`, an MTP `CalibreError`) is
+    a different thing: it is caught PER BOOK and reported `"failed"`, distinct from
+    `"rejected"` (a complete, trustworthy check that genuinely found nothing) and
+    from `"no_cover"` (nothing was even attempted) — never left to propagate out of
+    this function, which would abort every book still queued and discard every
+    already-reported result for the books that came before it.
 
     `on_progress(done, total)` fires once per book, after that book is fully
-    resolved (installed, rejected, or given up on).
+    resolved. Each book's own scratch files (a fetched copy of it, an extracted
+    cover, a resized thumbnail) are cleaned up before the next book starts, so a
+    library-sized run never holds more than one book's worth of temporary data on
+    disk at a time.
     """
     ffmpeg_bin = ffmpeg or ffmpeg_exe()
     cache_dir = Path(cache_dir)
     total = len(books)
     statuses: dict[str, str] = {}
-    with tempfile.TemporaryDirectory(prefix="kindle-thumbnails-") as scratch:
-        scratch_dir = Path(scratch)
-        for done, book in enumerate(books, start=1):
-            key = book.book_id or book.device_path
+    for done, book in enumerate(books, start=1):
+        key = book.book_id or book.device_path
+        with tempfile.TemporaryDirectory(prefix="kindle-thumbnails-") as scratch:
             statuses[key] = _install_one(
-                backend, book, cache_dir=cache_dir, ffmpeg=ffmpeg_bin, scratch_dir=scratch_dir
+                backend, book, cache_dir=cache_dir, ffmpeg=ffmpeg_bin, scratch_dir=Path(scratch)
             )
-            if on_progress:
-                on_progress(done, total)
+        if on_progress:
+            on_progress(done, total)
     return statuses
 
 
@@ -122,6 +148,10 @@ def _install_one(
     backend: DeviceBackend, book: Book, *, cache_dir: Path, ffmpeg: str, scratch_dir: Path
 ) -> str:
     if not book.book_id:
+        return "no_cover"
+    if not _is_safe_component(book.book_id) or not _is_safe_component(book.cdetype):
+        # A mangled EXTH value is REJECTED, not sanitized — see `_is_safe_component`
+        # and this module's own docstring on why (C2).
         return "no_cover"
 
     source = cache_path(cache_dir, book.book_id)
@@ -132,12 +162,20 @@ def _install_one(
         source = extracted
 
     resized = scratch_dir / f"{_safe_stem(book.book_id)}-thumb.jpg"
-    if not _resize(source, resized, ffmpeg=ffmpeg):
-        return "no_cover"
-
     device_path = f"{THUMBNAIL_DIR}{thumbnail_name(book.book_id, book.cdetype)}"
-    backend.write(resized, device_path)
-    return "installed" if backend.exists(device_path) else "rejected"
+    try:
+        if not _resize(source, resized, ffmpeg=ffmpeg):
+            return "no_cover"
+        backend.write(resized, device_path)
+        return "installed" if backend.exists(device_path) else "rejected"
+    except (RuntimeError, OSError):
+        # See `install()`'s own docstring: a device fault here must not escape this
+        # function and abort every other book in the batch.
+        return "failed"
+
+
+def _is_safe_component(value: str) -> bool:
+    return value not in ("", ".", "..") and _SAFE_COMPONENT.fullmatch(value) is not None
 
 
 def _is_usable(path: Path) -> bool:
@@ -195,13 +233,22 @@ def _extract_embedded_cover(
     fetch, or its EXTH/image records do not parse — is treated as "no cover", not
     raised: one book's broken file must not abort a whole `install()` batch, the
     same isolation `covers.resolve` and `cli._materialize_for_scan` already apply.
+
+    `book.local_path`, when given, is used directly instead of fetching the book
+    again: over MTP, `run_thumbnails` already materialised every book locally to
+    read its EXTH records before calling `install()` at all, and re-fetching the
+    same file here would mean two `calibre-debug` round trips per book — one
+    `MtpBackend` invocation re-opens and re-scans the whole device — instead of one.
     """
-    suffix = Path(book.device_path).suffix
-    local = scratch_dir / f"{_safe_stem(book.book_id)}-book{suffix}"
-    try:
-        backend.read(book.device_path, local)
-    except (RuntimeError, OSError):
-        return None
+    if book.local_path is not None:
+        local = book.local_path
+    else:
+        suffix = Path(book.device_path).suffix
+        local = scratch_dir / f"{_safe_stem(book.book_id)}-book{suffix}"
+        try:
+            backend.read(book.device_path, local)
+        except (RuntimeError, OSError):
+            return None
     image = _read_cover_image(local)
     if image is None:
         return None

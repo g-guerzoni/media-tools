@@ -122,6 +122,53 @@ def test_write_then_read_round_trips(fake_kindle, tmp_path):
     assert back.read_bytes() == b"book bytes"
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../outside.azw3",
+        "documents/../../outside.azw3",
+        "/etc/passwd",
+        "audible/x.azw3",
+        "documents/audible/x.azw3",
+        "system/wifi.cfg",
+        "system/notthumbnails/x.jpg",
+    ],
+)
+def test_write_refuses_a_path_outside_what_this_project_may_ever_touch(fake_kindle, tmp_path, path):
+    """A device path can be built from UNTRUSTED data (Task 6: a book's own EXTH
+    records) — this is the backstop `validate_writable_path` gives BOTH backends,
+    independent of whatever a caller building the path did or did not check."""
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    source = tmp_path / "x.azw3"
+    source.write_bytes(b"x")
+    with pytest.raises(backend.DeviceWritePathRejected):
+        device.write(source, path)
+
+
+def test_write_still_allows_a_thumbnail_under_system(fake_kindle, tmp_path):
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    source = tmp_path / "cover.jpg"
+    source.write_bytes(b"jpeg bytes")
+    device.write(source, "system/thumbnails/thumbnail_ABC123_EBOK_portrait.jpg")
+    assert device.exists("system/thumbnails/thumbnail_ABC123_EBOK_portrait.jpg")
+
+
+def test_exists_raises_rather_than_answering_false_when_the_device_is_gone(fake_kindle):
+    """A bare `Path.is_file()` swallows `OSError` and answers `False` for an
+    unmounted volume exactly as it would for a file that genuinely never existed —
+    a caller verifying a just-written file (e.g. installing a Kindle thumbnail)
+    needs to be able to tell "verified absent" from "the device vanished mid-check",
+    which a possibly-wrong `False` cannot express."""
+    import shutil as _shutil
+
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    assert device.exists("documents/en/A Book - An Author.azw3") is True
+
+    _shutil.rmtree(fake_kindle.mount)
+    with pytest.raises(FileNotFoundError):
+        device.exists("documents/en/A Book - An Author.azw3")
+
+
 def test_write_is_atomic_leaving_no_partial_file(fake_kindle, tmp_path, monkeypatch):
     device = massstorage.MassStorageBackend(fake_kindle.mount)
     source = tmp_path / "x.azw3"

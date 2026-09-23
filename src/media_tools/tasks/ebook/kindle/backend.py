@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from media_tools.core.paths import truncate_name
@@ -23,6 +23,28 @@ from media_tools.core.paths import truncate_name
 # characters. Forward slash is stripped for the same reason as everywhere else in
 # this file's device-relative paths: it is a path separator, not a name character.
 _FAT32_ILLEGAL = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
+
+# --- the exclusion rules every listing (and, since the C2 fix, every WRITE) enforces
+#
+# Live HERE, not in `massstorage.py`, so both backends — and this module's own write
+# guard below — import ONE copy rather than `mtp.py` importing massstorage's and this
+# file duplicating them a second time. `massstorage.py` and `mtp.py` both import these
+# back from here; nothing else changed about what they mean.
+VOLUME_LITTER = {".Trashes", ".fseventsd", ".Spotlight-V100"}
+# Fully off-limits, at any depth: `audible/` is Amazon's audiobook data, untouchable
+# by this whole plan. `system/` is different — only `system/thumbnails/` is ordinary
+# cache data; everything else under `system/` is device internals, not book content.
+PROTECTED_DIRS = {"audible"}
+RESTRICTED_PARENT = "system"
+RESTRICTED_EXCEPTION = "thumbnails"
+
+
+def is_volume_litter(name: str) -> bool:
+    return name.startswith("._") or name in VOLUME_LITTER
+
+
+def prefix_targets_a_forbidden_system_child(parts: tuple[str, ...]) -> bool:
+    return len(parts) >= 2 and parts[0] == RESTRICTED_PARENT and parts[1] != RESTRICTED_EXCEPTION
 
 
 @dataclass(frozen=True)
@@ -63,8 +85,10 @@ class DeviceBackend(Protocol):
       (Amazon's audiobook data, untouchable by this whole plan) and everything under a
       `system/` directory except its `thumbnails/` child (device internals — Wi-Fi
       credentials, logs, settings — not book content), plus volume litter. The
-      constants live in `massstorage.py` and the MTP backend imports them, so the two
-      cannot drift apart.
+      constants live HERE (`PROTECTED_DIRS`, `RESTRICTED_PARENT`,
+      `RESTRICTED_EXCEPTION`, `VOLUME_LITTER`), and `massstorage.py`/`mtp.py` both
+      import them from this module, so the two backends' listings — and this
+      module's own write-path guard below — cannot drift apart.
     - **`read(path, dest)`** and **`remove(path)`** raise `FileNotFoundError` when
       `path` is not on the device. A `read` that fails part-way leaves **no file at
       `dest`** on either backend: mass storage stages the copy, MTP's helper removes
@@ -80,8 +104,18 @@ class DeviceBackend(Protocol):
       raise for the first pair that fails — `FileNotFoundError` for an absent path —
       and leaves whatever already transferred in place, so a caller that needs
       all-or-nothing stages into a directory it can discard.
-    - **`exists(path)`** answers for FILES only: a directory is not "there".
-    - **`write(local, path)`** creates any missing parent directories.
+    - **`exists(path)`** answers for FILES only: a directory is not "there". A cold
+      cache that cannot be resolved into a definite yes/no MUST NOT answer `False` as
+      if it had checked — raise instead, so a caller cannot mistake "I could not
+      verify" for "verified absent" (the C1/I3 fix: a genuinely inconclusive check
+      answering `False` is indistinguishable from a device that really does refuse a
+      write, and the two need different handling).
+    - **`write(local, path)`** creates any missing parent directories, and validates
+      `path` through `validate_writable_path` FIRST, raising `DeviceWritePathRejected`
+      for anything outside what this project will ever touch — the same exclusions
+      `list_files` enforces for reads, now enforced before a write too, since `path`
+      may be built from data this project did not produce (a book's own EXTH
+      records).
     - **`free_space()`** is bytes free on the device's main storage.
     - **`close()`** releases whatever the backend holds, including any cached listing.
     """
@@ -101,6 +135,51 @@ class DeviceWriteProtected(RuntimeError):
     """The device refused a write outright — locked, or mounted read-only —
     rather than failing with an ordinary OSError a caller already knows how to
     handle."""
+
+
+class DeviceWritePathRejected(RuntimeError):
+    """A write targeted a device path outside what this project will ever touch on
+    a Kindle: absolute, containing a `..`/`.` component, inside `audible/`, or under
+    `system/` anywhere but `system/thumbnails/`. Raised by `validate_writable_path`
+    BEFORE either backend moves a single byte.
+
+    This exists because a device path can be built from UNTRUSTED data — a book's
+    own EXTH records, read off a sideloaded file nobody here produced — and nothing
+    stopped that from reaching `write()` unchecked. A caller building a path from
+    such data should validate the pieces (e.g. a book id) and refuse to build a path
+    at all rather than relying on this as the only guard; this is the backstop that
+    holds regardless of what any caller remembered to check."""
+
+
+def validate_writable_path(path: str) -> str:
+    """The one place a device-relative path is checked before EITHER backend writes
+    to it — `MassStorageBackend.write` and `MtpBackend.write` both call this first.
+    Returns `path` unchanged when it is safe; raises `DeviceWritePathRejected`
+    otherwise. Mirrors the same exclusions `list_files` already enforces for READS
+    (`audible/` at any depth, everything under `system/` except its `thumbnails/`
+    child), now enforced for writes too — matched against every directory
+    component in the path, not just a listing prefix, since a write path is the
+    whole thing, not a folder being walked.
+    """
+    cleaned = str(path).replace("\\", "/")
+    if not cleaned or cleaned.startswith("/") or cleaned.startswith("~"):
+        raise DeviceWritePathRejected(f"refusing to write to {path!r}: not a relative device path")
+    parts = PurePosixPath(cleaned).parts
+    if not parts or any(part in ("..", ".") for part in parts):
+        raise DeviceWritePathRejected(f"refusing to write to {path!r}: path traversal")
+    directories = parts[:-1]
+    if PROTECTED_DIRS & set(directories):
+        raise DeviceWritePathRejected(
+            f"refusing to write to {path!r}: inside a protected directory"
+        )
+    if RESTRICTED_PARENT in directories:
+        index = directories.index(RESTRICTED_PARENT)
+        if index + 1 >= len(directories) or directories[index + 1] != RESTRICTED_EXCEPTION:
+            raise DeviceWritePathRejected(
+                f"refusing to write to {path!r}: only system/{RESTRICTED_EXCEPTION}/ is writable "
+                "under system/"
+            )
+    return cleaned
 
 
 def sanitize_device_name(name: str, *, max_path: int) -> str:

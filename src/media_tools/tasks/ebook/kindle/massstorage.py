@@ -26,26 +26,31 @@ import subprocess
 from pathlib import Path
 
 from media_tools.core.paths import fsync_replace, temp_path
-from media_tools.tasks.ebook.kindle.backend import DeviceFile
+from media_tools.tasks.ebook.kindle.backend import (
+    PROTECTED_DIRS,
+    RESTRICTED_EXCEPTION,
+    RESTRICTED_PARENT,
+    VOLUME_LITTER,
+    DeviceFile,
+    is_volume_litter,
+    prefix_targets_a_forbidden_system_child,
+    validate_writable_path,
+)
 
-# These four are PUBLIC on purpose: `mtp.py` imports them rather than re-deriving the
-# same rules, so the two backends' listings cannot drift apart. `backend.py`'s protocol
-# docstring is where the rule itself is written down.
-VOLUME_LITTER = {".Trashes", ".fseventsd", ".Spotlight-V100"}
-# Fully off-limits, at any depth: `audible/` is Amazon's audiobook data, untouchable
-# by this whole plan. `system/` is different — only `system/thumbnails/` is ordinary
-# cache data; everything else under `system/` is device internals, not book content.
-PROTECTED_DIRS = {"audible"}
-RESTRICTED_PARENT = "system"
-RESTRICTED_EXCEPTION = "thumbnails"
-
-
-def is_volume_litter(name: str) -> bool:
-    return name.startswith("._") or name in VOLUME_LITTER
-
-
-def prefix_targets_a_forbidden_system_child(parts: tuple[str, ...]) -> bool:
-    return len(parts) >= 2 and parts[0] == RESTRICTED_PARENT and parts[1] != RESTRICTED_EXCEPTION
+# The four constants and two functions above USED to be defined here, with `mtp.py`
+# importing them from this module so the two backends' listings could not drift
+# apart. They now live in `backend.py` instead (re-exported here for anything that
+# still imports them from this module) because `backend.py`'s own write-path guard
+# needs them too, and `backend.py` cannot import FROM `massstorage.py` (this module
+# already imports `DeviceFile` the other way) without a cycle.
+__all__ = [
+    "PROTECTED_DIRS",
+    "RESTRICTED_EXCEPTION",
+    "RESTRICTED_PARENT",
+    "VOLUME_LITTER",
+    "is_volume_litter",
+    "prefix_targets_a_forbidden_system_child",
+]
 
 
 class MassStorageBackend:
@@ -145,6 +150,10 @@ class MassStorageBackend:
             self.read(path, dest)
 
     def write(self, local: Path, path: str) -> None:
+        # Validated BEFORE anything else: `path` may be built from data this project
+        # did not produce (a book's own EXTH records), and nothing else here stops
+        # `..`/`audible/`/a forbidden `system/` child from ever reaching a real write.
+        path = validate_writable_path(path)
         target = self.mount / path
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = temp_path(target)
@@ -165,6 +174,17 @@ class MassStorageBackend:
         # FILES only, per `backend.DeviceBackend`'s contract. `.exists()` answered
         # `True` for a directory, which the MTP backend can never do (it only ever
         # sees files), so a caller written against one backend broke against the other.
+        #
+        # The SAME "device gone" check `list_files` already does, repeated here: a
+        # bare `Path.is_file()` swallows `OSError` internally and answers `False` for
+        # an unmounted volume exactly as it would for a file that genuinely never
+        # existed — a caller verifying a just-written file (e.g. Kindle thumbnail
+        # install) cannot tell "verified absent" from "the device vanished mid-check"
+        # without this raising instead of answering a possibly-wrong `False`.
+        if not self.mount.is_dir() or (
+            self._device_id is not None and _device_id(self.mount) != self._device_id
+        ):
+            raise FileNotFoundError(f"the Kindle is no longer mounted at {self.mount}")
         return (self.mount / path).is_file()
 
     def free_space(self) -> int:

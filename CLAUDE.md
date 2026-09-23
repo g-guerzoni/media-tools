@@ -196,7 +196,8 @@ Item statuses (`item.status`, and `run.json`'s per-item `status`):
 | `size_limit_unreachable` | `split`: could not get a part under the limit in 3 attempts |
 | `engine_error` | the engine raised, or its subprocess failed |
 | `dependency_missing` | a required external tool/binary is missing |
-| `device_rejected` | (reserved for the future Kindle device path) |
+| `device_rejected` | `ebook kindle thumbnails`: the device accepted a thumbnail write and then silently discarded it (Colorsoft and newer, by design) |
+| `no_cover` | `ebook kindle thumbnails`: no cover anywhere for this book — no EXTH 113 id at all (paired with the `book_id_missing` warning), or an id but no cover in the library's cache or embedded in the book itself |
 | `no_audio_only_format` | (reserved; see the `no_audio_only_format` warning below) |
 | `llm_unavailable` | (reserved; a failed/unavailable LLM call currently falls back to the offline heuristic per batch instead of failing the item) |
 
@@ -214,17 +215,19 @@ when the LLM is enabled and no OpenRouter key resolves.
 `extension_filter_bypassed`, `device_rejected_thumbnail`, `hash_from_previous`,
 `name_collision_suffixed`, `leftover_book`.
 
-(`device_rejected_thumbnail` and the `llm_unavailable` reason above are reserved for
-the future Kindle-device path (`restore` and the LLM fallback, respectively) and not
-produced by anything today. `hash_from_previous` IS produced today, by `ebook kindle
+(`device_rejected_thumbnail` IS produced today, by `ebook kindle thumbnails` — the
+same rejection `device_rejected` (above) reports as a `reason`, on the identical item.
+The `llm_unavailable` reason above is still reserved for the future LLM fallback and
+not produced by anything today. `hash_from_previous` IS produced today, by `ebook kindle
 backup` — it fires when a reused file kept the hash the previous snapshot recorded for
 it instead of being re-read (pass `--verify-hashes` to recompute every one instead).
 `book_id_missing`, `cover_not_embedded`, `already_target_format`, `source_missing`,
 `name_collision_suffixed` and `leftover_book` are all produced by the `ebook` task
 described below (`leftover_book` is a standalone `warning` event, not attached to any
 one `item` — a leftover was never part of the plan to begin with; `book_id_missing` is
-also produced by `ebook kindle scan`, for a device book with no EXTH 113 id). They're
-listed here regardless because the set is closed and this is the authoritative source.)
+also produced by `ebook kindle scan` and `ebook kindle thumbnails`, both for a device
+book with no EXTH 113 id). They're listed here regardless because the set is closed
+and this is the authoritative source.)
 
 `-e/--extensions` only filters a **folder** scan. A file named directly on the command
 line is still processed as long as some engine accepts it, even when its extension is

@@ -19,7 +19,11 @@ import pytest
 
 from media_tools.integrations.calibre import CalibreError
 from media_tools.tasks.ebook.kindle import massstorage, mtp
-from media_tools.tasks.ebook.kindle.backend import DeviceFile, DeviceWriteProtected
+from media_tools.tasks.ebook.kindle.backend import (
+    DeviceFile,
+    DeviceWritePathRejected,
+    DeviceWriteProtected,
+)
 from media_tools.tasks.ebook.kindle.detect import Device, DeviceBusy, DeviceNotFound
 
 SERIAL = "G000TESTSERIAL"
@@ -388,6 +392,23 @@ def test_write_sends_one_put_op_with_an_explicit_device_path(device, tmp_path):
             }
         ]
     ]
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../outside.azw3", "/etc/passwd", "audible/x.azw3", "system/wifi.cfg"],
+)
+def test_write_refuses_a_path_outside_what_this_project_may_ever_touch(device, tmp_path, path):
+    """The SAME guard `MassStorageBackend.write` calls (`backend.validate_writable_path`)
+    — a device path can be built from UNTRUSTED data (a book's own EXTH records), and
+    this must hold on both backends, not just one. The `calibre-debug` runner must
+    never even be invoked: the ops list is empty."""
+    source = tmp_path / "x.azw3"
+    source.write_bytes(b"x")
+    runner = FakeRunner()
+    with pytest.raises(DeviceWritePathRejected):
+        backend(device, runner).write(source, path)
+    assert runner.calls == []
 
 
 def test_remove_sends_an_rm_op(device):
@@ -1415,3 +1436,38 @@ def test_exists_on_a_root_level_path_keeps_the_full_listing_it_paid_for(device):
     assert not device_backend.exists("Other.txt")
     assert [f.path for f in device_backend.list_files()] == ["My Clippings.txt"]
     assert len(runner.calls) == 1, "the full scan was paid for once and kept"
+
+
+# --- exists() must refuse to answer from an incomplete listing (I3) -------------
+
+
+def test_exists_raises_rather_than_trusting_an_incomplete_nested_listing(device):
+    """A cold cache, nested-path check that comes back PARTIAL must not silently
+    answer `False` — a caller verifying a just-written Kindle thumbnail (Task 6)
+    needs to tell "verified absent" (the device genuinely refused it) apart from
+    "could not check" (an inconclusive listing), and a possibly-wrong `False`
+    collapses that distinction into "your Kindle blocks sideloaded covers"."""
+    runner = FakeRunner(results(listing(("documents/en/A Book.azw3", 1, 1.0), partial=True)))
+    with pytest.raises(CalibreError):
+        backend(device, runner).exists("documents/en/A Book.azw3")
+
+
+def test_exists_raises_rather_than_trusting_an_incomplete_root_listing(device):
+    runner = FakeRunner(results(listing(("My Clippings.txt", 1, 1.0), partial=True)))
+    with pytest.raises(CalibreError):
+        backend(device, runner).exists("My Clippings.txt")
+
+
+def test_exists_does_not_cache_an_incomplete_root_listing(device):
+    """The failure above must not poison `self._listing` either — a later, complete
+    listing must still be trusted rather than the incomplete one from a prior call
+    getting cached anyway."""
+    runner = FakeRunner(
+        results(listing(("My Clippings.txt", 1, 1.0), partial=True)),
+        results(listing(("My Clippings.txt", 1, 1.0))),
+    )
+    device_backend = backend(device, runner)
+    with pytest.raises(CalibreError):
+        device_backend.exists("My Clippings.txt")
+    assert device_backend.exists("My Clippings.txt")
+    assert len(runner.calls) == 2

@@ -37,6 +37,7 @@ REASONS = frozenset(
         "device_rejected",
         "no_audio_only_format",
         "llm_unavailable",
+        "no_cover",
     }
 )
 

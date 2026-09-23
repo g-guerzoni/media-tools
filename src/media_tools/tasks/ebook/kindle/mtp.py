@@ -33,15 +33,17 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 from media_tools.integrations.calibre import CALIBRE_DEBUG, CalibreError, config_env
-from media_tools.tasks.ebook.kindle.backend import DeviceFile, DeviceWriteProtected
-from media_tools.tasks.ebook.kindle.detect import Device, DeviceBusy, DeviceNotFound
-from media_tools.tasks.ebook.kindle.massstorage import (
+from media_tools.tasks.ebook.kindle.backend import (
     PROTECTED_DIRS,
     RESTRICTED_EXCEPTION,
     RESTRICTED_PARENT,
+    DeviceFile,
+    DeviceWriteProtected,
     is_volume_litter,
     prefix_targets_a_forbidden_system_child,
+    validate_writable_path,
 )
+from media_tools.tasks.ebook.kindle.detect import Device, DeviceBusy, DeviceNotFound
 
 # The helper's own copies of these are authoritative — this module cannot import it
 # (different interpreter, and it imports `calibre`), so the constants are duplicated
@@ -394,6 +396,10 @@ class MtpBackend:
                 raise _error_for(result, op)
 
     def write(self, local: Path, path: str) -> None:
+        # Validated BEFORE anything else: `path` may be built from data this project
+        # did not produce (a book's own EXTH records), and nothing else here stops
+        # `..`/`audible/`/a forbidden `system/` child from ever reaching a real write.
+        path = validate_writable_path(path)
         self._one({"op": "put", "path": path, "local": str(Path(local).resolve())})
         self._listing = None
 
@@ -404,14 +410,24 @@ class MtpBackend:
     def exists(self, path: str) -> bool:
         if self._listing is not None:
             return any(entry.path == path for entry in self._listing)
-        if "/" not in path:
-            # A root-level path has the device root as its parent, so there is no
-            # cheaper listing to ask for — go through `list_files` and at least keep
-            # what the full scan cost.
-            return any(entry.path == path for entry in self.list_files())
-        # Cold cache, nested path: list only the parent folder, so a lone existence
-        # check does not pay for a full device scan.
-        files, _ = self._files_under(path.rsplit("/", 1)[0])
+        # Cold cache: list only the parent folder (root, for a top-level path) rather
+        # than paying for a full device scan for one existence check.
+        prefix = "" if "/" not in path else path.rsplit("/", 1)[0]
+        files, complete = self._files_under(prefix)
+        if not complete:
+            # An INCOMPLETE listing must never answer this question — the caller
+            # (e.g. verifying a just-written Kindle thumbnail) needs to be able to
+            # tell "verified absent" from "could not check", and a possibly-wrong
+            # `False` here collapses that distinction (I3): a real device rejection
+            # and a merely inconclusive listing would otherwise look identical.
+            raise CalibreError(
+                f"could not verify whether {path!r} exists: the MTP listing needed to "
+                "check it was incomplete, so absence cannot be confirmed"
+            )
+        if not prefix:
+            # A complete ROOT listing is exactly what `list_files` itself would
+            # cache — keep that benefit for whatever calls `list_files`/`exists` next.
+            self._listing = files
         return any(entry.path == path for entry in files)
 
     def free_space(self) -> int:

@@ -1,7 +1,12 @@
-"""`media-tools ebook kindle status|scan|backup`: the first three Kindle commands that
-are safe to run against a real device — none of them writes to it (`backup` writes only
-to the host) — and the one place every later command (`add`, `remove`, `sync`,
-`thumbnails`, `eject`, `restore`) resolves a device through.
+"""`media-tools ebook kindle status|scan|backup|thumbnails`, and the one place every
+later command (`add`, `remove`, `sync`, `eject`, `restore`) resolves a device through.
+
+`status`/`scan` never write anywhere; `backup` writes only to the host. `thumbnails`
+is this module's first command that writes to the DEVICE itself — see its own
+docstring, `run_thumbnails`, below, for what that means for the mandatory pre-write
+backup and per-book failure handling. Do not read this module's name or this
+docstring's history as a promise that nothing here writes: that was true through
+Task 5 and is no longer true as of Task 6.
 
 **Device resolution lives in exactly one helper, `resolve_device`.** It does detection
 (`device_finder`, defaulting to `detect.find_device`) and backend construction
@@ -27,11 +32,12 @@ otherwise misreport a run that demonstrably did fail, which is why `run_backup`'
 1, ...}`, a real `failed` entry, an `item` event) rather than letting it reach `_run`'s
 generic `_fail`/`empty_result` path, which can only express "nothing was attempted" —
 right for `device_not_found`/`device_busy`, wrong for a backup that really did run and
-really did fail. This does NOT generalise to a future WRITE command
-(`add`/`remove`/`sync`, Task 7) whose MANDATORY pre-write backup fails: there the
-backup is a precondition and nothing the user actually asked for was attempted, so
-that failure should keep exit 3 AND `_fail`'s all-zero counts — see `_EXIT_FOR_CODE`'s
-own comment.
+really did fail. This does NOT generalise to a WRITE command whose MANDATORY pre-write
+backup fails — `run_thumbnails` here, and every future one (`add`/`remove`/`sync`,
+Task 7): there the backup is a precondition and nothing the user actually asked for
+was attempted, so that failure should keep exit 3 AND `_fail`'s all-zero counts — see
+`_EXIT_FOR_CODE`'s own comment, and `_mandatory_backup` below (the one place this
+shape is built, shared by every write command rather than hand-copied by each).
 
 **Hold ONE backend instance across a backup and whatever operation follows it, and
 never re-detect between them.** `resolve_device` is called exactly once per command
@@ -102,7 +108,7 @@ from media_tools.tasks.ebook.kindle.backend import DeviceBackend, DeviceFile, De
 from media_tools.tasks.ebook.kindle.detect import Device, DeviceBusy, DeviceNotFound
 
 NAME = "kindle"
-HELP = "Report on, scan or back up a connected Kindle."
+HELP = "Report on, scan, back up, or install cover thumbnails on a connected Kindle."
 
 # The formats `exth.read_records` can actually parse (MOBI-family containers).
 BOOK_SUFFIXES = frozenset({".azw", ".azw3", ".azw8", ".kfx", ".mobi", ".prc", ".pdb"})
@@ -162,6 +168,20 @@ def register_subparsers(kindle_parser) -> None:
         "--force",
         action="store_true",
         help="Reinstall a thumbnail even for a book that already has one on the device.",
+    )
+    thumbnails_parser.add_argument(
+        "--match",
+        metavar="TEXT",
+        default=None,
+        help="Only consider device books whose path contains TEXT (case-insensitive) — "
+        "e.g. to retry the handful that reported no_cover without re-running the "
+        "backup and every other book.",
+    )
+    thumbnails_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report which books would be installed/skipped without taking a backup "
+        "or writing anything.",
     )
 
 
@@ -800,6 +820,79 @@ def _classify(device_books: list[dict], library_index: dict[str, dict], *, batch
 # --- backup ------------------------------------------------------------------------
 
 
+def _take_backup(
+    reporter: Reporter,
+    root: Path,
+    device: Device,
+    backend: DeviceBackend,
+    key: str,
+    *,
+    full: bool = False,
+    verify_hashes: bool = False,
+) -> backup_module.Snapshot:
+    """Take the backup every write command takes before touching the device, with
+    progress/warning wired to `reporter` the same way every caller needs it.
+    Extracted so the callback wiring is not hand-copied a third time by Task 7's
+    `add`/`remove`/`sync` — `run_backup` and `run_thumbnails` are the two call sites
+    today.
+
+    Raises `backup_module.BackupFailed` on failure, UNTOUCHED, so each caller reacts
+    to it its own way: `run_backup` reports it as `counts.failed: 1`/exit 1, since
+    there the snapshot IS the work being asked for; every WRITE command reports it as
+    a precondition that was never met/exit 3, via `_mandatory_backup` below. This
+    function itself does not know or care which — it only takes the snapshot.
+    """
+
+    def on_progress(done: int, total: int, phase: str) -> None:
+        reporter.progress(
+            stage=phase,
+            index=done,
+            count=total,
+            path=f"kindle:{key}",  # self-describing, not a bare serial
+            percent=(100.0 * done / total) if total else 100.0,
+        )
+
+    def on_warning(code: str, message: str) -> None:
+        reporter.warning(code=code, message=message)
+
+    return backup_module.snapshot(
+        backend,
+        root=root,
+        serial=key,
+        full=full,
+        verify_hashes=verify_hashes,
+        on_progress=on_progress,
+        on_warning=on_warning,
+    )
+
+
+def _mandatory_backup(
+    reporter: Reporter, root: Path, device: Device, backend: DeviceBackend, key: str
+) -> tuple[dict | None, backup_module.Snapshot | None]:
+    """For a WRITE command (not `backup` itself): take `_take_backup`'s snapshot and,
+    on failure, return the `body`-shaped all-zero/exit-3 failure dict — the backup is
+    a PRECONDITION here, never met, so nothing the user actually asked for was
+    attempted (Ruling R27; see this module's own docstring on `backup_failed`).
+    Returns `(None, snapshot)` on success, so the caller can both continue into its
+    own write step AND report the protecting snapshot in its own `result.data`.
+    """
+    try:
+        snap = _take_backup(reporter, root, device, backend, key)
+    except backup_module.BackupFailed as error:
+        reporter.error(code="backup_failed", message=str(error))
+        return {
+            "ok": False,
+            "exit_code": EXIT_DEPENDENCY,
+            "counts": {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0},
+            "failed": [],
+            "pending": [],
+            "outputs": [],
+            "run_file": None,
+            "data": {},
+        }, None
+    return None, snap
+
+
 def run_backup(
     args,
     *,
@@ -817,30 +910,18 @@ def run_backup(
         reporter.stage(stage="backup", index=2, count=len(stages))
         key = backup_module.device_key(device)
 
-        def on_progress(done: int, total: int, phase: str) -> None:
-            reporter.progress(
-                stage=phase,
-                index=done,
-                count=total,
-                path=f"kindle:{key}",  # self-describing, not a bare serial
-                percent=(100.0 * done / total) if total else 100.0,
-            )
-
-        def on_warning(code: str, message: str) -> None:
-            reporter.warning(code=code, message=message)
-
         # A single backend instance, resolved once by `_run` above and threaded
         # through unchanged — see this module's own docstring for why re-detecting
         # between a backup and a later step is the one ordering this design forecloses.
         try:
-            snap = backup_module.snapshot(
+            snap = _take_backup(
+                reporter,
+                root,
+                device,
                 backend,
-                root=root,
-                serial=key,
+                key,
                 full=args.full,
                 verify_hashes=args.verify_hashes,
-                on_progress=on_progress,
-                on_warning=on_warning,
             )
         except backup_module.BackupFailed as error:
             # Caught HERE, not left to `_run`'s outer `except (RuntimeError, OSError)`:
@@ -915,65 +996,62 @@ def run_thumbnails(
     backend_factory: Callable[..., DeviceBackend] | None = None,
 ) -> int:
     """Install a cover thumbnail for every device book that lacks one (or, with
-    `--force`, for every book regardless).
+    `--force`, for every book regardless; `--match TEXT` narrows to device paths
+    containing TEXT — the way to retry the handful of books that reported `no_cover`
+    without re-running the backup and every other book).
 
     Writing a thumbnail is a device write, so it takes the SAME mandatory backup
-    every write command takes, through the SAME backend instance `_run` already
-    resolved (see this module's own docstring on holding one backend across a backup
-    and the operation that follows it). Unlike `run_backup` itself, a failure in
-    THIS backup is a precondition that was never met — nothing about the actual
-    write was attempted — so it keeps exit 3 and `_fail`'s all-zero-counts shape
-    rather than `backup`'s own exit-1 "an item demonstrably failed" shape (Ruling
-    R27, carried forward to every future write command's own mandatory backup).
+    every write command takes (`_mandatory_backup`), through the SAME backend
+    instance `_run` already resolved (see this module's own docstring on holding one
+    backend across a backup and the operation that follows it) — unless `--dry-run`,
+    which takes NO backup and writes nothing at all, only reporting what a real run
+    would do. A failure in the (real) backup is a precondition that was never
+    met — nothing about the actual write was attempted — so it keeps exit 3 and
+    `_mandatory_backup`'s all-zero-counts shape rather than `backup`'s own exit-1
+    "an item demonstrably failed" shape (Ruling R27). The snapshot that protected the
+    run is reported in `result.data.snapshot` (the same shape `backup`/`status`
+    use), and a run that actually changed a thumbnail is journalled
+    (`backup_module.journal_append`) so a future `restore --op` has something to
+    undo.
 
-    A book already carrying its exact thumbnail name (`_has_thumbnail`) is reported
-    `skipped`/`exists` without being handed to `thumbnails.install` at all, unless
-    `--force`. A device that accepts a write and then silently drops it (Colorsoft
-    and newer, by design) is reported `skipped`/`device_rejected` with the
-    `device_rejected_thumbnail` warning — never `failed`, since the user did nothing
-    wrong and nothing is broken.
+    Per book, after the backup:
+    - Already carrying its exact thumbnail name (`_has_thumbnail`) and not
+      `--force`: `skipped`/`exists`, never handed to `thumbnails.install` at all.
+    - No EXTH 113 id at all: `skipped`/`no_cover` with the `book_id_missing`
+      warning — the one book that can never get a thumbnail, named as such rather
+      than folded into the same `no_cover` silence as "had an id, found no cover".
+    - Installed: `done`.
+    - The device accepted the write and silently dropped it (Colorsoft and newer, by
+      design): `skipped`/`device_rejected` with the `device_rejected_thumbnail`
+      warning — never `failed`, since the user did nothing wrong and nothing is
+      broken.
+    - A GENUINE device fault mid-write (full disk, a yanked cable,
+      `DeviceWriteProtected`, an MTP `CalibreError`) — `thumbnails.install` reports
+      this as `"failed"`, isolated per book: `failed`/`engine_error`, which DOES make
+      the run's own `ok` false / exit 1, the same as any other task's failed item.
+    - Had an id and no cover anywhere (cache miss and no embedded image): `skipped`/
+      `no_cover`.
     """
-    stages = ["detect", "backup", "thumbnails"]
-    options = {"kindle_command": "thumbnails", "force": bool(args.force)}
+    dry_run = bool(args.dry_run)
+    stages = ["detect", "thumbnails"] if dry_run else ["detect", "backup", "thumbnails"]
+    options = {
+        "kindle_command": "thumbnails",
+        "force": bool(args.force),
+        "match": args.match,
+        "dry_run": dry_run,
+    }
 
     def body(reporter: Reporter, root: Path, device: Device, backend: DeviceBackend) -> dict:
-        reporter.stage(stage="backup", index=2, count=len(stages))
         key = backup_module.device_key(device)
+        snap: backup_module.Snapshot | None = None
 
-        def on_backup_progress(done: int, total: int, phase: str) -> None:
-            reporter.progress(
-                stage=phase,
-                index=done,
-                count=total,
-                path=f"kindle:{key}",
-                percent=(100.0 * done / total) if total else 100.0,
-            )
+        if not dry_run:
+            reporter.stage(stage="backup", index=2, count=len(stages))
+            failure, snap = _mandatory_backup(reporter, root, device, backend, key)
+            if failure is not None:
+                return failure
 
-        def on_backup_warning(code: str, message: str) -> None:
-            reporter.warning(code=code, message=message)
-
-        try:
-            backup_module.snapshot(
-                backend,
-                root=root,
-                serial=key,
-                on_progress=on_backup_progress,
-                on_warning=on_backup_warning,
-            )
-        except backup_module.BackupFailed as error:
-            reporter.error(code="backup_failed", message=str(error))
-            return {
-                "ok": False,
-                "exit_code": EXIT_DEPENDENCY,
-                "counts": {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0},
-                "failed": [],
-                "pending": [],
-                "outputs": [],
-                "run_file": None,
-                "data": {},
-            }
-
-        reporter.stage(stage="thumbnails", index=3, count=len(stages))
+        reporter.stage(stage="thumbnails", index=len(stages), count=len(stages))
         all_entries = backend.list_files()
         all_paths = {entry.path for entry in all_entries}
         book_entries = [
@@ -981,7 +1059,11 @@ def run_thumbnails(
             for entry in all_entries
             if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
         ]
+        if args.match:
+            needle = args.match.lower()
+            book_entries = [entry for entry in book_entries if needle in entry.path.lower()]
 
+        local_paths: dict[str, Path] = {}
         if device.mode == "mass_storage":
             records_by_path = {
                 book.path: exth.read_records(device.mount / book.path) for book in book_entries
@@ -993,19 +1075,26 @@ def run_thumbnails(
                 book.path: exth.read_records(local_paths[book.path]) for book in book_entries
             }
 
-        # One (book, already_covered) pair per device book, decided up front: a book
-        # already carrying its exact thumbnail name is never handed to
-        # `thumbnails.install` at all (unless `--force`), but it still gets its own
-        # `item` event below — silently dropping it would hide it from an agent
+        # One (book, already_covered) pair per matched device book, decided up
+        # front: a book already carrying its exact thumbnail name is never handed
+        # to `thumbnails.install` at all (unless `--force`), but it still gets its
+        # own `item` event below — silently dropping it would hide it from an agent
         # reading the event stream, the same reason `compress`/`convert` report an
-        # `exists` skip rather than omitting the item entirely.
+        # `exists` skip rather than omitting the item entirely. `local_path`, when
+        # this book was already materialised for MTP (above), is threaded through
+        # so `thumbnails.install` never fetches the same book a second time.
         plan: list[tuple[thumbnails.Book, bool]] = []
         to_install: list[thumbnails.Book] = []
         for entry in book_entries:
             records = records_by_path[entry.path]
             book_id = exth.record_text(records, exth.TAG_UUID) or ""
             cdetype = exth.record_text(records, exth.TAG_CDETYPE) or thumbnails.DEFAULT_CDETYPE
-            book = thumbnails.Book(device_path=entry.path, book_id=book_id, cdetype=cdetype)
+            book = thumbnails.Book(
+                device_path=entry.path,
+                book_id=book_id,
+                cdetype=cdetype,
+                local_path=local_paths.get(entry.path),
+            )
             covered = (
                 bool(book_id) and not args.force and _has_thumbnail(book_id, cdetype, all_paths)
             )
@@ -1013,7 +1102,41 @@ def run_thumbnails(
             if not covered:
                 to_install.append(book)
 
-        cover_cache_dir = root / ".cache"
+        counts = {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0}
+        pending: list[str] = []
+
+        if dry_run:
+            # No cache/extraction resolution is attempted (that is real, if
+            # read-only, work) — a book that is not already covered and DOES carry
+            # an id is reported `pending`: an agent knows it WOULD be attempted, not
+            # what its outcome would be.
+            for item_id, (book, covered) in enumerate(plan, start=1):
+                if covered:
+                    item_status, reason, warnings = "skipped", "exists", []
+                elif not book.book_id:
+                    item_status, reason, warnings = "skipped", "no_cover", ["book_id_missing"]
+                else:
+                    item_status, reason, warnings = "pending", None, []
+                    pending.append(book.device_path)
+                counts["total"] += 1
+                counts[item_status] += 1
+                reporter.item(
+                    id=item_id,
+                    status=item_status,
+                    input=book.device_path,
+                    outputs=[],
+                    bytes_in=None,
+                    reason=reason,
+                    warnings=warnings,
+                )
+            return {
+                "counts": counts,
+                "failed": [],
+                "pending": pending,
+                "outputs": [],
+                "run_file": None,
+                "data": {"thumbnails": {}},
+            }
 
         def on_install_progress(done: int, total: int) -> None:
             reporter.progress(
@@ -1024,12 +1147,13 @@ def run_thumbnails(
                 percent=(100.0 * done / total) if total else 100.0,
             )
 
+        cover_cache_dir = root / ".cache"
         statuses = thumbnails.install(
             backend, to_install, cache_dir=cover_cache_dir, on_progress=on_install_progress
         )
 
-        counts = {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0}
         outputs: list[str] = []
+        failed: list[dict] = []
         for item_id, (book, covered) in enumerate(plan, start=1):
             item_outputs: list[str] = []
             if covered:
@@ -1048,8 +1172,14 @@ def run_thumbnails(
                     item_status = "skipped"
                     reason = "device_rejected"
                     warnings = ["device_rejected_thumbnail"]
-                else:
-                    item_status, reason, warnings = "skipped", None, []
+                elif status == "failed":
+                    item_status, reason, warnings = "failed", "engine_error", []
+                    failed.append(
+                        {"id": item_id, "input": book.device_path, "reason": "engine_error"}
+                    )
+                else:  # "no_cover"
+                    item_status, reason = "skipped", "no_cover"
+                    warnings = ["book_id_missing"] if not book.book_id else []
             counts["total"] += 1
             counts[item_status] += 1
             reporter.item(
@@ -1062,13 +1192,29 @@ def run_thumbnails(
                 warnings=warnings,
             )
 
+        if outputs:
+            # An undo pointer for a run that actually changed a thumbnail (including
+            # a `--force` run overwriting one already there) — the bytes are inside
+            # the backup `snap` just took, but nothing recorded WHICH operation put
+            # them there until now.
+            assert snap is not None  # `dry_run` is False here, so `_mandatory_backup` ran
+            backup_module.journal_append(
+                root, key, {"op": "thumbnails", "paths": outputs, "snapshot": snap.path.name}
+            )
+
+        ok = not failed
         return {
+            "ok": ok,
+            "exit_code": EXIT_OK if ok else EXIT_FAILED,
             "counts": counts,
-            "failed": [],
+            "failed": failed,
             "pending": [],
             "outputs": outputs,
             "run_file": None,
-            "data": {"thumbnails": statuses},
+            "data": {
+                "thumbnails": statuses,
+                "snapshot": _snapshot_summary(snap.path, fallback=snap) if snap else None,
+            },
         }
 
     return _run(
