@@ -1578,7 +1578,7 @@ def test_a_batch_output_in_a_format_no_kindle_reads_is_skipped_not_copied(
     assert not (fake_kindle.mount / "documents" / "en" / "Notes.txt").exists()
 
 
-# --- provenance authorises overwriting only this tool's own unfinished write ------------
+# --- provenance authorises overwriting only a placement this tool never confirmed -------
 
 
 def _add_epub(root: Path, source: Path, kindle, backend_factory=_mass_storage_factory) -> int:

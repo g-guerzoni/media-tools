@@ -1764,8 +1764,11 @@ def _book_id_of(path: Path) -> str | None:
     """`""` for a book that parsed and carries no EXTH 113 id; `None` when reading it
     RAISED, which is a different thing and must not be cached as if it were the first
     (see `_device_book_ids`). The guard itself lives in `exth.read_records_or_none`,
-    so `backup.py` — which reads records during the mandatory pre-write backup, before
-    any command in this module gets a turn — is covered by the same one."""
+    beside the function it guards, so that every EXTH read in this subsystem shares
+    one — including `backup.py`'s, which imports `read_records` directly and therefore
+    could never have been covered by a helper living here. That read is on the RESTORE
+    path (`_companions_of`, reached only from `restore(only=...)`), not in `snapshot()`
+    — the mandatory pre-write backup never reaches it."""
     records = exth.read_records_or_none(path)
     if records is None:
         return None
