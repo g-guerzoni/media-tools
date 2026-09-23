@@ -116,8 +116,11 @@ def _usable_meta_title(text: str | None) -> bool:
     return any(c.isupper() for c in text)
 
 
-_IGNORED_LANGUAGE_TAGS = frozenset({"und", "mul", "zxx"})  # ISO 639-2 placeholders:
+IGNORED_LANGUAGE_TAGS = frozenset({"und", "mul", "zxx"})  # ISO 639-2 placeholders:
 # undetermined / multiple languages / no linguistic content — never a real answer.
+# Public because `ebook kindle add` needs the same verdict when it turns a book's
+# language into a FOLDER NAME on the device: two modules deciding separately what
+# counts as a real language is exactly how a library and a device drift apart.
 
 
 def _tag_language(meta_language: str | None) -> str | None:
@@ -131,7 +134,7 @@ def _tag_language(meta_language: str | None) -> str | None:
     if not meta_language:
         return None
     code = meta_language.strip().lower()
-    if code in _IGNORED_LANGUAGE_TAGS:
+    if code in IGNORED_LANGUAGE_TAGS:
         return None
     if len(code) == 2 and code.isalpha():
         return code
