@@ -93,15 +93,15 @@ def test_convert_with_garbage_input_fails_the_item_not_the_command(tmp_path):
     assert item["reason"] == "engine_error"
 
 
-def test_ebook_stub_task_reports_not_implemented():
-    # ebook is the only task still a Task 8 stub; formats/doctor/status were replaced
-    # by Task 14/15 and are covered by their own test modules. Its exit code is 3
-    # (missing dependency/configuration), but the error code is "config_missing", not
-    # "dependency_missing" — nothing is missing from the machine to go install.
+def test_ebook_without_a_subcommand_is_a_usage_error():
+    # `ebook` (Task 11) requires one of build/scan/normalize/dedup/covers/convert;
+    # argparse itself enforces this (`required=True` on its subparsers), so a bare
+    # `media-tools ebook` is the same "usage" shape as any other missing-subcommand
+    # call, not the old Task 8 stub's config_missing/exit 3.
     result = _run(["ebook", "--json"])
-    assert result.returncode == 3
+    assert result.returncode == 2
     events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
-    assert any(e["type"] == "error" and e["code"] == "config_missing" for e in events)
+    assert any(e["type"] == "error" and e["code"] == "usage" for e in events)
 
 
 def test_json_mode_emits_only_jsonlines_on_stdout(tmp_path):
