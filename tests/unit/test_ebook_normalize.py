@@ -109,6 +109,23 @@ def test_a_failing_batch_falls_back_to_the_heuristic(tmp_path):
     assert verdicts[facts[0].path].title == "Cidade de Deus"
 
 
+def test_a_malformed_reply_shape_falls_back_to_the_heuristic(tmp_path):
+    # Valid JSON, wrong shape: a bare list instead of the expected object. This must
+    # be treated exactly like a failed request, not crash the whole classify() call.
+    def bare_list_chat(messages, **kwargs):
+        from media_tools.integrations.openrouter import Usage
+
+        return [1, 2, 3], Usage(1, 1)
+
+    facts = [_facts("Cidade de Deus - Paulo Lins.epub")]
+    verdicts, stats = normalize.classify(
+        facts, model="m", api_key="k", cache_dir=tmp_path, chat=bare_list_chat
+    )
+    assert stats["errors"] == 1
+    assert verdicts[facts[0].path].source == "heuristic"
+    assert verdicts[facts[0].path].title == "Cidade de Deus"
+
+
 def test_statuses_other_than_ok_are_carried_through(tmp_path):
     def fake_chat(messages, **kwargs):
         from media_tools.integrations.openrouter import Usage

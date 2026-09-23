@@ -127,14 +127,25 @@ def group(
     formats: dict[Path, str],
 ) -> list[Group]:
     """The exact pass: same language, same normalised title+author, one group.
-    The winner is whichever member's format comes first in `preference`; every
-    other member is a duplicate and is never converted."""
+    Only an "ok" verdict takes part in bucketing — an "unidentified"/"invalid"/
+    "irrelevant" book (typically an empty title, no author) still becomes its own
+    single-member group, so the pipeline can route it to a review folder, but must
+    never be treated as a duplicate of another such book just because both are
+    equally blank. The same guard applies to any book, "ok" or not, whose
+    normalised key has no usable title or author at all. The winner is whichever
+    member's format comes first in `preference`; every other member is a duplicate
+    and is never converted."""
     buckets: dict[tuple[str | None, str], list[Path]] = {}
+    solo: list[Path] = []
     for path, verdict in entries.items():
-        key = (verdict.language, normalise_key(verdict.title, verdict.author))
+        key_str = normalise_key(verdict.title, verdict.author)
+        if verdict.status != "ok" or not key_str.replace("|", ""):
+            solo.append(path)
+            continue
+        key = (verdict.language, key_str)
         buckets.setdefault(key, []).append(path)
 
-    return [
+    groups = [
         Group(
             members=members,
             winner=_pick_winner(members, formats, preference),
@@ -142,6 +153,10 @@ def group(
         )
         for (language, _key), members in buckets.items()
     ]
+    groups.extend(
+        Group(members=[path], winner=path, language=entries[path].language) for path in solo
+    )
+    return groups
 
 
 def _bucket_key(entry: Group, entries: dict[Path, Verdict]) -> tuple[str | None, str]:
@@ -160,25 +175,64 @@ def _ask_clusters(
         {"role": "user", "content": "\n".join(lines)},
     ]
     payload, usage = chat(messages, model=model, api_key=api_key)
+    if not isinstance(payload, dict):
+        # Valid JSON, wrong shape (e.g. a bare list) — treat exactly like a failed
+        # request rather than let an AttributeError from `.get` below escape and
+        # abort the whole refine() call.
+        raise openrouter.OpenRouterError("OpenRouter returned an unexpected response shape")
 
-    clusters: list[list[int]] = []
-    used: set[int] = set()
+    # Sanitise each cluster (drop invented/out-of-range/internally-repeated indices)
+    # before deciding which indices are ambiguous — an index claimed by more than
+    # one cluster must be dropped from ALL of them, not just kept in whichever one
+    # happened to be processed first.
+    sanitised: list[list[int]] = []
+    counts: dict[int, int] = {}
     for raw_cluster in payload.get("clusters") or []:
         if not isinstance(raw_cluster, list):
             continue
-        kept = []
+        seen_in_cluster: set[int] = set()
+        valid = []
         for index in raw_cluster:
             if not isinstance(index, int) or isinstance(index, bool):
                 continue  # an invented, non-integer index
             if not (0 <= index < len(chunk)):
                 continue  # out of range for this chunk
-            if index in used:
-                continue  # repeated across clusters: ambiguous, trust neither
-            used.add(index)
-            kept.append(index)
-        if len(kept) > 1:
-            clusters.append(kept)
-    return clusters, usage
+            if index in seen_in_cluster:
+                continue  # repeated within the same cluster
+            seen_in_cluster.add(index)
+            valid.append(index)
+        if valid:
+            sanitised.append(valid)
+            for index in valid:
+                counts[index] = counts.get(index, 0) + 1
+
+    ambiguous = {index for index, count in counts.items() if count > 1}
+    clusters = [[index for index in valid if index not in ambiguous] for valid in sanitised]
+    return [cluster for cluster in clusters if len(cluster) > 1], usage
+
+
+def _merge_cluster(
+    cluster: list[int],
+    chunk: list[Group],
+    formats: dict[Path, str],
+    preference: tuple[str, ...],
+) -> Group | None:
+    """Merge one model-approved cluster of chunk indices into a single Group, or
+    refuse (returning None) if it spans more than one language. Bucketing already
+    keeps different languages out of the same chunk — this is the second, closer
+    line of defense for that rule: it does not trust the bucketing alone, and it
+    does not trust the model's cluster either, whatever it says to merge."""
+    languages = {chunk[index].language for index in cluster}
+    if len(languages) > 1:
+        return None
+    members: list[Path] = []
+    for index in cluster:
+        members.extend(chunk[index].members)
+    return Group(
+        members=members,
+        winner=_pick_winner(members, formats, preference),
+        language=next(iter(languages)),
+    )
 
 
 def refine(
@@ -195,15 +249,20 @@ def refine(
     """The LLM pass: bucket the exact groups by `(language, blocking_key)` — never
     across languages — and ask the model which ones, within one bucket, are really
     the same book. A bucket with fewer than two groups costs no request at all. A
-    batch whose request fails is left ungrouped rather than dropped; the model's
-    clusters are trusted only where their indices are well-formed."""
+    batch whose request fails or comes back in an unexpected shape is left ungrouped
+    rather than dropped, and counted in `stats["errors"]` — dedup calls cost money
+    too, and the run summary is the only warning before a large bill. The model's
+    clusters are trusted only where their indices are well-formed, and a cluster
+    spanning more than one language is never merged, whatever the model said
+    (`stats["blocked_merges"]`) — `_merge_cluster` is the second line of defense for
+    that rule, independent of the bucketing that should already keep languages apart."""
     chat = chat or openrouter.chat
 
     buckets: dict[tuple[str | None, str], list[Group]] = {}
     for candidate in groups:
         buckets.setdefault(_bucket_key(candidate, entries), []).append(candidate)
 
-    stats = {"llm_calls": 0, "buckets": 0, "merges": 0}
+    stats = {"llm_calls": 0, "buckets": 0, "merges": 0, "errors": 0, "blocked_merges": 0}
     result: list[Group] = []
 
     for bucket_groups in buckets.values():
@@ -225,22 +284,18 @@ def refine(
                 clusters, _usage = _ask_clusters(chunk, entries, model, api_key, chat)
                 stats["llm_calls"] += 1
             except openrouter.OpenRouterError:
+                stats["errors"] += 1
                 result.extend(chunk)
                 continue
 
             merged_indices: set[int] = set()
             for cluster in clusters:
-                members: list[Path] = []
-                for index in cluster:
-                    members.extend(chunk[index].members)
-                    merged_indices.add(index)
-                result.append(
-                    Group(
-                        members=members,
-                        winner=_pick_winner(members, formats, preference),
-                        language=chunk[0].language,
-                    )
-                )
+                merged = _merge_cluster(cluster, chunk, formats, preference)
+                if merged is None:
+                    stats["blocked_merges"] += 1
+                    continue
+                result.append(merged)
+                merged_indices.update(cluster)
                 stats["merges"] += len(cluster) - 1
             for index, candidate in enumerate(chunk):
                 if index not in merged_indices:

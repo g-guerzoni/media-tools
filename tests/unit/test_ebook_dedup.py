@@ -164,3 +164,88 @@ def test_a_leftover_chunk_of_one_after_splitting_a_big_bucket_costs_no_call():
     )
     assert chunk_sizes == [60], "the lone 61st entry must not cost a request"
     assert stats["llm_calls"] == 1
+
+
+def test_a_malformed_reply_shape_is_treated_as_a_failed_request():
+    # Valid JSON, wrong shape: a bare list instead of the expected object. This must
+    # be treated exactly like a failed request — count it, and leave the groups
+    # unmerged rather than crash refine() entirely.
+    entries = _entries(
+        [
+            ("/b/Cidade de Deus - Paulo Lins.epub", "Cidade de Deus", "Paulo Lins", "pt"),
+            ("/b/Cidade de Deus.pdf", "Cidade de Deus", None, "pt"),
+        ]
+    )
+    groups = dedup.group(entries, formats=_formats(entries))
+
+    def bare_list_chat(messages, **kwargs):
+        from media_tools.integrations.openrouter import Usage
+
+        return [1, 2, 3], Usage(1, 1)
+
+    refined, stats = dedup.refine(
+        groups,
+        entries,
+        _formats(entries),
+        model="m",
+        api_key="k",
+        preference=dedup.DEFAULT_PREFERENCE,
+        chat=bare_list_chat,
+    )
+    assert len(refined) == 2
+    assert stats["errors"] == 1
+
+
+def test_repeated_indices_across_clusters_are_dropped_from_all_of_them():
+    entries = _entries(
+        [
+            ("/b/Solaris A - Lem.epub", "Solaris", "Lem A", "pl"),
+            ("/b/Solaris B - Lem.epub", "Solaris", "Lem B", "pl"),
+            ("/b/Solaris C - Lem.epub", "Solaris", "Lem C", "pl"),
+        ]
+    )
+    groups = dedup.group(entries, formats=_formats(entries))
+    assert len(groups) == 3
+
+    def chat(messages, **kwargs):
+        from media_tools.integrations.openrouter import Usage
+
+        # Index 1 is claimed by both clusters: ambiguous, must be trusted by neither.
+        return {"clusters": [[0, 1], [1, 2]]}, Usage(1, 1)
+
+    refined, _ = dedup.refine(
+        groups,
+        entries,
+        _formats(entries),
+        model="m",
+        api_key="k",
+        preference=dedup.DEFAULT_PREFERENCE,
+        chat=chat,
+    )
+    assert len(refined) == 3, "an index claimed by two clusters must be dropped from both"
+    book_b = Path("/b/Solaris B - Lem.epub")
+    for grp in refined:
+        assert len(grp.members) == 1
+        if book_b in grp.members:
+            assert grp.members == [book_b], "book 1 must end up alone"
+
+
+def test_merge_cluster_refuses_to_merge_across_languages_even_when_asked():
+    # A second line of defense, independent of bucketing: forcing a mixed-language
+    # chunk straight into the merge step must still refuse to merge it.
+    en_group = dedup.Group(members=[Path("/b/en.epub")], winner=Path("/b/en.epub"), language="en")
+    pt_group = dedup.Group(members=[Path("/b/pt.epub")], winner=Path("/b/pt.epub"), language="pt")
+    formats = {Path("/b/en.epub"): "epub", Path("/b/pt.epub"): "epub"}
+
+    merged = dedup._merge_cluster([0, 1], [en_group, pt_group], formats, dedup.DEFAULT_PREFERENCE)
+
+    assert merged is None, "a cluster spanning two languages must never be merged"
+
+
+def test_two_different_invalid_books_do_not_become_duplicates_of_each_other():
+    entries = {
+        Path("/b/scan0001.pdf"): Verdict("invalid", "", None, None, "heuristic"),
+        Path("/b/scan0002.pdf"): Verdict("invalid", "", None, None, "heuristic"),
+    }
+    groups = dedup.group(entries, formats=_formats(entries))
+    assert len(groups) == 2

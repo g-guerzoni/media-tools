@@ -181,6 +181,11 @@ def _ask(
         {"role": "user", "content": "\n".join(lines)},
     ]
     payload, usage = chat(messages, model=model, api_key=api_key)
+    if not isinstance(payload, dict):
+        # Valid JSON, wrong shape (e.g. a bare list) — treat exactly like a failed
+        # request rather than let an AttributeError from `.get` below escape and
+        # abort the whole classify() call.
+        raise openrouter.OpenRouterError("OpenRouter returned an unexpected response shape")
 
     answers: dict[int, dict] = {}
     seen: set[int] = set()
