@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -x \"$CLAUDE_PROJECT_DIR/.venv/bin/media-tools\" ]; then \"$CLAUDE_PROJECT_DIR/.venv/bin/media-tools\" doctor --quiet --check-updates || true; else echo 'media-tools is not installed yet: python3.13 -m venv .venv && .venv/bin/pip install -e . --group dev'; fi; exit 0"
+            "command": "if [ -x \"$CLAUDE_PROJECT_DIR/.venv/bin/media-tools\" ]; then \"$CLAUDE_PROJECT_DIR/.venv/bin/media-tools\" doctor --quiet --check-updates || true; else echo 'media-tools is not installed yet: python3 -m venv .venv && .venv/bin/pip install -e . --group dev'; fi; exit 0"
           }
         ]
       }

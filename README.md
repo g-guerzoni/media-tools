@@ -16,15 +16,17 @@ language-sorted, deduplicated library — see "Building an ebook library" below 
 ```bash
 git clone https://github.com/g-guerzoni/media-tools.git
 cd media-tools
-python3.13 -m venv .venv
+python3 -m venv .venv
 .venv/bin/pip install -e . --group dev
 .venv/bin/media-tools doctor
 ```
 
-On macOS, install Python 3.13 first with Homebrew: `brew install python@3.13`.
+Any Python >= 3.11 works. On macOS, install one with Homebrew (`brew install python`)
+if the system Python is older; no particular minor version is required, and this file
+deliberately names none, because a pinned one goes stale the moment Homebrew moves.
 
-`--group dev` needs pip >= 25.1. On an older pip (a stock 3.11/3.12 venv, most often),
-install the dev tools directly instead:
+`--group dev` needs pip >= 25.1. On an older pip, install the dev tools directly
+instead:
 
 ```bash
 .venv/bin/pip install -e . pytest ruff
@@ -47,7 +49,7 @@ your PATH, without a local clone.
 
 ## Requirements
 
-- **Python >= 3.11.** On macOS, use Homebrew's `python3.13` (see above).
+- **Python >= 3.11.** Any minor version from 3.11 up; see "Install" above.
 - **ffmpeg** — nothing to install: it ships with the `imageio-ffmpeg` dependency.
 - **A JS runtime for YouTube extraction** — ships with the `yt-dlp[default,deno]`
   dependency (it installs the `deno` pip package, which vendors the Deno binary).
@@ -56,8 +58,8 @@ your PATH, without a local clone.
   to/from an ebook format, and by `ebook kindle` for a Kindle that speaks MTP (see
   "Putting books on a Kindle"). Install with `brew install --cask calibre`.
 - **A Kindle** — only for `ebook kindle`, and only when you actually want to touch
-  one. `media-tools doctor` reports whether one is connected as a warning, never a
-  failure.
+  one. `media-tools doctor` reports whether one is connected, and having none attached
+  is not a problem it complains about.
 - **An OpenRouter API key** — optional, only for `ebook build`'s LLM-assisted cleanup.
   Skip it entirely with `--no-llm`. See "Building an ebook library" below.
 
@@ -320,9 +322,9 @@ is still the same book, and a book renamed on the device is not a new one.
   mass-storage Kindle needs none of it).
 
 `media-tools ebook kindle status` says which one it found, and `media-tools doctor`
-reports the same thing plus whether Calibre's MTP driver is available. Detection never
-trusts a model table — it looks for the mount, because firmware updates have moved
-that line before.
+reports the same thing — plus, when the Kindle it found speaks MTP, whether Calibre's
+driver is actually available. Detection never trusts a model table: it looks for the
+mount, because firmware updates have moved that line before.
 
 Two things work differently over MTP, both because of what Calibre's driver exposes:
 a book's `.sdr` sidecar can't be deleted at all (see `remove` below), and every `.kfx`
@@ -344,7 +346,12 @@ Snapshots live under the output root:
 <output root>/_kindle/<serial>/backups/<UTC timestamp>/
 ```
 
-Each holds a `manifest.json` and a `files/` tree mirroring the device's own paths. A
+`<serial>` is your Kindle's own serial number — or, if it doesn't report one, a short
+`unknown-`-prefixed name derived from the volume instead, so two serial-less devices
+never share a folder. `media-tools ebook kindle status` tells you which one yours got.
+
+Each snapshot holds a `manifest.json` and a `files/` tree mirroring the device's own
+paths. A
 snapshot is built under a temporary name and renamed only once complete, so an
 interrupted run can leave an unfinished snapshot but never one that looks finished.
 Backups are incremental: a file that hasn't changed is hard-linked from the previous
@@ -494,8 +501,8 @@ media-tools convert media/lecture --to mp3 --batch lecture-mp3
   by `ebook kindle` against an MTP Kindle: `brew install --cask calibre`.
 - **`ebook kindle` says no Kindle found** — plug it in over USB and unlock the screen.
   A 2024-or-later model (or a Scribe) shows no disk at all; that's expected, it speaks
-  MTP and needs Calibre installed. `media-tools doctor` reports both the device and
-  Calibre's MTP driver, as warnings.
+  MTP and needs Calibre installed. `media-tools doctor` reports the device, and — only
+  when the one it finds speaks MTP — whether Calibre's driver is there.
 - **`ebook kindle` exits 3 before doing anything** — the mandatory pre-write backup
   failed, so nothing was attempted. Exit 3 means "a precondition was not met"; the one
   command that exits 1 instead is `ebook kindle backup` itself, where the snapshot is

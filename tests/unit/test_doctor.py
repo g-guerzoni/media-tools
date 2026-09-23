@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -125,16 +127,29 @@ def test_unwritable_output_root_is_reported_missing(tmp_path):
         os.chmod(root, 0o700)
 
 
-def test_venv_hint_matches_the_readme_python_version(monkeypatch):
-    # README.md and .claude/settings.json both tell a human/agent to use python3.13;
-    # doctor's own hint must not disagree and say python3.11 (the *minimum* supported,
-    # not what anyone is told to actually install).
+def test_venv_hint_names_no_particular_minor_version(monkeypatch):
+    """doctor's hint, README.md's clone+venv block and .claude/settings.json's hook
+    message are one coordinated instruction, and the thing that keeps them agreeing is
+    that none of them names a minor version. A pinned one (this used to be python3.13)
+    drifts the moment Homebrew moves, and then three files and this test disagree about
+    a number none of them needs — the project supports >= 3.11 and the CI matrix is
+    what proves it."""
     monkeypatch.setattr(doctor_task.sys, "prefix", "/usr")
     monkeypatch.setattr(doctor_task.sys, "base_prefix", "/usr", raising=False)
     check = doctor_task._venv_check()
     assert check.status == "warn"
-    assert "python3.13" in check.hint
-    assert "python3.11" not in check.hint
+    assert "python3 -m venv" in check.hint
+    assert not re.search(r"python3\.\d+", check.hint)
+
+
+def test_the_venv_instruction_names_no_minor_version_anywhere_it_appears():
+    # The other two copies of the same instruction. Kept here rather than in
+    # test_docs.py because what binds them is doctor's hint, not the formats table.
+    for path in (Path("README.md"), Path(".claude/settings.json")):
+        text = path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if "-m venv .venv" in line:
+                assert not re.search(r"python3\.\d+", line), f"{path}: {line.strip()}"
 
 
 # -- deno's "found but did not run" branch must hint like its ffmpeg twin ----------

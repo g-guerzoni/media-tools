@@ -10,10 +10,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         # 3.14 is not optional padding: it is the interpreter this project is
-        # actually developed and tested on (Homebrew dropped python@3.13 from the
-        # development machine, so the local .venv runs 3.14). Without it, "the tests
-        # pass" locally and "the tests pass" in CI were claims about two different
-        # interpreters.
+        # actually developed and tested on. Without it, "the tests pass" locally and
+        # "the tests pass" in CI were claims about two different interpreters. Nothing
+        # here (or in README.md, doctor's venv hint, or the session-start hook) tells
+        # anyone to install a particular minor version — the project supports >= 3.11,
+        # and this matrix is what makes that claim true rather than a pinned prose
+        # number that goes stale.
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4

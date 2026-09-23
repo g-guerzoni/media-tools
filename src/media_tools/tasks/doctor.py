@@ -136,10 +136,12 @@ def _venv_check() -> Check:
         "venv",
         "warn",
         "not running inside a virtualenv",
-        # Matches README.md's clone+venv instructions and .claude/settings.json's own
-        # hook message: python3.13 (Python >= 3.11 is only the minimum this project
-        # supports, not the version anyone is actually told to install).
-        hint="python3.13 -m venv .venv && .venv/bin/pip install -e . --group dev",
+        # Matches README.md's clone+venv instructions and .claude/settings.json's
+        # own hook message, all three of which name NO minor version. A pinned one
+        # (this used to say python3.13) drifts the moment Homebrew moves, and then
+        # three files and a test disagree about a number none of them needs: the
+        # project supports >= 3.11 and cares about nothing beyond that.
+        hint="python3 -m venv .venv && .venv/bin/pip install -e . --group dev",
     )
 
 
