@@ -12,13 +12,19 @@ complete, and three rules exist to make that trust honest:
    against a cold cache, would both let a FAILED listing pass as an empty device: the
    backup would write an empty snapshot, report success, and clear a destructive
    command to run. Anything the listing raises becomes `BackupFailed`, never an empty
-   snapshot. The remaining hole — a device that is simply gone, where a filesystem
-   walk returns nothing rather than raising — is NARROWED, not closed, from both
-   ends: `MassStorageBackend.list_files` raises when its mount is not a directory,
-   and a zero-file listing here is believed only after the backend answers a second
-   question (`free_space`). Neither catches a stale mountpoint whose directory is
-   still there and empty, so a genuinely empty device and a vanished one are not
-   perfectly distinguishable — only much harder to confuse.
+   snapshot. The hole this used to leave — a device that is simply gone, where a
+   filesystem walk returns nothing rather than raising — is CLOSED at the backend:
+   `MassStorageBackend.list_files` raises both when its mount is no longer a
+   directory and when the mount's `st_dev` no longer matches the one recorded when
+   detection handed the device over, which is what an unmounted volume looks like (an
+   empty mountpoint directory carrying the parent filesystem's `st_dev`). A zero-file
+   listing here is additionally believed only after the backend answers a second
+   question (`free_space`) — belt and braces behind that guard, not the guard itself.
+   What is left is a hand-constructed backend whose construction-time stat failed, so
+   there was no `st_dev` to record; `detect.find_device` cannot produce one, since it
+   only returns a mount it has already stat'd. A device that lists zero files and
+   answers is therefore a genuinely EMPTY device — a factory-reset Kindle — and gets a
+   successful, empty snapshot.
 2. **A snapshot directory is built under a `.partial` name** (`core.paths.temp_path`)
    and renamed only once it is complete, and the `latest` pointer moves only after
    that rename. A killed process can therefore leave an incomplete snapshot behind,
@@ -391,13 +397,13 @@ def _listing(device_backend, scope: Scope) -> list[DeviceFile]:
             error
         )
     if not found:
-        # Belt and braces behind `MassStorageBackend.list_files`, which now raises when
-        # its mount is not a directory at all: a zero-file listing is the one case where
-        # "empty" and "failed" look alike, so it gets a second question the backend
-        # cannot answer from a stale cache. This NARROWS the hole rather than closing
-        # it — a stale mountpoint whose directory is still there and empty passes both
-        # checks — and a factory-reset Kindle really does list zero files, so an empty
-        # listing from a device that answers is a successful, empty snapshot.
+        # Belt and braces behind `MassStorageBackend.list_files`, which raises both
+        # for a mount that is no longer a directory and for one whose `st_dev` has
+        # changed under it. "Empty" and "failed" look alike only here, so a zero-file
+        # listing gets a second question the backend cannot answer from a stale cache —
+        # cheap, since it only ever fires when the listing came back with nothing at
+        # all. A factory-reset Kindle really does list zero files, so an empty listing
+        # from a device that answers is a successful, empty snapshot, not a failure.
         _confirm_the_device_answered(device_backend)
     return sorted(
         (entry for entry in found if scope.includes(entry.path)), key=lambda entry: entry.path
