@@ -173,15 +173,16 @@ def register_subparsers(kindle_parser) -> None:
         "--match",
         metavar="TEXT",
         default=None,
-        help="Only consider device books whose path contains TEXT (case-insensitive) — "
-        "e.g. to retry the handful that reported no_cover without re-running the "
-        "backup and every other book.",
+        help="Only consider books whose device path OR own title/author contains "
+        "TEXT (case-insensitive) — e.g. to retry the handful that reported "
+        "no_cover without re-running the backup and every other book.",
     )
     thumbnails_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Report which books would be installed/skipped without taking a backup "
-        "or writing anything.",
+        "or writing to the device. Over MTP this still reads each matched book "
+        "into the local header cache, the same way scan does.",
     )
 
 
@@ -823,7 +824,6 @@ def _classify(device_books: list[dict], library_index: dict[str, dict], *, batch
 def _take_backup(
     reporter: Reporter,
     root: Path,
-    device: Device,
     backend: DeviceBackend,
     key: str,
     *,
@@ -867,7 +867,7 @@ def _take_backup(
 
 
 def _mandatory_backup(
-    reporter: Reporter, root: Path, device: Device, backend: DeviceBackend, key: str
+    reporter: Reporter, root: Path, backend: DeviceBackend, key: str
 ) -> tuple[dict | None, backup_module.Snapshot | None]:
     """For a WRITE command (not `backup` itself): take `_take_backup`'s snapshot and,
     on failure, return the `body`-shaped all-zero/exit-3 failure dict — the backup is
@@ -877,7 +877,7 @@ def _mandatory_backup(
     own write step AND report the protecting snapshot in its own `result.data`.
     """
     try:
-        snap = _take_backup(reporter, root, device, backend, key)
+        snap = _take_backup(reporter, root, backend, key)
     except backup_module.BackupFailed as error:
         reporter.error(code="backup_failed", message=str(error))
         return {
@@ -917,7 +917,6 @@ def run_backup(
             snap = _take_backup(
                 reporter,
                 root,
-                device,
                 backend,
                 key,
                 full=args.full,
@@ -996,23 +995,28 @@ def run_thumbnails(
     backend_factory: Callable[..., DeviceBackend] | None = None,
 ) -> int:
     """Install a cover thumbnail for every device book that lacks one (or, with
-    `--force`, for every book regardless; `--match TEXT` narrows to device paths
-    containing TEXT — the way to retry the handful of books that reported `no_cover`
-    without re-running the backup and every other book).
+    `--force`, for every book regardless; `--match TEXT` narrows to books whose
+    device path OR own EXTH title/author contains TEXT, case-insensitively — a
+    device's filenames are often opaque, so a user typing an author name must not
+    silently match nothing. This is the way to retry the handful of books that
+    reported `no_cover` without re-running the backup and every other book).
 
     Writing a thumbnail is a device write, so it takes the SAME mandatory backup
     every write command takes (`_mandatory_backup`), through the SAME backend
     instance `_run` already resolved (see this module's own docstring on holding one
     backend across a backup and the operation that follows it) — unless `--dry-run`,
-    which takes NO backup and writes nothing at all, only reporting what a real run
-    would do. A failure in the (real) backup is a precondition that was never
-    met — nothing about the actual write was attempted — so it keeps exit 3 and
-    `_mandatory_backup`'s all-zero-counts shape rather than `backup`'s own exit-1
-    "an item demonstrably failed" shape (Ruling R27). The snapshot that protected the
-    run is reported in `result.data.snapshot` (the same shape `backup`/`status`
-    use), and a run that actually changed a thumbnail is journalled
-    (`backup_module.journal_append`) so a future `restore --op` has something to
-    undo.
+    which takes NO backup and writes nothing to the DEVICE, only reporting what a
+    real run would do. **Over MTP, `--dry-run` still populates the local per-book
+    header cache** (`_materialize_for_scan`, the same read `scan` already does) —
+    reading each matched book's EXTH id/title/author needs a local copy of it
+    regardless of whether anything is ever written to the device. A failure in the
+    (real) backup is a precondition that was never met — nothing about the actual
+    write was attempted — so it keeps exit 3 and `_mandatory_backup`'s
+    all-zero-counts shape rather than `backup`'s own exit-1 "an item demonstrably
+    failed" shape (Ruling R27). The snapshot that protected the run is reported in
+    `result.data.snapshot` (the same shape `backup`/`status` use), and a run that
+    actually changed a thumbnail is journalled (`backup_module.journal_append`) so a
+    future `restore --op` has something to undo.
 
     Per book, after the backup:
     - Already carrying its exact thumbnail name (`_has_thumbnail`) and not
@@ -1047,7 +1051,7 @@ def run_thumbnails(
 
         if not dry_run:
             reporter.stage(stage="backup", index=2, count=len(stages))
-            failure, snap = _mandatory_backup(reporter, root, device, backend, key)
+            failure, snap = _mandatory_backup(reporter, root, backend, key)
             if failure is not None:
                 return failure
 
@@ -1059,9 +1063,15 @@ def run_thumbnails(
             for entry in all_entries
             if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
         ]
-        if args.match:
-            needle = args.match.lower()
-            book_entries = [entry for entry in book_entries if needle in entry.path.lower()]
+        # `--match` is deliberately NOT applied here, even though every book's
+        # device path is already known at this point. It also matches a book's own
+        # EXTH title/author (below), which are not read until every book's records
+        # are — a device's filenames are often opaque, and a user typing an author
+        # name should not silently match nothing just because it isn't IN the path.
+        # Pre-filtering by path alone here would be cheaper (fewer books to
+        # materialise over MTP), but it would silently break title/author matching
+        # for every `--match` call — do not "optimise" this back without also
+        # reading `TAG_TITLE`/`TAG_AUTHOR` before it.
 
         local_paths: dict[str, Path] = {}
         if device.mode == "mass_storage":
@@ -1075,7 +1085,7 @@ def run_thumbnails(
                 book.path: exth.read_records(local_paths[book.path]) for book in book_entries
             }
 
-        # One (book, already_covered) pair per matched device book, decided up
+        # One (book, already_covered) pair per MATCHED device book, decided up
         # front: a book already carrying its exact thumbnail name is never handed
         # to `thumbnails.install` at all (unless `--force`), but it still gets its
         # own `item` event below — silently dropping it would hide it from an agent
@@ -1083,12 +1093,19 @@ def run_thumbnails(
         # `exists` skip rather than omitting the item entirely. `local_path`, when
         # this book was already materialised for MTP (above), is threaded through
         # so `thumbnails.install` never fetches the same book a second time.
+        needle = args.match.lower() if args.match else None
         plan: list[tuple[thumbnails.Book, bool]] = []
         to_install: list[thumbnails.Book] = []
         for entry in book_entries:
             records = records_by_path[entry.path]
             book_id = exth.record_text(records, exth.TAG_UUID) or ""
             cdetype = exth.record_text(records, exth.TAG_CDETYPE) or thumbnails.DEFAULT_CDETYPE
+            if needle is not None:
+                title = exth.record_text(records, exth.TAG_TITLE) or ""
+                author = exth.record_text(records, exth.TAG_AUTHOR) or ""
+                haystacks = (entry.path, title, author)
+                if not any(needle in haystack.lower() for haystack in haystacks):
+                    continue
             book = thumbnails.Book(
                 device_path=entry.path,
                 book_id=book_id,
@@ -1135,7 +1152,10 @@ def run_thumbnails(
                 "pending": pending,
                 "outputs": [],
                 "run_file": None,
-                "data": {"thumbnails": {}},
+                # Same two keys the real run's `data` carries (`snapshot` explicitly
+                # `None` here, never omitted) — an agent parsing either shape gets a
+                # missing VALUE, never a missing KEY.
+                "data": {"thumbnails": {}, "snapshot": None},
             }
 
         def on_install_progress(done: int, total: int) -> None:
@@ -1193,11 +1213,24 @@ def run_thumbnails(
             )
 
         if outputs:
+            if snap is None:
+                # Unreachable in practice: `outputs` is only ever populated below
+                # this point, which is only reached when `dry_run` is False, which
+                # is exactly when the `if not dry_run:` block above ran
+                # `_mandatory_backup` and returned early on failure — so a
+                # successful arrival here always carries a real snapshot. Raised
+                # explicitly (not a bare `assert`, which `python -O` strips)
+                # because trusting that chain silently would turn a violated
+                # invariant into a confusing `AttributeError` on `None.path`
+                # instead of a clear error naming what actually broke.
+                raise RuntimeError(
+                    "internal error: a thumbnails run wrote to the device with no "
+                    "protecting snapshot on record"
+                )
             # An undo pointer for a run that actually changed a thumbnail (including
             # a `--force` run overwriting one already there) — the bytes are inside
             # the backup `snap` just took, but nothing recorded WHICH operation put
             # them there until now.
-            assert snap is not None  # `dry_run` is False here, so `_mandatory_backup` ran
             backup_module.journal_append(
                 root, key, {"op": "thumbnails", "paths": outputs, "snapshot": snap.path.name}
             )

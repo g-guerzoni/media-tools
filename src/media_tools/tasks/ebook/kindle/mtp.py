@@ -361,7 +361,7 @@ class MtpBackend:
         if PROTECTED_DIRS & set(parts) or prefix_targets_a_forbidden_system_child(parts):
             return []
         if self._listing is None:
-            files, complete = self._files_under("")
+            files, complete, _missing = self._files_under("")
             if not complete:
                 # An incomplete listing must never become this backend's idea of the
                 # device for the rest of its life.
@@ -413,13 +413,24 @@ class MtpBackend:
         # Cold cache: list only the parent folder (root, for a top-level path) rather
         # than paying for a full device scan for one existence check.
         prefix = "" if "/" not in path else path.rsplit("/", 1)[0]
-        files, complete = self._files_under(prefix)
+        files, complete, missing = self._files_under(prefix)
+        if missing:
+            # `missing` is a DEFINITE, verified answer — `kindle_mtp.py`'s own
+            # docstring calls it the ONLY exception that means "this folder is not
+            # on the device", not an incomplete listing. A path cannot exist under a
+            # folder that itself does not exist, so this is "verified absent", not
+            # "could not check": an MTP device with no `system/thumbnails/` at all
+            # (which silently discards a sideloaded cover) must still read as
+            # `rejected`, not `failed` — that is the exact case this whole check
+            # exists to get right.
+            return False
         if not complete:
-            # An INCOMPLETE listing must never answer this question — the caller
-            # (e.g. verifying a just-written Kindle thumbnail) needs to be able to
-            # tell "verified absent" from "could not check", and a possibly-wrong
-            # `False` here collapses that distinction (I3): a real device rejection
-            # and a merely inconclusive listing would otherwise look identical.
+            # `partial`/`note`, unlike `missing`, mean the listing itself could not
+            # be completed — genuinely inconclusive. The caller (e.g. verifying a
+            # just-written Kindle thumbnail) needs to be able to tell "verified
+            # absent" from "could not check", and a possibly-wrong `False` here
+            # collapses that distinction (I3): a real device rejection and a merely
+            # inconclusive listing would otherwise look identical.
             raise CalibreError(
                 f"could not verify whether {path!r} exists: the MTP listing needed to "
                 "check it was incomplete, so absence cannot be confirmed"
@@ -446,10 +457,17 @@ class MtpBackend:
 
     # -- internals ----------------------------------------------------------------
 
-    def _files_under(self, prefix: str) -> tuple[list[DeviceFile], bool]:
-        """`(files, complete)`. `complete` is False whenever the helper flagged the
-        listing as incomplete or as a missing prefix — such a listing is usable as an
-        answer but must not be cached as the state of the device."""
+    def _files_under(self, prefix: str) -> tuple[list[DeviceFile], bool, bool]:
+        """`(files, complete, missing)`. `complete` is False whenever the helper
+        flagged the listing as incomplete (`partial`/`note`) OR as a missing prefix
+        (`missing`) — none of the three is safe to CACHE as the state of the device.
+        `missing` is called out separately because, unlike `partial`/`note`, it is
+        the helper's own DEFINITE, verified answer — `kindle_mtp.py`'s own docstring
+        calls it the only exception that means "this folder is not on the device",
+        not merely "the listing could not be completed". A caller that can act on
+        that distinction (`exists`, below) should; one that cannot (`list_files`)
+        only needs `complete`.
+        """
         result = self._one({"op": "list", "path": prefix})
         files = [
             DeviceFile(
@@ -459,8 +477,9 @@ class MtpBackend:
             )
             for entry in result.get("files") or []
         ]
-        complete = not (result.get("partial") or result.get("missing") or result.get("note"))
-        return files, complete
+        missing = bool(result.get("missing"))
+        complete = not (result.get("partial") or missing or result.get("note"))
+        return files, complete, missing
 
 
 def _error_for(result: dict, op: dict) -> Exception:

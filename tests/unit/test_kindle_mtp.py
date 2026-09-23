@@ -1471,3 +1471,32 @@ def test_exists_does_not_cache_an_incomplete_root_listing(device):
         device_backend.exists("My Clippings.txt")
     assert device_backend.exists("My Clippings.txt")
     assert len(runner.calls) == 2
+
+
+def test_exists_returns_false_not_raise_for_a_definitely_missing_folder(device):
+    """Regression: the first version of the `partial`/`missing`/`note` fold treated
+    ALL THREE as equally inconclusive and raised for every one of them. But
+    `missing` is the helper's own DEFINITE, verified answer (`kindle_mtp.py`'s own
+    docstring: the only exception that means the folder genuinely is not there, not
+    merely that the listing could not be completed) — an MTP device with no
+    `system/thumbnails/` folder at all, which silently discards every sideloaded
+    cover, must still verify as `rejected` (`exists()` returning `False`), not
+    `failed` (raising). None of the three `partial=True` tests above could catch
+    this, since `missing` and `partial` are different flags."""
+    runner = FakeRunner(results(listing(missing=True, note="system/thumbnails does not exist")))
+    assert (
+        backend(device, runner).exists("system/thumbnails/thumbnail_X_EBOK_portrait.jpg") is False
+    )
+
+
+def test_exists_does_not_cache_a_missing_folders_empty_listing(device):
+    """A `missing` answer is about ONE folder, not the whole device — it must not
+    be trusted as `self._listing` (which stands for the full root listing)."""
+    runner = FakeRunner(
+        results(listing(missing=True)),
+        results(listing(("My Clippings.txt", 1, 1.0))),
+    )
+    device_backend = backend(device, runner)
+    assert device_backend.exists("system/thumbnails/x.jpg") is False
+    assert device_backend.exists("My Clippings.txt") is True
+    assert len(runner.calls) == 2

@@ -132,6 +132,12 @@ def test_write_then_read_round_trips(fake_kindle, tmp_path):
         "documents/audible/x.azw3",
         "system/wifi.cfg",
         "system/notthumbnails/x.jpg",
+        # A SECOND `system/` component, past a legitimate `system/thumbnails/`
+        # child — `validate_writable_path` must check every occurrence, not
+        # just the first (a `.index()`-based check would stop at the first
+        # "system", see it followed by "thumbnails", and never look at this
+        # second one at all).
+        "system/thumbnails/system/x.jpg",
     ],
 )
 def test_write_refuses_a_path_outside_what_this_project_may_ever_touch(fake_kindle, tmp_path, path):

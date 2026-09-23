@@ -1331,6 +1331,13 @@ def test_thumbnails_backup_failure_blocks_a_write_that_couldve_succeeded(
     )
     assert exit_code == EXIT_DEPENDENCY
 
+    # Exit 3 alone is not enough evidence: `device_not_found`/`device_busy` also
+    # exit 3, so this alone would still pass if the failure never actually went
+    # through `_mandatory_backup`. `backup_failed` in the event stream is what
+    # actually pins that the BACKUP is what blocked this write.
+    errors = [e for e in _events(capsys) if e["type"] == "error"]
+    assert any(e["code"] == "backup_failed" for e in errors)
+
     pt_thumb = kindle.mount / "system" / "thumbnails" / f"thumbnail_{PT_ID}_EBOK_portrait.jpg"
     assert not pt_thumb.exists()
 
@@ -1382,6 +1389,10 @@ def test_thumbnails_dry_run_reports_a_plan_and_writes_nothing(fake_kindle, tmp_p
 
     result = events[-1]
     assert result["pending"] == [PT_PATH]
+    # The real run's `data` has a `snapshot` key even when it's `null` — an agent
+    # parsing either shape gets a missing VALUE, never a missing KEY.
+    assert result["data"]["snapshot"] is None
+    assert result["data"]["thumbnails"] == {}
 
     # No backup was taken, and nothing was written.
     assert not (root / "_kindle").exists()
@@ -1407,6 +1418,34 @@ def test_thumbnails_match_narrows_to_device_paths_containing_the_text(
     item_events = {e["input"]: e for e in _events(capsys) if e["type"] == "item"}
     assert set(item_events) == {PT_PATH}  # EN_PATH never even considered
     assert item_events[PT_PATH]["status"] == "done"
+
+
+def test_thumbnails_match_also_matches_the_books_own_title_and_author(
+    fake_kindle, tmp_path, capsys
+):
+    """A device's filenames are often opaque — `--match` must also hit a book's own
+    EXTH title/author, not just its device path, or a user typing an author name
+    would silently match nothing. `kindle_device`'s EN book is planted with
+    EN_AUTHOR = "Someone Else Entirely", which shares NOTHING with EN_PATH
+    ("documents/en/A Book - An Author.azw3") — matching it is only possible by
+    actually reading the book's own EXTH 100, not its filename."""
+    kindle = kindle_device(fake_kindle)
+    root = tmp_path / "media"
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "thumbnails", "--match", "someone else", "--json", "-o", str(root)]
+    )
+    exit_code = kindle_cli.run_thumbnails(
+        args, device_finder=lambda: kindle, backend_factory=_mass_storage_factory
+    )
+    assert exit_code == EXIT_OK
+
+    item_events = {e["input"]: e for e in _events(capsys) if e["type"] == "item"}
+    assert set(item_events) == {EN_PATH}  # matched via EN_AUTHOR, not the path
+    # EN already carries its exact thumbnail (planted by `kindle_device`), so this
+    # also proves the matched book still goes through the normal covered/install
+    # decision rather than some separate match-only code path.
+    assert item_events[EN_PATH]["status"] == "skipped"
+    assert item_events[EN_PATH]["reason"] == "exists"
 
 
 # --- end-to-end (no real device in this environment) ---------------------------------

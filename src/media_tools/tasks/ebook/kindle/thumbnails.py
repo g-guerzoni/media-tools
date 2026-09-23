@@ -151,7 +151,13 @@ def _install_one(
         return "no_cover"
     if not _is_safe_component(book.book_id) or not _is_safe_component(book.cdetype):
         # A mangled EXTH value is REJECTED, not sanitized — see `_is_safe_component`
-        # and this module's own docstring on why (C2).
+        # and this module's own docstring on why (C2). This is also where a book
+        # whose EXTH 113 is a `urn:uuid:...` form (rather than the bare hex/base64
+        # id every fixture and every real Kindle-produced file here carries) ends
+        # up: the colon is illegal on FAT32 regardless, so rejecting it is correct,
+        # not a bug — it just reports identically to a genuine cover miss (both
+        # "no_cover"), since there is no registered code that means "id present but
+        # unusable" distinct from "no cover found".
         return "no_cover"
 
     source = cache_path(cache_dir, book.book_id)

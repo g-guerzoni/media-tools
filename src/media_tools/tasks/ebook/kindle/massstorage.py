@@ -6,14 +6,21 @@ operation is a filesystem call — no MTP session, no vendor protocol.
 never count as done"): a Kindle pulled mid-copy must never leave a truncated book
 sitting at its final name — on the device or on the host — and any failure anywhere in
 either staged copy, including a `KeyboardInterrupt`, must leave no `.partial` file
-behind either. `list_files` refuses to answer at all once the
+behind either. `list_files` AND `exists` both refuse to answer at all once the
 device is gone — a missing directory, or a mountpoint whose `st_dev` no longer matches
-the one recorded at construction — because an empty listing must mean "nothing is
-there", never "I could not look". It skips the macOS/Linux volume
-litter every removable disk accumulates, never descends into `audible/` (Amazon's
-audiobook data, untouchable by this whole plan), and only descends into `system/`
-as far as `system/thumbnails/` — the rest of `system/` is device internals (Wi-Fi
-credentials, logs, settings), not book content.
+the one recorded at construction — because an empty listing (or a bare `False` from
+`exists`) must mean "nothing is there", never "I could not look": a caller verifying a
+just-written file needs to tell "verified absent" from "the device vanished
+mid-check" apart, and a `Path.is_file()` that silently swallows the `OSError` an
+unmounted volume raises cannot make that distinction on its own. It skips the
+macOS/Linux volume litter every removable disk accumulates, never descends into
+`audible/` (Amazon's audiobook data, untouchable by this whole plan), and only
+descends into `system/` as far as `system/thumbnails/` — the rest of `system/` is
+device internals (Wi-Fi credentials, logs, settings), not book content. `write` also
+refuses any path outside what this project will ever touch (`validate_writable_path`,
+`backend.py`) before it moves a single byte — a device path can be built from
+untrusted data (a book's own EXTH records), so this is not merely a mirror of the
+read-side exclusions above; it is the one place a write specifically is checked.
 """
 
 from __future__ import annotations

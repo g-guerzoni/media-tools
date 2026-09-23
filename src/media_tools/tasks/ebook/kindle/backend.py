@@ -154,12 +154,14 @@ class DeviceWritePathRejected(RuntimeError):
 def validate_writable_path(path: str) -> str:
     """The one place a device-relative path is checked before EITHER backend writes
     to it — `MassStorageBackend.write` and `MtpBackend.write` both call this first.
-    Returns `path` unchanged when it is safe; raises `DeviceWritePathRejected`
-    otherwise. Mirrors the same exclusions `list_files` already enforces for READS
-    (`audible/` at any depth, everything under `system/` except its `thumbnails/`
-    child), now enforced for writes too — matched against every directory
-    component in the path, not just a listing prefix, since a write path is the
-    whole thing, not a folder being walked.
+    Returns the path with backslashes normalized to forward slashes when it is
+    safe (the same value either backend then joins onto its device root); raises
+    `DeviceWritePathRejected` otherwise. Mirrors the same exclusions `list_files`
+    already enforces for READS (`audible/` at any depth, everything under
+    `system/` except its `thumbnails/` child) — checking EVERY directory
+    component in the path, the same way `backup.Scope.includes` does for a
+    listing entry, not just the first occurrence of `system`, since a write path
+    is the whole thing, not a single listing prefix.
     """
     cleaned = str(path).replace("\\", "/")
     if not cleaned or cleaned.startswith("/") or cleaned.startswith("~"):
@@ -172,9 +174,10 @@ def validate_writable_path(path: str) -> str:
         raise DeviceWritePathRejected(
             f"refusing to write to {path!r}: inside a protected directory"
         )
-    if RESTRICTED_PARENT in directories:
-        index = directories.index(RESTRICTED_PARENT)
-        if index + 1 >= len(directories) or directories[index + 1] != RESTRICTED_EXCEPTION:
+    for index, part in enumerate(directories):
+        if part == RESTRICTED_PARENT and (
+            index + 1 >= len(directories) or directories[index + 1] != RESTRICTED_EXCEPTION
+        ):
             raise DeviceWritePathRejected(
                 f"refusing to write to {path!r}: only system/{RESTRICTED_EXCEPTION}/ is writable "
                 "under system/"
