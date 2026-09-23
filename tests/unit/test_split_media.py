@@ -198,7 +198,89 @@ def test_oversized_part_is_retried_with_a_smaller_budget_then_succeeds(tmp_path,
     assert all(p.stat().st_size <= 1_000_000 for p in outcome.outputs)
 
 
-def test_part_still_oversized_after_max_attempts_fails_and_keeps_no_part(tmp_path, monkeypatch):
+def test_part_still_shrinking_when_attempts_run_out_is_size_limit_unreachable(
+    tmp_path, monkeypatch
+):
+    # Each attempt DOES produce a smaller file than the last — the budget correction is
+    # working — it just doesn't get under the limit before MAX_ATTEMPTS runs out. This is
+    # the one case `size_limit_unreachable` is honestly for: attempts, not physics, ran out.
+    engine = MediaSplitEngine()
+    item = _item(tmp_path, source_size=5_000_000)
+    ctx = _context(tmp_path, max_bytes=1_000_000)
+
+    monkeypatch.setattr(
+        "media_tools.tasks.split.media.probe",
+        lambda p: Probe(duration_s=10.0, bitrate_bps=None),
+    )
+
+    sizes = iter([1_800_000, 1_300_000, 1_150_000])  # strictly shrinking, never <= 1_000_000
+    attempts = {"n": 0}
+
+    def fake_run_ffmpeg(argv, *, total_s=None, on_progress=None):
+        attempts["n"] += 1
+        Path(argv[-1]).write_bytes(b"y" * next(sizes))
+        return 0, ""
+
+    monkeypatch.setattr("media_tools.tasks.split.media.run_ffmpeg", fake_run_ffmpeg)
+
+    outcome = engine.process(item, ctx)
+
+    assert outcome.status == "failed"
+    assert outcome.reason == "size_limit_unreachable"
+    assert attempts["n"] == MAX_ATTEMPTS
+    assert outcome.outputs == []
+    out_dir = tmp_path / "out"
+    assert not list(out_dir.glob("*.mp4"))
+    assert not list(out_dir.glob(".*.partial"))
+
+
+def test_budget_is_scaled_proportionally_to_the_measured_overshoot(tmp_path, monkeypatch):
+    # Pins the actual fix: the next `-fs` budget must be `budget * limit / actual_size *
+    # SAFETY_FACTOR` (derived from how far off the MEASURED size was), not the old fixed
+    # `* 0.95` ladder — a single large overshoot must correct in one step, not three.
+    from media_tools.tasks.split.media import SAFETY_FACTOR
+
+    engine = MediaSplitEngine()
+    item = _item(tmp_path, source_size=5_000_000)
+    limit = 1_000_000
+    ctx = _context(tmp_path, max_bytes=limit)
+
+    monkeypatch.setattr(
+        "media_tools.tasks.split.media.probe", lambda p: Probe(duration_s=2.0, bitrate_bps=None)
+    )
+
+    budgets_seen = []
+    attempt = {"n": 0}
+
+    def fake_run_ffmpeg(argv, *, total_s=None, on_progress=None):
+        budget = int(argv[argv.index("-fs") + 1])
+        budgets_seen.append(budget)
+        attempt["n"] += 1
+        temp = Path(argv[-1])
+        # First attempt overshoots by far more than the old ladder's 15% (3 * 5%) cap —
+        # exactly the CI-observed case a fixed-percentage ladder could never correct.
+        size = 3_500_000 if attempt["n"] == 1 else 900_000
+        temp.write_bytes(b"y" * size)
+        return 0, ""
+
+    monkeypatch.setattr("media_tools.tasks.split.media.run_ffmpeg", fake_run_ffmpeg)
+
+    outcome = engine.process(item, ctx)
+
+    assert outcome.status == "done"
+    assert len(budgets_seen) == 2
+    first_actual_size = 3_500_000
+    expected_second_budget = int(budgets_seen[0] * limit / first_actual_size * SAFETY_FACTOR)
+    assert budgets_seen[1] == expected_second_budget
+    # The old ladder could only ever reach `budgets_seen[0] * 0.95` — nowhere close.
+    assert budgets_seen[1] < int(budgets_seen[0] * 0.95)
+
+
+def test_uncuttable_keyframe_interval_fails_honestly_and_keeps_no_part(tmp_path, monkeypatch):
+    # A single keyframe interval genuinely bigger than the limit: `-fs` checks size only
+    # AFTER a chunk is written, so once that one mandatory chunk exceeds `limit`, no lower
+    # budget ever produces a smaller file — this must be reported as
+    # `keyframe_interval_exceeds_max_size`, not blamed on running out of attempts.
     engine = MediaSplitEngine()
     item = _item(tmp_path, source_size=5_000_000)
     ctx = _context(tmp_path, max_bytes=1_000_000)
@@ -212,7 +294,7 @@ def test_part_still_oversized_after_max_attempts_fails_and_keeps_no_part(tmp_pat
 
     def fake_run_ffmpeg(argv, *, total_s=None, on_progress=None):
         attempts["n"] += 1
-        Path(argv[-1]).write_bytes(b"y" * 1_100_000)  # always oversized
+        Path(argv[-1]).write_bytes(b"y" * 1_100_000)  # identical regardless of budget
         return 0, ""
 
     monkeypatch.setattr("media_tools.tasks.split.media.run_ffmpeg", fake_run_ffmpeg)
@@ -220,9 +302,14 @@ def test_part_still_oversized_after_max_attempts_fails_and_keeps_no_part(tmp_pat
     outcome = engine.process(item, ctx)
 
     assert outcome.status == "failed"
-    assert outcome.reason == "size_limit_unreachable"
-    assert attempts["n"] == MAX_ATTEMPTS
+    assert outcome.reason == "keyframe_interval_exceeds_max_size"
+    # Two non-improving corrections in a row is the honest signal — it must not take more
+    # than the bounded attempt count to notice, even though it does need a second
+    # (escalated) correction to rule out a stall at the muxer's own chunk boundary rather
+    # than a truly oversized keyframe interval (see STALL_ESCALATION_FACTOR).
+    assert attempts["n"] <= MAX_ATTEMPTS
     assert outcome.outputs == []
+    assert outcome.data and "1.1 MB" in outcome.data["error"] and "1.0 MB" in outcome.data["error"]
     out_dir = tmp_path / "out"
     assert not list(out_dir.glob("*.mp4"))
     assert not list(out_dir.glob(".*.partial"))

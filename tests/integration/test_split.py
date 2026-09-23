@@ -12,8 +12,13 @@ def _cli(*args):
 
 
 def test_parts_never_exceed_the_limit_and_cover_the_source(make_video, tmp_path):
-    # Long enough that a third of its size still clears --max-size's 1MB floor.
-    video = make_video(seconds=130, name="long.mp4", size="640x480")
+    # Long enough that a third of its size still clears --max-size's 1MB floor. An
+    # explicit gop=15 (1 keyframe/s at 15fps) gives every ffmpeg build the same cut
+    # points — this test must not depend on a build's default keyframe interval, which
+    # is exactly what made it fail in CI while passing locally (a build that placed
+    # keyframes much further apart put the requested limit out of reach for the old,
+    # non-converging retry ladder).
+    video = make_video(seconds=130, name="long.mp4", size="640x480", gop=15)
     limit = video.stat().st_size // 3
     out = tmp_path / "media"
 
@@ -45,9 +50,10 @@ def test_file_under_the_limit_is_placed_unchanged(make_video, tmp_path):
 
 
 def test_batch_of_two_files(make_video, tmp_path):
-    # Long enough that half its size still clears --max-size's 1MB floor.
-    folder = make_video(seconds=70, name="in/one.mp4", size="640x480").parent
-    make_video(seconds=70, name="in/two.mp4", size="640x480")
+    # Long enough that half its size still clears --max-size's 1MB floor. Explicit gop=15
+    # for the same reason as above: cut points must not depend on a build's default.
+    folder = make_video(seconds=70, name="in/one.mp4", size="640x480", gop=15).parent
+    make_video(seconds=70, name="in/two.mp4", size="640x480", gop=15)
     out = tmp_path / "media"
     limit = (folder / "one.mp4").stat().st_size // 2
     result = _cli("split", str(folder), "--max-size", f"{limit}B", "-o", str(out), "-b", "b")

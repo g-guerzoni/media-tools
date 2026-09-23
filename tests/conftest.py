@@ -26,35 +26,41 @@ def ffmpeg_path() -> str:
 
 @pytest.fixture
 def make_video(tmp_path, ffmpeg_path):
-    def _make(seconds: int = 2, name: str = "clip.mp4", size: str = "320x240"):
+    def _make(
+        seconds: int = 2,
+        name: str = "clip.mp4",
+        size: str = "320x240",
+        gop: int | None = None,
+    ):
         target = tmp_path / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            [
-                ffmpeg_path,
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                f"testsrc=size={size}:rate=15",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440",
-                "-t",
-                str(seconds),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-c:a",
-                "aac",
-                "-shortest",
-                str(target),
-            ],
-            check=True,
-            capture_output=True,
-        )
+        args = [
+            ffmpeg_path,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc=size={size}:rate=15",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440",
+            "-t",
+            str(seconds),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ]
+        if gop is not None:
+            # An explicit keyframe interval, not the encoder's own default: a test that
+            # needs actual cut points (e.g. `split`) must not depend on how far apart an
+            # ffmpeg build happens to place keyframes by default — that differs enough
+            # between builds/platforms to change which `--max-size` values are reachable
+            # at all (see tests/integration/test_split.py).
+            args += ["-g", str(gop)]
+        args += ["-c:a", "aac", "-shortest", str(target)]
+        subprocess.run(args, check=True, capture_output=True)
         return target
 
     return _make

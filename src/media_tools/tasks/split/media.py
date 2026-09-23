@@ -16,11 +16,29 @@ from media_tools.core.ffmpeg import FFMPEG, probe, run_ffmpeg
 from media_tools.core.media_formats import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
 from media_tools.core.paths import fsync_replace, temp_path
 from media_tools.core.runner import Context, Item, Outcome
-from media_tools.core.sizes import parse_size
+from media_tools.core.sizes import format_size, parse_size
 
 MARGIN_RATIO = 0.02
 MAX_ATTEMPTS = 3
 MIN_PART_SECONDS = 0.05
+
+# Applied on top of the proportional budget correction (see `_write_part`) as a small
+# cushion below the theoretical `limit / actual_size` scale-down: the overshoot ratio
+# measured on one attempt is a good predictor for the next, not a perfect one (variable
+# packet sizes around the new cut point), so aiming exactly at the limit would still
+# leave a nonzero chance of a second, smaller overshoot.
+SAFETY_FACTOR = 0.97
+
+# `-fs` does not shrink the output continuously with the budget: ffmpeg's mp4 muxer
+# writes in whole interleaved chunks, so a budget that is only slightly smaller can
+# produce the BYTE-IDENTICAL file as the previous attempt (measured directly against a
+# real encode: a ~1% overshoot needed a budget cut several times larger than that 1% to
+# actually move the output at all). A plain proportional correction, scaled from a small
+# measured overshoot, can therefore land back on the same plateau. When that happens
+# once, this factor forces a harder cut for the next attempt instead of nibbling at the
+# same boundary again; a SECOND consecutive non-improvement after that is the genuine
+# signal that no `-fs` value at this position helps (see `_write_part`).
+STALL_ESCALATION_FACTOR = 0.5
 
 # ffmpeg picks a muxer from the OUTPUT filename's extension, but a part is written to a
 # `.partial` temp name first (so a crash leaves it for the runner's shared cleanup to
@@ -152,50 +170,12 @@ class MediaSplitEngine:
         while start < total - MIN_PART_SECONDS:
             index += 1
             temp = batch_dir / f".{source.stem}.part{index:02d}{source.suffix}.partial"
-            budget = int(limit * (1 - MARGIN_RATIO))
-            duration = 0.0
 
-            for _attempt in range(MAX_ATTEMPTS):
-                temp.unlink(missing_ok=True)
-                code, stderr = run_ffmpeg(
-                    [
-                        ffmpeg,
-                        "-y",
-                        "-ss",
-                        f"{start:.3f}",
-                        "-i",
-                        str(source),
-                        "-map",
-                        "0",
-                        "-c",
-                        "copy",
-                        "-fs",
-                        str(budget),
-                        "-avoid_negative_ts",
-                        "make_zero",
-                        "-f",
-                        muxer,
-                        str(temp),
-                    ]
-                )
-                if code != 0 or not temp.exists():
-                    self._discard(temp, parts)
-                    return Outcome(
-                        status="failed",
-                        outputs=[],
-                        bytes_out=None,
-                        reason="engine_error",
-                        data={"stderr": stderr},
-                    )
-                if temp.stat().st_size <= limit:
-                    duration = probe(temp).duration_s or 0.0
-                    break
-                budget = int(budget * 0.95)
-            else:
+            result = self._write_part(ffmpeg, source, start, limit, muxer, temp)
+            if isinstance(result, Outcome):
                 self._discard(temp, parts)
-                return Outcome(
-                    status="failed", outputs=[], bytes_out=None, reason="size_limit_unreachable"
-                )
+                return result
+            duration, _size = result
 
             if duration <= MIN_PART_SECONDS:
                 self._discard(temp, parts)
@@ -243,6 +223,112 @@ class MediaSplitEngine:
                 "overlap_s": round(max(0.0, covered - total), 2),
             },
         )
+
+    @staticmethod
+    def _write_part(
+        ffmpeg: str,
+        source: Path,
+        start: float,
+        limit: int,
+        muxer: str,
+        temp: Path,
+    ) -> tuple[float, int] | Outcome:
+        """Write one part at `start`, retrying with a budget corrected from the
+        MEASURED overshoot until the result fits under `limit`.
+
+        Returns `(duration_s, size)` on success. On failure returns a ready-to-return
+        failed `Outcome` — `engine_error` if ffmpeg itself failed, `size_limit_unreachable`
+        if attempts ran out while the output kept shrinking but never made it under the
+        limit, or `keyframe_interval_exceeds_max_size` if two corrections in a row failed
+        to produce a smaller file at all (the smallest part ffmpeg can write from this
+        source at this position is already this size, and it still exceeds `limit` — no
+        amount of retrying changes that). The caller is responsible for unlinking `temp`
+        and any already-accepted sibling parts; this method never leaves a final part in
+        place, but does not know about siblings.
+        """
+        budget = int(limit * (1 - MARGIN_RATIO))
+        previous_size: int | None = None
+        stalled_once = False
+
+        for _attempt in range(MAX_ATTEMPTS):
+            temp.unlink(missing_ok=True)
+            code, stderr = run_ffmpeg(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-ss",
+                    f"{start:.3f}",
+                    "-i",
+                    str(source),
+                    "-map",
+                    "0",
+                    "-c",
+                    "copy",
+                    "-fs",
+                    str(budget),
+                    "-avoid_negative_ts",
+                    "make_zero",
+                    "-f",
+                    muxer,
+                    str(temp),
+                ]
+            )
+            if code != 0 or not temp.exists():
+                temp.unlink(missing_ok=True)
+                return Outcome(
+                    status="failed",
+                    outputs=[],
+                    bytes_out=None,
+                    reason="engine_error",
+                    data={"stderr": stderr},
+                )
+
+            actual_size = temp.stat().st_size
+            if actual_size <= limit:
+                return probe(temp).duration_s or 0.0, actual_size
+
+            stalled = previous_size is not None and actual_size >= previous_size
+            if stalled and stalled_once:
+                # Two corrections in a row produced no smaller output: ffmpeg's `-fs`
+                # only checks the file size AFTER a whole chunk is already written (and
+                # the container trailer lands afterwards), so once a single mandatory
+                # chunk (a keyframe, or a whole GOP `-c copy` cannot split mid-way) is
+                # bigger than `limit` on its own, no lower budget will ever shrink it
+                # further. Reporting `size_limit_unreachable` here would blame the
+                # attempt count instead of the real cause.
+                temp.unlink(missing_ok=True)
+                return Outcome(
+                    status="failed",
+                    outputs=[],
+                    bytes_out=None,
+                    reason="keyframe_interval_exceeds_max_size",
+                    data={
+                        "error": (
+                            f"a keyframe interval at {start:.1f}s measured "
+                            f"{format_size(actual_size)}, over the {format_size(limit)} "
+                            "--max-size limit; try a larger --max-size"
+                        )
+                    },
+                )
+
+            # Proportional correction from the MEASURED overshoot, not a fixed ladder:
+            # `-fs` is a byte cap applied only after a chunk is written, so the real
+            # overshoot ratio varies with the source and is often far more than a fixed
+            # percentage (the old `* 0.95`) can correct within a bounded attempt count.
+            # Scaling by how far off the actual size was from the limit converges in one
+            # or two corrections instead.
+            correction = int(budget * limit / actual_size * SAFETY_FACTOR)
+            if stalled:
+                # The proportional correction alone did not move the needle last time
+                # (still landed on the same muxer chunk boundary) — force a harder cut
+                # before concluding it truly cannot be helped.
+                correction = min(correction, int(budget * STALL_ESCALATION_FACTOR))
+            stalled_once = stalled
+            previous_size = actual_size
+            budget = max(1, correction)
+
+        temp.unlink(missing_ok=True)
+        return Outcome(status="failed", outputs=[], bytes_out=None, reason="size_limit_unreachable")
 
     @staticmethod
     def _discard(temp: Path, parts: list[Path]) -> None:
