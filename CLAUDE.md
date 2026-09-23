@@ -43,7 +43,11 @@ Each entry in `checks` is `{"name", "status", "detail", "hint"}` with `status` o
   and in which mode; **no Kindle connected is `"ok"`**, not a warning, because there is
   no action attached to it and a permanent warn in a report whose other warns are all
   actionable teaches everyone to skim the level that carries the real blockers. A
-  Kindle another program HOLDS is a warn — that one has an action. `kindle-device`
+  Kindle that Calibre's GUI is HOLDING is a warn — that one has an action, and it is
+  asked about directly (`mtp.calibre_gui_is_running`, the same check `ebook kindle
+  status` reports as `held_by`), because `detect.find_device` never raises `DeviceBusy`
+  and a doctor waiting for that exception would report "ok" on a machine where every
+  `ebook kindle` command fails `device_busy`/exit 3. `kindle-device`
   never prints a serial; `ebook kindle status` is where that is asked for deliberately.
   `kindle-mtp-driver` reports whether Calibre's own MTP driver imports inside Calibre's
   interpreter, and **it only probes when `kindle-device` found an MTP Kindle** —
@@ -741,8 +745,16 @@ mass storage needs none of it. `doctor` reports both facts (`kindle-device`, the
 report `missing` or move `doctor`'s exit code, and neither warns about a state with
 nothing to act on.
 
-Three things behave differently over MTP, all because of what Calibre's cached device
-tree exposes:
+**Exactly one program may hold an MTP device**, and Calibre's GUI grabs a connected
+one the moment it sees it. `MtpBackend._preflight` therefore checks
+`calibre_gui_is_running()` before EVERY invocation — not once per backend, since the
+GUI can be started while a long run is in flight — and raises `DeviceBusy`, which
+reaches the user as `device_busy`/exit 3. It is the most likely reason an otherwise
+correct MTP command fails, `doctor`'s `kindle-device` check reports it, and the only
+fix is for a human to close Calibre: **never quit a program on the user's behalf.**
+
+Three further things behave differently over MTP, all because of what Calibre's cached
+device tree exposes:
 
 - a book's `.sdr` sidecar and anything under `system/` **cannot be deleted at all**
   (`mtp.MtpPathNotInCachedTree`) — reported as the `sidecar_not_removed` warning on a
@@ -780,9 +792,10 @@ do not write, and a run that does not write has nothing to protect.
 
 `_kindle` is one of `core.paths.RESERVED_ROOT_ENTRIES`; never point an input at it.
 `<serial>` above is `backup.device_key(device)`, NOT always a serial: a device that
-reports none gets `unknown-<8 hex of its mount name or model hint>`, never a shared
-constant (two serial-less devices under one root would otherwise write into each
-other's snapshots). Resolve the directory through `device_key`, or read it off
+reports none gets `unknown-<8 hex>`, hashed from the first of its mount name, its
+`model_hint`, or `"<mode>:<product_id>"` that is available — never a shared constant
+(two serial-less devices under one root would otherwise write into each other's
+snapshots). Resolve the directory through `device_key`, or read it off
 `status`; do not build it from `data.device.serial`, which is `null` for exactly the
 devices whose directory is not named after it.
 
@@ -827,11 +840,12 @@ A `--dry-run` list never contains `backup`, because a dry run takes none.
 
 **This subsystem is the exception to the `stage` contract above** ("once per entry in
 `start`'s `stages` list, in that order"). A failed precondition returns from `body`
-early, so a run that declared six stages can emit only `detect` and `backup` — most
-obviously a failed mandatory backup (`error: backup_failed`, exit 3), but also a
-`restore` whose `--op` id or snapshot cannot be resolved. `result` is still the last
-stdout line in every one of those cases; the stages list in `start` is what the run
-INTENDED, not a promise of what it reached.
+early, and how far it got varies: a failed mandatory backup (`error: backup_failed`,
+exit 3) emits `detect` and `backup` out of the six an `add` declared, while a `restore`
+whose `--op` id or snapshot cannot be resolved returns before announcing anything and
+emits `detect` alone. `result` is still the last stdout line in every one of those
+cases; the stages list in `start` is what the run INTENDED, not a promise of what it
+reached.
 
 #### What each command puts in `result.data`
 
@@ -995,8 +1009,9 @@ The adding half IS `add --batch NAME` — shared code, not a second implementati
 extra is a device book whose EXTH 113 id the batch does not carry. **Four things are
 never extras:**
 
-1. **A book with no id to compare.** The test is `(ids.get(path) or "") not in ("",
-   *library_ids)`, so an EMPTY id is never an extra — and that covers BOTH a read that
+1. **A book with no id to compare.** The test is
+   `(view.ids_by_path.get(entry.path) or "") not in ("", *library_ids)`, so an EMPTY id
+   is never an extra — and that covers BOTH a read that
    failed AND a book that legitimately carries no EXTH 113 at all (an `.epub`, a
    `.pdf`, a MOBI nobody wrote one into). Do not read this as "unreadable ids only": an
    id-less device book is never deleted by `--delete-extras --yes`, because absence from

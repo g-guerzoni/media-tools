@@ -326,10 +326,16 @@ reports the same thing — plus, when the Kindle it found speaks MTP, whether Ca
 driver is actually available. Detection never trusts a model table: it looks for the
 mount, because firmware updates have moved that line before.
 
-Two things work differently over MTP, both because of what Calibre's driver exposes:
-a book's `.sdr` sidecar can't be deleted at all (see `remove` below), and every `.kfx`
-book is refused for removal, because a purchased one can't be told apart from a
-sideloaded one there.
+**Close Calibre before using an MTP Kindle.** An MTP device allows exactly one
+program to hold it, and Calibre's desktop app grabs a connected device the moment it
+sees one — so every `ebook kindle` command will refuse to run while it is open, saying
+the device is busy. media-tools never quits a program for you. `media-tools doctor`
+flags this too, so you find out before a long command does.
+
+Two other things work differently over MTP, both because of what Calibre's driver
+exposes: a book's `.sdr` sidecar can't be deleted at all (see `remove` below), and
+every `.kfx` book is refused for removal, because a purchased one can't be told apart
+from a sideloaded one there.
 
 ### Every write is preceded by a backup, and there is no flag to skip it
 
@@ -347,13 +353,13 @@ Snapshots live under the output root:
 ```
 
 `<serial>` is your Kindle's own serial number — or, if it doesn't report one, a short
-`unknown-`-prefixed name derived from the volume instead, so two serial-less devices
-never share a folder. `media-tools ebook kindle status` tells you which one yours got.
+`unknown-`-prefixed name derived from whichever of the volume name, the model or the
+USB product id is available, so two serial-less devices never share a folder.
+`media-tools ebook kindle status` tells you which one yours got.
 
 Each snapshot holds a `manifest.json` and a `files/` tree mirroring the device's own
-paths. A
-snapshot is built under a temporary name and renamed only once complete, so an
-interrupted run can leave an unfinished snapshot but never one that looks finished.
+paths. A snapshot is built under a temporary name and renamed only once complete, so
+an interrupted run can leave an unfinished snapshot but never one that looks finished.
 Backups are incremental: a file that hasn't changed is hard-linked from the previous
 snapshot instead of being transferred again.
 

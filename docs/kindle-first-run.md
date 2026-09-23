@@ -74,8 +74,10 @@ Two lines in the report are about this feature:
 
 - `kindle-device` — whether a Kindle is connected, and in which mode. Having none
   attached is reported `ok`, not as a problem: a machine with no Kindle is not a broken
-  machine. A Kindle another program is holding IS flagged, because there is something
-  to do about that.
+  machine. An MTP Kindle that **Calibre's GUI is holding** IS flagged, because there is
+  something to do about that — an MTP device allows exactly one holder, so every
+  `ebook kindle` command would fail `device_busy` until Calibre is closed. (Mass
+  storage has no such lock and is never flagged this way.)
 - `kindle-mtp-driver` — whether Calibre's MTP driver imports inside Calibre's own
   interpreter. It is only probed when the line above found an **MTP** Kindle; otherwise
   it says `not probed`, because nothing else on the machine needs the driver.
@@ -148,8 +150,9 @@ the snapshot just written. It lands under
 ```
 
 with a `manifest.json` and a `files/` tree mirroring the device's own paths.
-`<serial>` is the device's own serial when it reports one — and `unknown-<8 hex>`,
-derived from the mount name or model hint, when it does not. **Check which you got
+`<serial>` is the device's own serial when it reports one — and `unknown-<8 hex>` when
+it does not, hashed from the first of the mount name, the model hint or
+`"<mode>:<product id>"` that is available. **Check which you got
 before going looking for a serial-named folder**; `status` above reported the serial,
 and a `null` there means the directory is the `unknown-` one.
 
@@ -283,12 +286,19 @@ volume really did disappear, that the Kindle says it is safe to unplug, and — 
 MTP — that the device is in a clean state afterwards and nothing else on the host is
 still holding it.
 
-If it fails, the error code says which kind of failure it was: `device_busy` means the
-volume is still in use after the one retry (close whatever is reading it and run
-`eject` again), and `dependency_missing` means a platform binary — `diskutil`,
-`udisksctl` or `sync` — is not there. Both exit 3, and the device is untouched either
-way. Worth deliberately provoking the busy case once, by leaving a file manager open on
-the volume, since neither branch has ever run for real.
+If it fails, the error code says which kind of failure it was, and `device_busy` means
+two different things depending on the mode:
+
+- **Mass storage** — the volume is still in use after the one retry. Close whatever is
+  reading it and run `eject` again.
+- **MTP** — Calibre's GUI is running, and an MTP device allows exactly one holder. That
+  check runs before *every* MTP invocation, not just this one, so the same code appears
+  for `status`, `scan` and everything else while Calibre is open. Close Calibre.
+
+`dependency_missing` is the other branch: a platform binary — `diskutil`, `udisksctl`
+or `sync` — is not there. Both exit 3, and the device is untouched either way. Worth
+deliberately provoking the busy case once, by leaving a file manager open on the volume
+(or Calibre open, over MTP), since neither branch has ever run for real.
 
 ## When something does not match
 
