@@ -145,11 +145,19 @@ def test_venv_hint_names_no_particular_minor_version(monkeypatch):
 def test_the_venv_instruction_names_no_minor_version_anywhere_it_appears():
     # The other two copies of the same instruction. Kept here rather than in
     # test_docs.py because what binds them is doctor's hint, not the formats table.
+    #
+    # The found-at-least-one assertion is the point: without it, rewording either copy
+    # (or moving it to another file) silently reduces this to a loop over nothing that
+    # keeps passing while covering nothing at all.
     for path in (Path("README.md"), Path(".claude/settings.json")):
-        text = path.read_text(encoding="utf-8")
-        for line in text.splitlines():
-            if "-m venv .venv" in line:
-                assert not re.search(r"python3\.\d+", line), f"{path}: {line.strip()}"
+        lines = [
+            line
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if "-m venv .venv" in line
+        ]
+        assert lines, f"{path} no longer carries the venv instruction this test exists to pin"
+        for line in lines:
+            assert not re.search(r"python3\.\d+", line), f"{path}: {line.strip()}"
 
 
 # -- deno's "found but did not run" branch must hint like its ffmpeg twin ----------
@@ -429,12 +437,14 @@ def _mtp_kindle():
     return kindle_detect.Device(serial=None, product_id=0x9981, mode="mtp", mount=None)
 
 
-def _patch_kindle(monkeypatch, *, finder=_no_kindle, calibre_debug=None):
-    """Both Kindle probes replaced: detection, and `calibre-debug`'s location. With
-    `calibre_debug=None` the driver check finds no tool, so nothing is ever spawned
-    even if the gate below it were to break."""
+def _patch_kindle(monkeypatch, *, finder=_no_kindle, calibre_debug=None, gui=False):
+    """Every Kindle probe replaced: detection, `calibre-debug`'s location, and the
+    process-table read behind the Calibre-GUI check. With `calibre_debug=None` the
+    driver check finds no tool, so nothing is ever spawned even if the gate below it
+    were to break."""
     monkeypatch.setattr(doctor_task.kindle_detect, "find_device", finder)
     monkeypatch.setattr(doctor_task.calibre, "find_tool", lambda name: calibre_debug)
+    monkeypatch.setattr(doctor_task.kindle_mtp, "calibre_gui_is_running", lambda: gui)
 
 
 def _kindle_checks(tmp_path) -> dict:
@@ -471,11 +481,12 @@ def test_a_machine_with_no_kindle_and_no_calibre_gets_no_kindle_warning(tmp_path
 
 
 def test_kindle_device_check_is_ok_when_nothing_is_connected(monkeypatch):
-    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", _no_kindle)
-    check, device = doctor_task._kindle_device_check()
+    _patch_kindle(monkeypatch)
+    check, device, skip_reason = doctor_task._kindle_device_check()
     assert check.status == "ok"
     assert "no Kindle connected" in check.detail
     assert device is None
+    assert skip_reason == "no Kindle connected"
     # The hint survives the demotion: it is what a user who EXPECTED a device needs.
     assert "kindle" in (check.hint or "").lower()
 
@@ -487,33 +498,75 @@ def test_kindle_device_check_reports_the_mode_when_one_is_connected(monkeypatch,
         mode="mass_storage",
         mount=tmp_path,
     )
-    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", lambda: device)
-    check, found = doctor_task._kindle_device_check()
+    _patch_kindle(monkeypatch, finder=lambda: device)
+    check, found, skip_reason = doctor_task._kindle_device_check()
     assert check.status == "ok"
     assert "mass storage" in check.detail.lower()
     assert found is device
+    assert "mass storage" in skip_reason
     # A serial identifies one physical device and nothing here needs it: `ebook kindle
     # status` is where a user asks for that, deliberately and one command at a time.
     assert "SERIAL-THAT-MUST-NOT-BE-PRINTED" not in check.detail + (check.hint or "")
 
 
 def test_kindle_device_check_reports_mtp_mode(monkeypatch):
-    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", _mtp_kindle)
-    check, device = doctor_task._kindle_device_check()
+    _patch_kindle(monkeypatch, finder=_mtp_kindle)
+    check, device, _ = doctor_task._kindle_device_check()
     assert check.status == "ok"
     assert "mtp" in check.detail.lower()
     assert device is not None and device.mode == "mtp"
 
 
-def test_kindle_device_check_warns_when_the_device_is_held(monkeypatch):
-    # A warn WITH an action attached, which is the difference from "no Kindle".
-    def busy():
-        raise kindle_detect.DeviceBusy("Calibre has it")
-
-    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", busy)
-    check, device = doctor_task._kindle_device_check()
+def test_kindle_device_check_warns_when_calibres_gui_holds_an_mtp_device(monkeypatch):
+    """The real gate, not a stub exception. `detect.find_device` returns a device or
+    raises `DeviceNotFound`, full stop — it NEVER raises `DeviceBusy`, which only the
+    two backends raise. So this is asked directly, the same way `ebook kindle status`
+    asks it. Without this, doctor reports "ok, connected (MTP)" on a machine where
+    every `ebook kindle` command fails device_busy/exit 3 at `MtpBackend._preflight`."""
+    _patch_kindle(monkeypatch, finder=_mtp_kindle, gui=True)
+    check, device, _ = doctor_task._kindle_device_check()
     assert check.status == "warn"
-    assert device is None
+    assert "calibre" in check.detail.lower()
+    assert "device_busy" in (check.hint or "")
+    # Still returned: whether the driver IMPORTS is a separate question from who holds
+    # the device, and the probe never opens one.
+    assert device is not None and device.mode == "mtp"
+
+
+def test_a_held_mtp_device_still_gets_its_driver_probed(monkeypatch, tmp_path):
+    _patch_kindle(monkeypatch, finder=_mtp_kindle, gui=True)
+    checks = _kindle_checks(tmp_path)
+    assert checks["kindle-device"].status == "warn"
+    # calibre-debug is absent under _patch_kindle's default, so the probe ran and found
+    # no tool — which is a warn, not the "not probed" skip.
+    assert "not probed" not in checks["kindle-mtp-driver"].detail
+
+
+def test_the_gui_check_is_not_consulted_for_a_mass_storage_kindle(monkeypatch, tmp_path):
+    """Mass storage has no single-holder lock, which is why `run_status` reports
+    `held_by` only for MTP. Doctor must not invent one."""
+
+    def boom():
+        raise AssertionError("the GUI check must not run for a mass-storage Kindle")
+
+    device = kindle_detect.Device(
+        serial=None, product_id=0x0004, mode="mass_storage", mount=tmp_path
+    )
+    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", lambda: device)
+    monkeypatch.setattr(doctor_task.kindle_mtp, "calibre_gui_is_running", boom)
+    check, _, _ = doctor_task._kindle_device_check()
+    assert check.status == "ok"
+
+
+def test_the_gui_check_never_raises(monkeypatch):
+    def boom():
+        raise OSError("no process table today")
+
+    _patch_kindle(monkeypatch, finder=_mtp_kindle)
+    monkeypatch.setattr(doctor_task.kindle_mtp, "calibre_gui_is_running", boom)
+    check, device, _ = doctor_task._kindle_device_check()
+    assert check.status == "ok"
+    assert device is not None
 
 
 def test_kindle_device_check_never_raises(monkeypatch):
@@ -522,10 +575,13 @@ def test_kindle_device_check_never_raises(monkeypatch):
     def boom():
         raise ValueError("ioreg said something unparseable")
 
-    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", boom)
-    check, device = doctor_task._kindle_device_check()
+    _patch_kindle(monkeypatch, finder=boom)
+    check, device, skip_reason = doctor_task._kindle_device_check()
     assert check.status == "warn"
     assert device is None
+    # NOT "no MTP Kindle connected": detection failed, so nothing is known about what
+    # is attached, and claiming otherwise on an "ok" row is a false statement.
+    assert skip_reason == "no device detected"
 
 
 # -- the driver probe, and the gate that keeps it off the session-start path -------
@@ -543,9 +599,30 @@ def test_kindle_mtp_driver_check_is_skipped_without_an_mtp_device(monkeypatch, t
         serial=None, product_id=0x0004, mode="mass_storage", mount=tmp_path
     )
     for device in (None, mass_storage):
-        check = doctor_task._kindle_mtp_driver_check(device)
+        check = doctor_task._kindle_mtp_driver_check(device, "some reason")
         assert check.status == "ok"
-        assert "not probed" in check.detail
+        assert check.detail == "not probed: some reason"
+
+
+def test_the_skipped_driver_check_says_which_of_three_reasons_applies(monkeypatch, tmp_path):
+    """An "ok" row must not assert something unknown. "no MTP Kindle connected" is
+    false when detection itself failed — nothing is known then about what is attached."""
+
+    def boom():
+        raise ValueError("ioreg said something unparseable")
+
+    mass_storage = kindle_detect.Device(
+        serial=None, product_id=0x0004, mode="mass_storage", mount=tmp_path
+    )
+    cases = {
+        _no_kindle: "not probed: no Kindle connected",
+        boom: "not probed: no device detected",
+        (lambda: mass_storage): "not probed: the connected Kindle is mass storage, "
+        "which needs no MTP driver",
+    }
+    for finder, expected in cases.items():
+        _patch_kindle(monkeypatch, finder=finder)
+        assert _kindle_checks(tmp_path)["kindle-mtp-driver"].detail == expected
 
 
 def test_kindle_mtp_driver_check_warns_when_calibre_debug_is_absent(monkeypatch):
