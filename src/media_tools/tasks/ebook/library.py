@@ -133,6 +133,7 @@ def reconcile(
     dry_run: bool,
     force: bool = False,
     id_reader: Callable[[Path], str | None] | None = None,
+    before_rename: Callable[[Path, Path], bool] | None = None,
 ) -> ReconcileReport:
     """Make the batch directory match `planned`, without reconverting anything
     that is already there under a different name.
@@ -157,6 +158,23 @@ def reconcile(
     would defeat `--force` for that one book. Its old file is then simply left
     unclaimed and swept to `_leftover/` like any other file the plan doesn't want,
     while the source gets a genuine reconversion.
+
+    `before_rename(twin, source)` (RB23), when given, is called on a candidate twin
+    BEFORE it is renamed into place, and the rename only happens when it returns
+    True. The caller uses this to rewrite the twin's embedded metadata (still under
+    its OLD name, OLD content) first — a failure there must never still rename the
+    file, or the file ends up sitting at a NEW path whose name promises content the
+    file does not actually have, with no way for a later run to tell "renamed and
+    correct" apart from "renamed but still wrong" (this was RB20/C1's own bug, one
+    layer deeper: renaming first and rewriting after left exactly that ambiguity
+    whenever the rewrite failed). On a `False`/failed `before_rename`, the twin is
+    left exactly where it is — not renamed, and explicitly protected from the
+    `_leftover/` sweep below — so the NEXT `reconcile()` call finds it again and
+    retries the same rename-and-rewrite attempt, instead of losing it to
+    `_leftover/` or silently giving up on it. `before_rename` is never called
+    during `dry_run` (which must never touch Calibre or the filesystem) or when the
+    caller passes none at all — both cases behave as if it always succeeds, the
+    original unconditional-rename behaviour.
     """
     id_reader = id_reader or _read_book_id
     existing = [
@@ -191,15 +209,26 @@ def reconcile(
             continue
         twin = None if force else by_id.get(book_ids.get(source, ""))
         if twin is not None and twin not in claimed_twins:
-            # The book is already converted, only its name changed: rename, never
-            # reconvert.
-            renamed += 1
-            renamed_sources.append(source)
-            claimed_targets.add(target)
+            ready = dry_run or before_rename is None or before_rename(twin, source)
+            if ready:
+                # The book is already converted, only its name changed: rename,
+                # never reconvert.
+                renamed += 1
+                renamed_sources.append(source)
+                claimed_targets.add(target)
+                claimed_twins.add(twin)
+                if not dry_run:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    twin.replace(target)
+                continue
+            # RB23: the rewrite failed. Deliberately NOT added to `missing` — that
+            # would make the caller run a full reconversion this same run, which
+            # would fill the target and leave nothing for a later run to retry,
+            # contradicting "the next run sees the same rename-and-rewrite work to
+            # do". Protect the twin from the leftover sweep below instead (it is
+            # claimed, just not renamed) so it survives, under its own name and
+            # content, for the next reconcile() call to find and retry.
             claimed_twins.add(twin)
-            if not dry_run:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                twin.replace(target)
             continue
         missing.append(source)
 

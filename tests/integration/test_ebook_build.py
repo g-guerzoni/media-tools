@@ -446,3 +446,250 @@ def test_a_multi_book_build_emits_progress_between_stage_events(make_epub, tmp_p
     assert any(metadata_stage_at < p < normalize_stage_at for p in progress_positions), (
         "a progress event must land between the metadata and normalize stage events"
     )
+
+
+# -- RB23: rewrite-before-rename must retry, and a stranded kept file must self-heal
+
+
+def test_a_failed_rewrite_is_retried_next_run_and_then_renames_cleanly(
+    make_epub, tmp_path, monkeypatch, capsys
+):
+    """C1's own mechanism regressed: renaming first and rewriting after left a
+    book stuck reporting `failed` forever whenever the rewrite failed even once,
+    with no retry path (the next run saw the target already occupied and called
+    it `kept`). RB23 rewrites the twin BEFORE renaming it, so a failed rewrite
+    leaves the twin under its OLD name/content for the next run to find and retry
+    — reproduced here exactly as the reviewer did: force `update_metadata` to
+    raise once, see the expected failure, restore a working `update_metadata`,
+    and confirm a plain rerun converges."""
+    from media_tools.cli import build_parser
+    from media_tools.integrations import calibre as calibre_mod
+    from media_tools.tasks.ebook import build as build_mod
+
+    book = make_epub(
+        title="Old Title", author="Jane Smith", language="en", name="Old Title - Jane Smith"
+    )
+    out = tmp_path / "media"
+
+    first = _cli(
+        "ebook",
+        "build",
+        str(book),
+        "--no-llm",
+        "-o",
+        str(out),
+        "-b",
+        "retry",
+        "--no-cover-fetch",
+        "--json",
+    )
+    assert first.returncode == 0
+    old_target = out / "retry" / "en" / "Old Title - Jane Smith.azw3"
+    assert old_target.is_file()
+
+    listing = tmp_path / "list.json"
+    listing.write_text(
+        json.dumps(
+            [{"path": str(book), "title": "New Title", "author": "Jane Smith", "language": "en"}]
+        )
+    )
+    args = build_parser().parse_args(
+        [
+            "ebook",
+            "build",
+            "--list",
+            str(listing),
+            "--no-llm",
+            "-o",
+            str(out),
+            "-b",
+            "retry",
+            "--no-cover-fetch",
+            "--json",
+        ]
+    )
+
+    real_update_metadata = calibre_mod.update_metadata
+    calls = {"n": 0}
+
+    def flaky_update_metadata(path, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise calibre_mod.CalibreError("simulated transient ebook-meta failure")
+        return real_update_metadata(path, **kwargs)
+
+    monkeypatch.setattr(build_mod.calibre, "update_metadata", flaky_update_metadata)
+
+    # First retitle attempt: the rewrite fails, so nothing must be renamed.
+    exit_code = build_mod.run(args)
+    assert exit_code == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    (item,) = [e for e in events if e["type"] == "item"]
+    assert item["status"] == "failed"
+    assert item["reason"] == "engine_error"
+    assert old_target.is_file(), "the twin must stay under its old name after a failed rewrite"
+    new_target = out / "retry" / "en" / "New Title - Jane Smith.azw3"
+    assert not new_target.exists()
+    old_meta = calibre.read_metadata(old_target, cache_dir=tmp_path / "verify-cache-1")
+    assert old_meta.title == "Old Title", "the untouched twin's content must be unchanged"
+    # nothing genuinely exists at the (new) target this attempt, so data.output
+    # being null here is correct, not the misleading case the third test covers.
+    run_data = json.loads((out / "retry" / "run.json").read_text())
+    (run_item,) = run_data["items"]
+    assert run_item["data"]["output"] is None
+
+    # Second attempt, same command, no code changes needed: update_metadata now
+    # succeeds (calls["n"] == 2), so reconcile() finds the SAME twin again and
+    # completes the rename it couldn't finish last time.
+    exit_code = build_mod.run(args)
+    assert exit_code == 0
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    (item,) = [e for e in events if e["type"] == "item"]
+    assert item["status"] == "skipped"
+    assert item["reason"] == "exists"
+    assert new_target.is_file() and not old_target.exists()
+    new_meta = calibre.read_metadata(new_target, cache_dir=tmp_path / "verify-cache-2")
+    assert new_meta.title == "New Title"
+
+
+def test_a_stranded_kept_file_is_repaired_by_a_plain_rerun(make_epub, tmp_path):
+    """RB23 point 2: a file already sitting at its target with a stale embedded
+    title (simulating a book stranded by the version this fix replaces, or any
+    other reason its metadata drifted from the plan) is verified, found
+    mismatched, and repaired with one rewrite-and-reverify attempt — not just
+    reported failed — the next time `ebook build` runs against the same batch."""
+    book = make_epub(
+        title="Correct Title", author="Jane Smith", language="en", name="Correct Title - Jane Smith"
+    )
+    out = tmp_path / "media"
+
+    first = _cli(
+        "ebook",
+        "build",
+        str(book),
+        "--no-llm",
+        "-o",
+        str(out),
+        "-b",
+        "heal",
+        "--no-cover-fetch",
+    )
+    assert first.returncode == 0
+    target = out / "heal" / "en" / "Correct Title - Jane Smith.azw3"
+    assert target.is_file()
+
+    # Simulate staleness directly, the way an earlier (pre-RB20) build could have
+    # left it: the file sits at the CORRECT path but carries the WRONG title.
+    calibre.update_metadata(
+        target,
+        title="Stranded Old Title",
+        author="Jane Smith",
+        language="en",
+        cache_dir=tmp_path / "strand-cache",
+    )
+    stranded = calibre.read_metadata(target, cache_dir=tmp_path / "verify-cache-0")
+    assert stranded.title == "Stranded Old Title"
+
+    # A plain rerun of the exact same command — nothing forces a reconversion or
+    # a rename; the file is already "kept" at its target.
+    result = _cli(
+        "ebook",
+        "build",
+        str(book),
+        "--no-llm",
+        "-o",
+        str(out),
+        "-b",
+        "heal",
+        "--no-cover-fetch",
+        "--json",
+    )
+    assert result.returncode == 0
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    (item,) = [e for e in events if e["type"] == "item"]
+    assert item["status"] == "skipped"
+    assert item["reason"] == "exists"
+
+    repaired = calibre.read_metadata(target, cache_dir=tmp_path / "verify-cache-1")
+    assert repaired.title == "Correct Title"
+
+
+def test_a_kept_file_that_keeps_failing_repair_is_reported_with_its_real_path(
+    make_epub, tmp_path, monkeypatch, capsys
+):
+    """The reviewer's third requirement: when the repair itself keeps failing, the
+    item must be reported `failed` with the file's real (target) path in
+    `data.output`, not null — the file genuinely exists there, just with the
+    wrong content, and a null output made this hard to diagnose by hand. The file
+    itself must be left exactly as it was: not moved, not deleted, its stale
+    title unchanged (a failed ebook-meta call must not half-write it)."""
+    from media_tools.cli import build_parser
+    from media_tools.integrations import calibre as calibre_mod
+    from media_tools.tasks.ebook import build as build_mod
+
+    book = make_epub(
+        title="Correct Title", author="Jane Smith", language="en", name="Correct Title - Jane Smith"
+    )
+    out = tmp_path / "media"
+    _cli(
+        "ebook",
+        "build",
+        str(book),
+        "--no-llm",
+        "-o",
+        str(out),
+        "-b",
+        "heal2",
+        "--no-cover-fetch",
+    )
+    target = out / "heal2" / "en" / "Correct Title - Jane Smith.azw3"
+    assert target.is_file()
+
+    calibre.update_metadata(
+        target,
+        title="Stranded Old Title",
+        author="Jane Smith",
+        language="en",
+        cache_dir=tmp_path / "strand-cache",
+    )
+
+    def always_fails(path, **kwargs):
+        raise calibre_mod.CalibreError("simulated persistent ebook-meta failure")
+
+    monkeypatch.setattr(build_mod.calibre, "update_metadata", always_fails)
+
+    args = build_parser().parse_args(
+        [
+            "ebook",
+            "build",
+            str(book),
+            "--no-llm",
+            "-o",
+            str(out),
+            "-b",
+            "heal2",
+            "--no-cover-fetch",
+            "--json",
+        ]
+    )
+    exit_code = build_mod.run(args)
+    assert exit_code == 1
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    (item,) = [e for e in events if e["type"] == "item"]
+    assert item["status"] == "failed"
+    assert item["reason"] == "engine_error"
+
+    # `data` (with `output`) lives in run.json's per-item record, not the `item`
+    # JSON Lines event itself.
+    run_data = json.loads((out / "heal2" / "run.json").read_text())
+    (run_item,) = run_data["items"]
+    assert run_item["status"] == "failed"
+    assert run_item["data"]["output"] == str(target), (
+        "a file genuinely at its target must not be null"
+    )
+
+    # the file was neither moved nor corrupted by the failed repair attempt.
+    assert target.is_file()
+    unchanged = calibre.read_metadata(target, cache_dir=tmp_path / "verify-cache-2")
+    assert unchanged.title == "Stranded Old Title"

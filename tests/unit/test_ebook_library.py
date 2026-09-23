@@ -294,3 +294,89 @@ def test_force_skips_the_twin_lookup_and_reconverts_instead_of_renaming(tmp_path
     assert not new.exists()
     # the old file was never renamed or reused — it becomes a leftover, not lost.
     assert (tmp_path / library.LEFTOVER_DIR / "pt" / "Cidade de Deus.azw3").is_file()
+
+
+# -- RB23: rewrite-before-rename — a failed before_rename must not rename, and must
+# protect the twin from the leftover sweep so a later reconcile() call retries it --
+
+
+def test_reconcile_does_not_rename_when_before_rename_fails(tmp_path):
+    old = tmp_path / "pt" / "Cidade de Deus.azw3"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"stale book content")
+    source = Path("/books/cidade.epub")
+    new = tmp_path / "pt" / "Cidade de Deus - Paulo Lins.azw3"
+
+    calls = []
+
+    def failing_rewrite(twin: Path, src: Path) -> bool:
+        calls.append((twin, src))
+        return False
+
+    report = library.reconcile(
+        tmp_path,
+        {source: new},
+        {source: "id-1"},
+        dry_run=False,
+        id_reader=lambda path: "id-1" if path == old else None,
+        before_rename=failing_rewrite,
+    )
+
+    assert calls == [(old, source)]
+    # nothing was renamed: the twin stays exactly where it was, with its own
+    # content, and the new target was never created.
+    assert old.is_file() and old.read_bytes() == b"stale book content"
+    assert not new.exists()
+    assert report.renamed == 0
+    assert report.renamed_sources == []
+    assert report.missing == []  # deliberately not "missing" either — see reconcile()'s docstring
+    # and, crucially, it must not have been swept to _leftover/ — that would lose
+    # the retry opportunity for the next reconcile() call.
+    assert report.leftover == []
+    assert not (tmp_path / library.LEFTOVER_DIR).exists()
+
+
+def test_reconcile_renames_once_before_rename_succeeds(tmp_path):
+    old = tmp_path / "pt" / "Cidade de Deus.azw3"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"book")
+    source = Path("/books/cidade.epub")
+    new = tmp_path / "pt" / "Cidade de Deus - Paulo Lins.azw3"
+
+    report = library.reconcile(
+        tmp_path,
+        {source: new},
+        {source: "id-1"},
+        dry_run=False,
+        id_reader=lambda path: "id-1" if path == old else None,
+        before_rename=lambda twin, src: True,
+    )
+
+    assert new.is_file() and not old.exists()
+    assert report.renamed == 1
+    assert report.renamed_sources == [source]
+
+
+def test_reconcile_never_calls_before_rename_during_a_dry_run(tmp_path):
+    old = tmp_path / "pt" / "Cidade de Deus.azw3"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"book")
+    source = Path("/books/cidade.epub")
+    new = tmp_path / "pt" / "Cidade de Deus - Paulo Lins.azw3"
+
+    def boom(twin, src):
+        raise AssertionError("before_rename must never be called during a dry run")
+
+    report = library.reconcile(
+        tmp_path,
+        {source: new},
+        {source: "id-1"},
+        dry_run=True,
+        id_reader=lambda path: "id-1" if path == old else None,
+        before_rename=boom,
+    )
+
+    # dry run reports optimistically (as the original unconditional-rename
+    # behaviour did) without ever touching Calibre or the filesystem.
+    assert report.renamed == 1
+    assert old.is_file() and not new.exists()

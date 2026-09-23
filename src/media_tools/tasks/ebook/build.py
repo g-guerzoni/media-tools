@@ -715,21 +715,20 @@ def _run_pipeline(
             if reaches_convert:
                 _announce_stage(reporter, "convert", stages)
                 convert_plan = _plan_and_reconcile(
-                    plan, batch_dir=batch_dir, to=args.to, force=args.force
+                    plan, batch_dir=batch_dir, to=args.to, force=args.force, cache_dir=cache_dir
                 )
                 _report_leftovers(convert_plan["leftover"], batch_dir=batch_dir, reporter=reporter)
+                # RB23: `convert_plan["rename_errors"]` comes from `reconcile()`'s
+                # `before_rename` hook — a metadata rewrite attempted (and, here,
+                # failed) on a twin BEFORE it was ever renamed, so merging it in
+                # alongside a real conversion failure is exactly the same
+                # "this book has no valid output this run" signal to `_finalize_group`.
+                convert_errors.update(convert_plan["rename_errors"])
                 workers = args.workers or min(4, os.cpu_count() or 1)
-                convert_errors = _convert_missing_books(
-                    plan, convert_plan, cache_dir=cache_dir, to=args.to, workers=workers
-                )
-                # RB20/C1: a file `reconcile()` renamed into place still carries
-                # whatever title/author/language it was converted with under its OLD
-                # name — rewrite it to match the plan so the rename is honest and
-                # `_verify_output` (below, in the "organize" phase) isn't comparing
-                # the new target's embedded metadata against a title Calibre never
-                # actually wrote there.
                 convert_errors.update(
-                    _rewrite_renamed_metadata(plan, convert_plan, cache_dir=cache_dir)
+                    _convert_missing_books(
+                        plan, convert_plan, cache_dir=cache_dir, to=args.to, workers=workers
+                    )
                 )
 
             if reaches_organize:
@@ -852,7 +851,7 @@ def _report_leftovers(leftover: list[Path], *, batch_dir: Path, reporter: Report
         )
 
 
-def _plan_and_reconcile(plan: _Plan, *, batch_dir: Path, to: str, force: bool):
+def _plan_and_reconcile(plan: _Plan, *, batch_dir: Path, to: str, force: bool, cache_dir: Path):
     entries = {
         group.winner: (plan.verdicts[group.winner], to, plan.book_ids[group.winner])
         for group in plan.groups
@@ -863,7 +862,39 @@ def _plan_and_reconcile(plan: _Plan, *, batch_dir: Path, to: str, force: bool):
             if target.exists():
                 target.unlink()
     book_ids = {source: plan.book_ids[source] for source in planned}
-    report = library.reconcile(batch_dir, planned, book_ids, dry_run=False, force=force)
+
+    # RB23: rewrite a twin's embedded metadata BEFORE it is renamed, not after —
+    # `reconcile()` only performs the rename once this returns True, so a failure
+    # here leaves the twin under its old name/content instead of stranding it at a
+    # new path whose name contradicts what the file actually contains (RB20/C1's
+    # own bug, one layer deeper: renaming first and rewriting after meant a failed
+    # rewrite still left the file "renamed" and never eligible for a retry, since a
+    # later run would see the target already occupied and call it `kept`).
+    rename_errors: dict[Path, str] = {}
+
+    def _rewrite_before_rename(twin: Path, source: Path) -> bool:
+        verdict = plan.verdicts[source]
+        try:
+            calibre.update_metadata(
+                twin,
+                title=verdict.title,
+                author=verdict.author,
+                language=verdict.language,
+                cache_dir=cache_dir,
+            )
+        except calibre.CalibreError as error:
+            rename_errors[source] = str(error)
+            return False
+        return True
+
+    report = library.reconcile(
+        batch_dir,
+        planned,
+        book_ids,
+        dry_run=False,
+        force=force,
+        before_rename=_rewrite_before_rename,
+    )
     return {
         "planned": planned,
         "collisions": collisions,
@@ -871,46 +902,25 @@ def _plan_and_reconcile(plan: _Plan, *, batch_dir: Path, to: str, force: bool):
         "kept": report.kept,
         "renamed": report.renamed,
         "leftover": report.leftover,
-        "renamed_sources": set(report.renamed_sources),
+        "rename_errors": rename_errors,
     }
 
 
-def _rewrite_renamed_metadata(plan: _Plan, convert_plan, *, cache_dir: Path) -> dict[Path, str]:
-    """RB20/C1: a file `reconcile()` renamed into place is, by construction, still
-    carrying the title/author/language it was converted with under its OLD name —
-    that is exactly what makes the rename free instead of a reconversion, but it
-    also means the file does not yet genuinely match the plan. Rewrite it here so
-    it does. Returns `{source: error message}` for any rewrite that failed, in the
-    same shape `_convert_missing_books` already returns, so both merge into one
-    `convert_errors` dict and `_finalize_group` needs no separate failure path for
-    "renamed" vs "converted"."""
-    errors: dict[Path, str] = {}
-    for source in convert_plan["renamed_sources"]:
-        verdict = plan.verdicts[source]
-        target = convert_plan["planned"][source]
-        try:
-            calibre.update_metadata(
-                target,
-                title=verdict.title,
-                author=verdict.author,
-                language=verdict.language,
-                cache_dir=cache_dir,
-            )
-        except calibre.CalibreError as error:
-            errors[source] = str(error)
-    return errors
-
-
 def _verify_output(target: Path, verdict: normalize_stage.Verdict, cache_dir: Path):
-    """Re-read a produced file (spec 8.2's verify stage). Returns (ok, warnings)
-    where ok=False means the file could not be confirmed at all (engine_error)."""
+    """Re-read a produced file (spec 8.2's verify stage). Returns
+    `(ok, warnings, title_mismatch)`: `ok=False` means the file could not be
+    confirmed at all (`engine_error`); `title_mismatch` is `True` only when the
+    file was readable but its title genuinely did not match — RB23's self-heal
+    (`_finalize_group`, below) repairs exactly this one failure mode with one
+    rewrite-and-reverify attempt, and nothing else (an unreadable file is a
+    different class of problem an in-place metadata rewrite is unlikely to fix)."""
     warnings: list[str] = []
     try:
         meta = calibre.read_metadata(target, cache_dir=cache_dir)
     except calibre.CalibreError:
-        return False, warnings
+        return False, warnings, False
     if meta.title is None or meta.title.strip() != verdict.title.strip():
-        return False, warnings
+        return False, warnings, True
     if target.suffix.lower().lstrip(".") in KINDLE_FORMATS:
         records = exth.read_records(target)
         if not exth.record_text(records, exth.TAG_UUID):
@@ -921,7 +931,7 @@ def _verify_output(target: Path, verdict: normalize_stage.Verdict, cache_dir: Pa
         # actually means here.
         if records.get(exth.TAG_COVER_OFFSET) is None or records.get(exth.TAG_THUMB_OFFSET) is None:
             warnings.append("cover_not_embedded")
-    return True, warnings
+    return True, warnings, False
 
 
 def _finalize_group(
@@ -944,13 +954,14 @@ def _finalize_group(
     target = convert_plan["planned"][group.winner]
     warnings = ["name_collision_suffixed"] if group.winner in convert_plan["collisions"] else []
 
-    # C1: `convert_errors` now holds BOTH a real conversion failure (a book that
-    # needed `ebook-convert`) and a failed metadata rewrite on a renamed book (see
-    # `_rewrite_renamed_metadata`) — checking it before branching on `missing`
-    # means a renamed-but-not-yet-honest book can fail here too, instead of the old
-    # code's unconditional "skipped/exists" for anything reconcile didn't have to
-    # convert, which is exactly what made a renamed book's stale embedded title
-    # report `failed` forever once `_verify_output` below actually checked it.
+    # C1/RB23: `convert_errors` holds BOTH a real conversion failure (a book that
+    # needed `ebook-convert`) and a failed metadata rewrite on a twin `reconcile()`
+    # tried to rename (`_plan_and_reconcile`'s `before_rename` hook, RB23) —
+    # checking it before branching on `missing` means that book can fail here too,
+    # instead of the old code's unconditional "skipped/exists" for anything
+    # reconcile didn't have to convert. `output=None` is correct in both cases:
+    # since RB23 rewrites BEFORE renaming, a failed rewrite here means the file was
+    # never renamed either — nothing genuinely exists at `target`.
     error = convert_errors.get(group.winner)
     if error is not None:
         data = _item_data(group, plan, reaches_covers=reaches_covers, output=None)
@@ -963,15 +974,45 @@ def _finalize_group(
             "output": None,
         }
 
-    if group.winner not in convert_plan["missing"]:
-        # Already there (kept), or renamed into place by reconcile() and its
-        # metadata rewritten to match (see above): nothing left to convert.
+    reused = group.winner not in convert_plan["missing"]
+    if reused:
+        # Already there (kept), or renamed into place by reconcile() with its
+        # metadata already rewritten to match (RB23: rewritten BEFORE the rename,
+        # so a file that reaches this point is honest by construction): nothing
+        # left to convert.
         status, reason = "skipped", "exists"
     else:
         status, reason = "done", None
 
     if reaches_organize and target.exists():
-        ok, verify_warnings = _verify_output(target, verdict, cache_dir)
+        ok, verify_warnings, title_mismatch = _verify_output(target, verdict, cache_dir)
+        if not ok and title_mismatch and reused:
+            # RB23 point 2: this file was never touched THIS run (kept as-is, or
+            # renamed in a run before its own metadata rewrite existed) — it can
+            # still be sitting at its correct path with a stale embedded title, and
+            # would otherwise fail forever with no path back to correct, exactly
+            # C1's original defect one layer deeper. One rewrite-and-reverify
+            # attempt self-heals it, including a book stranded on a user's machine
+            # by the very version this fix replaces.
+            try:
+                calibre.update_metadata(
+                    target,
+                    title=verdict.title,
+                    author=verdict.author,
+                    language=verdict.language,
+                    cache_dir=cache_dir,
+                )
+            except calibre.CalibreError as error:
+                data = _item_data(group, plan, reaches_covers=reaches_covers, output=target)
+                data["error"] = str(error)
+                return {
+                    "status": "failed",
+                    "reason": "engine_error",
+                    "warnings": warnings + verify_warnings,
+                    "data": data,
+                    "output": target,
+                }
+            ok, verify_warnings, _title_mismatch = _verify_output(target, verdict, cache_dir)
         warnings = warnings + verify_warnings
         if not ok:
             status, reason = "failed", "engine_error"

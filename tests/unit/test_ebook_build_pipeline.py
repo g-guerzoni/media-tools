@@ -69,10 +69,11 @@ def test_verify_output_passes_once_a_renamed_book_is_honest(monkeypatch, tmp_pat
     monkeypatch.setattr(calibre_mod, "read_metadata", fake_read_metadata)
     verdict = Verdict("ok", "New Title", "An Author", "en", "list", "list")
 
-    ok, warnings = build._verify_output(target, verdict, tmp_path / "cache")
+    ok, warnings, title_mismatch = build._verify_output(target, verdict, tmp_path / "cache")
 
     assert ok is True
     assert warnings == []
+    assert title_mismatch is False
 
 
 def test_verify_output_fails_on_a_genuine_mismatch(monkeypatch, tmp_path):
@@ -91,9 +92,30 @@ def test_verify_output_fails_on_a_genuine_mismatch(monkeypatch, tmp_path):
     monkeypatch.setattr(calibre_mod, "read_metadata", fake_read_metadata)
     verdict = Verdict("ok", "The Real Title", "An Author", "en", "heuristic", "heuristic")
 
-    ok, _warnings = build._verify_output(target, verdict, tmp_path / "cache")
+    ok, _warnings, title_mismatch = build._verify_output(target, verdict, tmp_path / "cache")
 
     assert ok is False
+    assert title_mismatch is True  # a readable file, just with the wrong title
+
+
+def test_verify_output_does_not_flag_title_mismatch_when_the_file_is_unreadable(
+    monkeypatch, tmp_path
+):
+    # RB23's self-heal repairs a title MISMATCH specifically; an unreadable file is
+    # a different class of problem and must not be flagged as repair-eligible.
+    target = tmp_path / "book.azw3"
+    target.write_bytes(b"x")
+
+    def fake_read_metadata(path, *, cache_dir, timeout=120):
+        raise calibre_mod.CalibreError("boom")
+
+    monkeypatch.setattr(calibre_mod, "read_metadata", fake_read_metadata)
+    verdict = Verdict("ok", "The Real Title", "An Author", "en", "heuristic", "heuristic")
+
+    ok, _warnings, title_mismatch = build._verify_output(target, verdict, tmp_path / "cache")
+
+    assert ok is False
+    assert title_mismatch is False
 
 
 # -- M5: cover-offset presence is a key check, not a UTF-8 decode -------------------
@@ -121,7 +143,7 @@ def test_verify_output_checks_cover_offset_presence_by_key_not_decode(monkeypatc
     monkeypatch.setattr(exth, "read_records", lambda path: fake_records)
 
     verdict = Verdict("ok", "Title", None, "en", "heuristic", "heuristic")
-    ok, warnings = build._verify_output(target, verdict, tmp_path / "cache")
+    ok, warnings, _title_mismatch = build._verify_output(target, verdict, tmp_path / "cache")
 
     assert ok is True
     assert "cover_not_embedded" not in warnings
@@ -144,7 +166,7 @@ def test_verify_output_reports_cover_not_embedded_when_the_records_are_absent(
     monkeypatch.setattr(exth, "read_records", lambda path: {exth.TAG_UUID: b"uuid-1"})
 
     verdict = Verdict("ok", "Title", None, "en", "heuristic", "heuristic")
-    ok, warnings = build._verify_output(target, verdict, tmp_path / "cache")
+    ok, warnings, _title_mismatch = build._verify_output(target, verdict, tmp_path / "cache")
 
     assert ok is True
     assert warnings == ["cover_not_embedded"]
