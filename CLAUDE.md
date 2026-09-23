@@ -204,13 +204,17 @@ when the LLM is enabled and no OpenRouter key resolves.
 `extension_filter_bypassed`, `device_rejected_thumbnail`, `hash_from_previous`,
 `name_collision_suffixed`, `leftover_book`.
 
-(`device_*`, `hash_from_previous` and the `llm_unavailable` reason above are reserved
-for the future Kindle-device path and not produced by anything today; `book_id_missing`,
-`cover_not_embedded`, `already_target_format`, `source_missing`,
+(`device_rejected_thumbnail` and the `llm_unavailable` reason above are reserved for
+the future Kindle-device path (`restore` and the LLM fallback, respectively) and not
+produced by anything today. `hash_from_previous` IS produced today, by `ebook kindle
+backup` — it fires when a reused file kept the hash the previous snapshot recorded for
+it instead of being re-read (pass `--verify-hashes` to recompute every one instead).
+`book_id_missing`, `cover_not_embedded`, `already_target_format`, `source_missing`,
 `name_collision_suffixed` and `leftover_book` are all produced by the `ebook` task
 described below (`leftover_book` is a standalone `warning` event, not attached to any
-one `item` — a leftover was never part of the plan to begin with). They're listed here
-regardless because the set is closed and this is the authoritative source.)
+one `item` — a leftover was never part of the plan to begin with; `book_id_missing` is
+also produced by `ebook kindle scan`, for a device book with no EXTH 113 id). They're
+listed here regardless because the set is closed and this is the authoritative source.)
 
 `-e/--extensions` only filters a **folder** scan. A file named directly on the command
 line is still processed as long as some engine accepts it, even when its extension is

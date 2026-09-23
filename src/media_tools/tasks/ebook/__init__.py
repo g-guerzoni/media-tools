@@ -8,7 +8,10 @@ same pipeline and simply stop after their own named stage.
 
 from __future__ import annotations
 
+import argparse
+
 from media_tools.tasks.ebook import build
+from media_tools.tasks.ebook.kindle import cli as kindle
 
 NAME = "ebook"
 HELP = "Build an ebook library, all at once (`build`) or stage by stage."
@@ -17,8 +20,26 @@ HELP = "Build an ebook library, all at once (`build`) or stage by stage."
 def register(subparsers):
     parser = subparsers.add_parser(NAME, help=HELP, description=HELP)
     build.register_subparsers(parser)
+    # `build.register_subparsers` just gave `parser` its one subparsers action (argparse
+    # allows only one per parser) with dest="ebook_command", covering its six
+    # stage-based subcommands (`SUBCOMMANDS`). `kindle` is not a stage in that pipeline
+    # — it gets its own nested dispatch instead (dest="kindle_command":
+    # status/scan/backup, wired by `kindle.register_subparsers` below) rather than a
+    # slot in `build.SUBCOMMANDS` — so it is added to that SAME action rather than a
+    # second one, which argparse would refuse outright ("cannot have multiple
+    # subparser arguments"). `run()` below is `kindle`'s own dispatch branch: it never
+    # reaches `build.run`, which would otherwise KeyError on `SUBCOMMANDS["kindle"]`.
+    subparsers_action = next(
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+    )
+    kindle_parser = subparsers_action.add_parser(
+        kindle.NAME, help=kindle.HELP, description=kindle.HELP
+    )
+    kindle.register_subparsers(kindle_parser)
     return parser
 
 
 def run(args) -> int:
+    if args.ebook_command == kindle.NAME:
+        return kindle.run(args)
     return build.run(args)
