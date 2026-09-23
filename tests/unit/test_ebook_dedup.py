@@ -284,6 +284,45 @@ def test_refine_never_calls_the_model_for_books_that_did_not_qualify_for_exact_g
     assert calls == [], "an ineligible pair must never even be sent to the model"
 
 
+def test_an_unknown_language_is_never_bucketed_in_the_fuzzy_pass():
+    # Minor finding: `dedup` used to treat `language=None` as if it were itself a
+    # shared language, letting two groups whose language simply couldn't be
+    # detected reach the LLM (and its cross-language guard, which only blocks a
+    # cluster spanning MORE than one language value — two `None`s look like one
+    # value to it) together in the same bucket. Excluding `None` from bucketing
+    # entirely — consistent with the existing non-"ok" exclusion — means these
+    # never even reach the model.
+    entries = _entries(
+        [
+            ("/b/Solaris - Lem A.epub", "Solaris", "Lem A", None),
+            ("/b/Solaris - Lem B.epub", "Solaris", "Lem B", None),
+        ]
+    )
+    groups = dedup.group(entries, formats=_formats(entries))
+    # different normalised title+author: the exact pass already keeps them apart.
+    assert len(groups) == 2
+
+    calls = []
+
+    def greedy_chat(messages, **kwargs):
+        calls.append(1)
+        from media_tools.integrations.openrouter import Usage
+
+        return {"clusters": [[0, 1]]}, Usage(1, 1)
+
+    refined, _ = dedup.refine(
+        groups,
+        entries,
+        _formats(entries),
+        model="m",
+        api_key="k",
+        preference=dedup.DEFAULT_PREFERENCE,
+        chat=greedy_chat,
+    )
+    assert len(refined) == 2, "an unknown language must never be treated as a shared bucket"
+    assert calls == [], "an unbucketable pair must never even be sent to the model"
+
+
 def test_the_exclusion_does_not_swallow_a_genuine_duplicate():
     # Guard against the fix above being too broad: a real same-language duplicate
     # (both "ok", both a usable title) must still merge through refine() as before.

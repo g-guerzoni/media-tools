@@ -167,9 +167,22 @@ def _is_bucketable(candidate: Group, entries: dict[Path, Verdict]) -> bool:
     """A group only enters the fuzzy-merge pass if it would have qualified for
     exact grouping too (see `group()`'s own guard): a non-"ok" verdict or an
     empty blocking key gives the model nothing reliable to compare, and every
-    reason to hallucinate a match between two blank/invalid entries."""
+    reason to hallucinate a match between two blank/invalid entries.
+
+    An unknown (`None`) language is excluded the same way: bucketing by
+    `(language, blocking_key)` would otherwise treat "we don't know the language"
+    as if it were itself a language every unknown-language book shares, putting
+    two books that are quite possibly in two different (undetected) languages in
+    front of the model together — and since `_merge_cluster`'s own cross-language
+    guard only blocks a cluster spanning *more than one* language value, two
+    `None`s look identical to it and the guard cannot catch what bucketing already
+    let through. Consistent with the rule above: no reliable signal, no bucket."""
     verdict = entries[candidate.winner]
-    return verdict.status == "ok" and bool(blocking_key(verdict.title))
+    return (
+        verdict.status == "ok"
+        and verdict.language is not None
+        and bool(blocking_key(verdict.title))
+    )
 
 
 def _ask_clusters(

@@ -2,10 +2,20 @@
 
 This library's filenames are curated; its embedded metadata frequently is not — a
 URL, a temp name like `tmp1603`, or the name of whoever packaged the file instead of
-the author. `heuristic` is the offline fallback (no LLM, no network): it trusts the
-filename over the embedded metadata wherever the two disagree. `classify` is the LLM
-path: it batches unclassified books, asks the model to clean them up, and caches every
-answer so re-running a build never re-pays for a book it already classified.
+the author. `heuristic` is the offline fallback (no LLM, no network): the filename
+wins for title AND author wherever the two disagree; a usable embedded title (or a
+non-junk embedded author) only steps in when the filename itself parses to something
+junk (a temp name, a scan artifact). `classify` is the LLM path: it batches
+unclassified books, asks the model to clean them up, and caches every answer so
+re-running a build never re-pays for a book it already classified.
+
+Language is a separate chain, and does NOT follow "filename wins" (RB22): a book's
+own embedded `<dc:language>` tag is trusted before the title heuristic runs, not only
+as a fallback when the heuristic finds nothing — once the heuristic *does* find a
+marker at all it is not conservative, and a short, common word can override an
+already-correct tag with a wrong, confident guess (see `heuristic`'s own docstring).
+The full precedence, including the LLM/`--list` layers above this module: `--list`
+override > LLM > embedded tag > title heuristic > unknown.
 
 The cache key (`signature`) is deliberately independent of the file's path — it is
 built from the filename plus the embedded title/author plus the model plus the prompt
@@ -20,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+from media_tools.core.paths import fsync_replace, temp_path
 from media_tools.integrations import openrouter
 from media_tools.tasks.ebook import language as lang
 from media_tools.tasks.ebook import names
@@ -68,6 +79,16 @@ class Verdict:
     author: str | None
     language: str | None
     source: str
+    # RB22: `source` already covers title/author/language jointly ("heuristic" /
+    # "llm" / "cache" / "list"); `language_origin` tracks the language field
+    # specifically, since it can come from a different step than the title/author
+    # did (e.g. title/author from the LLM, language from the book's own embedded
+    # tag because the model didn't answer). Also: the tool writes its own guess
+    # into the OUTPUT's `<dc:language>` field, so a re-ingested output's "embedded
+    # tag" would otherwise silently be an old guess wearing the tag's authority —
+    # recording where a run's language answer actually came from keeps that
+    # visible in `run.json` instead of laundering it through `origin`.
+    language_origin: str = "unknown"
 
 
 def signature(facts: BookFacts, model: str) -> str:
@@ -85,9 +106,9 @@ def signature(facts: BookFacts, model: str) -> str:
 
 
 def _usable_meta_title(text: str | None) -> bool:
-    """A meta title only beats the filename when it looks like an actual title:
-    not flagged by `names.is_junk_title`, and carrying at least one capital letter
-    the way a real title page does. This library's junk embedded titles are
+    """A meta title only beats a junk filename title when it looks like an actual
+    title: not flagged by `names.is_junk_title`, and carrying at least one capital
+    letter the way a real title page does. This library's junk embedded titles are
     routinely a lowercase slug — a packager's filename, a URL fragment — that
     `is_junk_title` alone does not catch."""
     if not text or names.is_junk_title(text):
@@ -95,11 +116,53 @@ def _usable_meta_title(text: str | None) -> bool:
     return any(c.isupper() for c in text)
 
 
+_IGNORED_LANGUAGE_TAGS = frozenset({"und", "mul", "zxx"})  # ISO 639-2 placeholders:
+# undetermined / multiple languages / no linguistic content — never a real answer.
+
+
+def _tag_language(meta_language: str | None) -> str | None:
+    """A book's own embedded `<dc:language>` tag, accepted only when it looks like
+    a genuine ISO 639-1 code: exactly two alphabetic characters, and never one of
+    the ISO 639-2 placeholder codes above. `calibre.read_metadata` already maps
+    known 3-letter codes back to two letters (`eng` -> `en`); a placeholder such as
+    `und` has no 2-letter form and is returned unchanged, so the length check alone
+    would already reject it — the explicit rejection here just makes that
+    deliberate rather than incidental."""
+    if not meta_language:
+        return None
+    code = meta_language.strip().lower()
+    if code in _IGNORED_LANGUAGE_TAGS:
+        return None
+    if len(code) == 2 and code.isalpha():
+        return code
+    return None
+
+
 def heuristic(facts: BookFacts) -> Verdict:
-    """The offline path: title from a usable embedded title else the filename;
-    author from the filename first, since this library's filenames are more
-    reliable than its embedded authors; language from `language.detect`."""
-    title = facts.meta_title.strip() if _usable_meta_title(facts.meta_title) else facts.file_title
+    """The offline path.
+
+    Title: the filename wins unless the filename's own title is itself junk (a
+    temp name like `tmp1603`, a scan artifact) — only then does a usable embedded
+    title step in. Author: the filename first, since this library's filenames are
+    more reliable than its embedded authors, else a non-junk embedded author.
+
+    Language (RB22 — supersedes an earlier ruling and does NOT follow "filename
+    wins"): the book's own embedded tag when it looks like a genuine two-letter
+    code, else `language.detect` on the title, else unknown. The tag must be
+    checked BEFORE the heuristic runs, not only used to fill in when the heuristic
+    abstains — once the heuristic finds a marker at all it is not conservative,
+    and a short, common word can then override an already-correct tag with a
+    wrong, confident guess: "Die Trying" (Lee Child, English, tagged "en") would
+    otherwise land on "de" because "die" is an exclusive German marker, and "Death
+    Du Jour" on "fr" because of "Du" — both confirmed against a real ~3,600-book
+    library.
+    """
+    if not names.is_junk_title(facts.file_title):
+        title = facts.file_title
+    elif _usable_meta_title(facts.meta_title):
+        title = facts.meta_title.strip()
+    else:
+        title = facts.file_title
 
     author: str | None
     if facts.file_author:
@@ -109,12 +172,20 @@ def heuristic(facts: BookFacts) -> Verdict:
     else:
         author = None
 
+    tag = _tag_language(facts.meta_language)
+    if tag:
+        language, language_origin = tag, "embedded_tag"
+    else:
+        detected = lang.detect(title, author)
+        language, language_origin = (detected, "title_heuristic") if detected else (None, "unknown")
+
     return Verdict(
         status="ok",
         title=title,
         author=author,
-        language=lang.detect(title, author),
+        language=language,
         source="heuristic",
+        language_origin=language_origin,
     )
 
 
@@ -131,13 +202,24 @@ def _load_cache(cache_file: Path | None) -> dict[str, dict]:
 def _save_cache(cache_file: Path | None, cache: dict) -> None:
     if cache_file is None:
         return
+    # I7: this cache is shared by every batch under the output root and is written
+    # from OUTSIDE any batch's lock — a concurrent run, or a Ctrl+C mid write, must
+    # never leave a truncated file that `_load_cache` then silently discards
+    # (paying for every one of those LLM calls again on the next run). Write to a
+    # `.partial` name, fsync it, then rename.
     cache_file.parent.mkdir(parents=True, exist_ok=True)
-    cache_file.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    temp = temp_path(cache_file)
+    temp.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    fsync_replace(temp, cache_file)
 
 
 def _verdict_from(answer: dict, *, source: str, facts: BookFacts) -> Verdict:
     """Normalise one book's answer from the model, falling back to the offline
-    heuristic for any field the model left blank or gave nonsense for."""
+    heuristic for any field the model left blank or gave nonsense for. RB22: the
+    model's own language answer beats the embedded tag (it knows the book; the tag
+    is frequently just Calibre's default) — but when the model gives none, the
+    fallback is the heuristic's OWN precedence (tag, then title, then unknown), not
+    a bare title guess."""
     fallback = heuristic(facts)
 
     status = answer.get("status")
@@ -158,15 +240,24 @@ def _verdict_from(answer: dict, *, source: str, facts: BookFacts) -> Verdict:
         author = None
 
     language = None
+    language_origin = fallback.language_origin
     raw_language = answer.get("language")
     if isinstance(raw_language, str):
         code = raw_language.strip().lower()
         if len(code) == 2 and code.isalpha():
             language = code
+            language_origin = source
     if language is None:
         language = fallback.language
 
-    return Verdict(status=status, title=title, author=author, language=language, source=source)
+    return Verdict(
+        status=status,
+        title=title,
+        author=author,
+        language=language,
+        source=source,
+        language_origin=language_origin,
+    )
 
 
 def _ask(
