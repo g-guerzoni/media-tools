@@ -675,13 +675,18 @@ def restore(
     selects everything beneath it. An entry this snapshot knows nothing about is
     reported as `not_in_snapshot` rather than silently dropped.
 
-    Every file's hash is checked against the manifest before a single byte is written,
-    and one that disagrees is refused rather than restored — see `RestoreReport`. That
-    is literally true, not approximately: EVERY selected file is verified in a first
-    pass and only then is anything written. A single loop that hashed and wrote file
-    by file would have written the first forty-nine books before discovering that the
-    fiftieth is corrupt, on the one path where the user is already recovering from
-    something — leaving them a half-restored device and a report that says so.
+    Every selected file is VERIFIED in a first pass, and only then is anything written.
+    A single loop that hashed and wrote file by file would have written the first
+    forty-nine books before discovering that the fiftieth is corrupt, on the one path
+    where the user is already recovering from something — leaving them a half-restored
+    device and a report that says so.
+
+    "Verified" is hashed against the manifest wherever the manifest records a hash, and
+    one that disagrees is refused rather than restored (see `RestoreReport`). An entry
+    with NO usable hash cannot be checked and is taken at face value instead — see
+    `_hash_agrees`, which explains why. So "every selected file is hashed" would be an
+    overstatement, and the distinction is worth keeping: it is the difference between a
+    guarantee and a best effort on the one command a user reaches while recovering.
 
     `dry_run` computes the same report, hashes included, and writes nothing at all.
 

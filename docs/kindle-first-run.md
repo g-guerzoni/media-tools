@@ -10,11 +10,17 @@ starts read-only and ends with a deletion you undo.
 
 `media-tools ebook kindle ...` is covered by a large offline test suite, and every one
 of those tests drives a simulated device — a directory shaped like a mass-storage
-Kindle, or a fake helper standing in for Calibre. **No line of the MTP device-facing
-code has ever run against a real MTP Kindle**, and the mass-storage eject path has
-never run against the real platform binaries either. The shapes below were read off a
-locally installed Calibre 9.15.0 by introspection (`inspect.signature`, `dis`), so the
-signatures and constants are real; the runtime behaviour is not verified.
+Kindle, or a fake helper standing in for Calibre. **Nothing here has ever touched a
+real Kindle**: not the MTP half, not the mass-storage half, not `eject`. The suite
+passing with nothing plugged in is the point of the suite, and it is not evidence about
+hardware; a `chmod`-ed directory is not a device that was unplugged mid-write.
+
+The MTP half is the more exposed of the two, because it also depends on shapes that
+were read off a locally installed Calibre 9.15.0 by introspection
+(`inspect.signature`, `dis`) rather than run: the signatures and constants are real,
+the runtime behaviour is not verified. The mass-storage half is ordinary filesystem
+work and its failure modes are better understood — but "better understood" is not
+"observed", and the checklist below treats both the same way.
 
 `src/media_tools/integrations/kindle_mtp.py` carries the full list in its FIRST-RUN
 VERIFICATION comment block, and that block is the thing to correct as each item is
@@ -97,9 +103,10 @@ Expected: exit 0, and a final `result` event whose `data.device` reports
 
 - `mode` — `"mass_storage"` or `"mtp"`,
 - `backend` — the matching `"mass_storage"` / `"mtp"` literal,
-- `serial`, `free_space`, and `held_by` — **MTP only**: it reads `"calibre_gui"` when
-  Calibre's GUI has the device, and is `null` on a mass-storage Kindle even with
-  Calibre open, because mass storage has no single-holder lock to report on,
+- `serial`, `model_hint` and `free_space` — reported in both modes,
+- `held_by` — **MTP only**: it reads `"calibre_gui"` when Calibre's GUI has the device,
+  and is `null` on a mass-storage Kindle even with Calibre open, because mass storage
+  has no single-holder lock to report on,
 
 plus `data.backup` with `last: null` (no snapshot yet), `abandoned_partials: []` and
 `header_cache_bytes: 0`.

@@ -21,8 +21,9 @@ def register(subparsers):
     # allows only one per parser) with dest="ebook_command", covering its six
     # stage-based subcommands (`SUBCOMMANDS`), AND RETURNS that action for exactly this
     # reason: `kindle` is not a stage in that pipeline — it gets its own nested dispatch
-    # instead (dest="kindle_command": status/scan/backup/thumbnails, wired by
-    # `kindle.register_subparsers` below) rather than a slot in `build.SUBCOMMANDS` —
+    # instead (dest="kindle_command": status/scan/backup/thumbnails/add/remove/sync/
+    # restore/eject, wired by `kindle.register_subparsers` below) rather than a slot
+    # in `build.SUBCOMMANDS` —
     # so it is added to that SAME action (`.add_parser()`, fully public API) rather
     # than a second one, which argparse would refuse outright ("cannot have multiple
     # subparser arguments"). `run()` below is `kindle`'s own dispatch branch: it never

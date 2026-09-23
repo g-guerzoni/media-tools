@@ -411,12 +411,15 @@ media-tools ebook kindle remove "documents/en/Book.azw3" --yes  # actually delet
   *addition* restores nothing, because the snapshot that protected it was taken before
   those files existed. Taking an added book off again is `remove`'s job.
 
-Every run that changed the device records an operation id, so a single operation can
-be undone on its own:
+Every run that changed the device reports an operation id as `data.operation` —
+`thumbnails`, `add`, `remove`, `sync` (which reports two, one per half) and `restore`
+itself — so a single operation can be undone on its own:
 
 ```bash
 media-tools ebook kindle restore --op <ID> --yes
 ```
+
+A run that changed nothing reports `null` there, because there is nothing to undo.
 
 ### Cover thumbnails, and the Colorsoft limitation
 
@@ -430,17 +433,21 @@ bug in this tool and nothing you did wrong. media-tools verifies the write after
 and reports those books as skipped rather than claiming a success that isn't there.
 The run still succeeds. On older models, thumbnails install normally.
 
-A book can also come back without a cover simply because there wasn't one to use —
-nothing in the library cache, nothing embedded in the book, or a cover that couldn't
-be resized.
+A book can also come back without a cover for three other reasons, all reported the
+same way: there wasn't one to use (nothing in the library cache and nothing embedded in
+the book), a cover was found but couldn't be resized, or the book's own id is one that
+can't be used as a filename on the device (a `urn:uuid:...` form, whose colon FAT32
+rejects). Only "no id at all" is told apart, by a `book_id_missing` warning.
 
 ### First time with a real Kindle
 
-Large parts of this — everything MTP-specific, and the eject path — have been built
-and tested against a simulated device, not a real one. `docs/kindle-first-run.md` is
-the checklist to work through the first time an actual Kindle is attached: read-only
-commands first, then a backup, then a single book added, then a single book removed
-and restored. It is explicit about what has never run against real hardware.
+**None of this has ever run against a real Kindle** — not the MTP half, not the
+mass-storage half, not `eject`. It is built and tested against simulated devices, and
+the whole suite passes with nothing plugged in, which is exactly why that is not
+evidence about hardware. `docs/kindle-first-run.md` is the checklist to work through
+the first time an actual Kindle is attached: read-only commands first, then a backup,
+then a single book added, then a single book removed and restored. Work through it in
+order, and keep the backup it takes until everything on it has been checked.
 
 ## Where output goes
 
@@ -510,9 +517,13 @@ media-tools convert media/lecture --to mp3 --batch lecture-mp3
   A 2024-or-later model (or a Scribe) shows no disk at all; that's expected, it speaks
   MTP and needs Calibre installed. `media-tools doctor` reports the device, and — only
   when the one it finds speaks MTP — whether Calibre's driver is there.
-- **`ebook kindle` exits 3 before doing anything** — the mandatory pre-write backup
-  failed, so nothing was attempted. Exit 3 means "a precondition was not met"; the one
-  command that exits 1 instead is `ebook kindle backup` itself, where the snapshot is
-  the work being asked for.
+- **`ebook kindle` exits 3 before doing anything** — a precondition was not met, and
+  the `error` event's `code` says which. `device_not_found` (no Kindle, or it went
+  away) is much the commonest; then `device_busy` (something else holds it — over MTP,
+  Calibre's GUI), `device_write_protected` (mounted read-only or locked),
+  `eject_failed`, `dependency_missing` (Calibre, or a platform binary, is not
+  installed) and `backup_failed` (the mandatory pre-write snapshot failed, so nothing
+  was attempted). The one command that exits 1 for a failed backup instead is
+  `ebook kindle backup` itself, where the snapshot *is* the work being asked for.
 - Run `media-tools doctor` any time — it checks all of the above and gives an
   install/upgrade hint for anything missing.

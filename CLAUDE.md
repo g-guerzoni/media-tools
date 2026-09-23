@@ -715,6 +715,18 @@ are documented in "`run.json`" below.
 `media-tools ebook kindle <subcommand>` is the only part of this tool that writes to
 hardware. Read this whole section before driving `add`, `remove`, `sync` or `restore`.
 
+> **None of it has ever run against a real Kindle.** Not the MTP half, not the
+> mass-storage half, not `eject`. Everything below is built and tested against
+> simulated devices — a directory shaped like a mounted Kindle, and a fake helper
+> runner for MTP — and the Calibre-facing constants were read off an installed Calibre
+> 9.15.0 by introspection, never exercised against hardware
+> (`integrations/kindle_mtp.py`'s FIRST-RUN VERIFICATION block itemises that half).
+> **`docs/kindle-first-run.md` is the checklist to work through the first time a real
+> device is attached**: read-only commands first, then a backup, then one book added,
+> then one removed and restored. Read it before running anything on this list against
+> hardware, and correct the code and that checklist rather than working around what you
+> find.
+
 ```bash
 media-tools ebook kindle status --json
 media-tools ebook kindle scan --json [--compare BATCH]
@@ -1053,9 +1065,12 @@ files restores them; undoing one that ADDED files restores nothing and reports
 that protected it was taken before those files existed. Taking an added book off again
 is `remove`'s job.
 
-Every selected file is hashed against the manifest before a byte is written, including
-in the plan; one that disagrees is `failed` with `detail: "corrupt: ..."` rather than
-restored. A snapshot from a DIFFERENT Kindle is refused unless `--force`. A run that
+Every selected file **that the manifest records a hash for** is hashed against it
+before a byte is written, including in the plan; one that disagrees is `failed` with
+`detail: "corrupt: ..."` rather than restored. An entry carrying no usable hash cannot
+be checked and is taken at face value rather than refused (`backup._hash_agrees`) —
+refusing it would make a manifest written before hashes existed useless for recovery,
+which is worse than the risk it leaves open. A snapshot from a DIFFERENT Kindle is refused unless `--force`. A run that
 actually put files back reports the protecting snapshot (`data.snapshot`) and its own
 journalled `data.operation`, exactly as every other write command does — a run that
 wrote nothing (a plan, or undoing an `add`) reports `null` for both. The snapshot

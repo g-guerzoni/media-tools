@@ -2219,7 +2219,10 @@ def _provenance_verdict(
     edited from 500 to 900 bytes whose device copy still matches the OLD recorded size
     would otherwise be reported "already on the device", for a file whose contents had
     changed. A record with no usable digest (an old entry, or one whose hash could not
-    be computed) proves nothing and is ignored, which errs towards copying again.
+    be computed) proves nothing and is ignored — which withholds BOTH values below, so
+    it errs towards REFUSING: no `exists` skip, and no waiver either, so an occupied
+    target path is an `output_collision` rather than an overwrite. (It re-copies only
+    where the path is free, which is the harmless half of that.)
 
     **First value — the `exists` skip.** A record whose digest matches AND whose device
     path still holds exactly the recorded size: these bytes are on the device, so there
@@ -4076,9 +4079,12 @@ def run_restore(
     deliberately removed — from a command line with no confirmation in it at all.
     Without `--yes` the run reports exactly what it would put back and writes nothing.
 
-    **Every selected file is hashed against the manifest before a byte is written**,
+    **Every selected file is verified against the manifest before a byte is written**,
     including in that plan, and one that disagrees is refused rather than restored:
-    recovery is exactly where a corrupt snapshot does the most damage. That hashing is
+    recovery is exactly where a corrupt snapshot does the most damage. Verified means
+    HASHED wherever the manifest recorded a hash; an entry that records none is taken
+    at face value rather than refused, because refusing it would make an older manifest
+    useless for recovery (`backup._hash_agrees`). That hashing is
     a full read of everything selected, which is why this run reports `progress` in
     two phases (`verify`, then `restore`) — a whole-library plan would otherwise sit
     silent for minutes.
