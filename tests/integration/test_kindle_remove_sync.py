@@ -984,6 +984,130 @@ def test_restore_without_yes_reports_the_plan_and_writes_nothing(fake_kindle, tm
     assert not any(e["type"] == "progress" and e["stage"] == "restore" for e in events)
 
 
+def test_a_restore_that_wrote_reports_its_snapshot_and_its_own_operation_id(
+    fake_kindle, tmp_path, capsys
+):
+    """`restore` was the only write command that left no trail: no `data.snapshot`, no
+    journal entry, no operation id — while its own docstring said the backup exists
+    "so the restore itself can be undone" and `README.md` claimed every run that
+    changed the device records an id that can be undone on its own.
+
+    It writes to the device and it takes the same mandatory backup as every other
+    write command, so it reports the same three things, and the id it hands back is
+    one `restore --op` really accepts."""
+    device = prepare_device(fake_kindle)
+    root = tmp_path / "media"
+    mount = device.mount
+    book_before = (mount / EN_PATH).read_bytes()
+
+    kindle_cli.run_remove(
+        _remove_args(root, "--match", EN_AUTHOR, "--yes"),
+        device_finder=lambda: device,
+        backend_factory=_mass_storage_factory,
+    )
+    removal_id = _events(capsys)[-1]["data"]["operation"]
+
+    assert (
+        kindle_cli.run_restore(
+            _restore_args(root, "--op", removal_id, "--yes"),
+            device_finder=lambda: device,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+    result = _events(capsys)[-1]
+    assert (mount / EN_PATH).read_bytes() == book_before
+
+    assert result["data"]["snapshot"]["snapshot"]
+    restore_id = result["data"]["operation"]
+    assert restore_id and restore_id != removal_id
+    # The `--op` it was ASKED to undo is a different field from the one it recorded.
+    assert result["data"]["restore"]["undoing"] == removal_id
+
+    journalled = {entry["id"]: entry for entry in backup_module.journal_read(root, device.serial)}
+    assert journalled[restore_id]["op"] == "restore"
+    assert EN_PATH in journalled[restore_id]["paths"]
+    assert journalled[restore_id]["snapshot"] == result["data"]["snapshot"]["snapshot"]
+
+    # And it really is undoable on its own: the snapshot this restore took first holds
+    # the device as it was with the book still absent.
+    capsys.readouterr()
+    assert (
+        kindle_cli.run_restore(
+            _restore_args(root, "--op", restore_id, "--yes"),
+            device_finder=lambda: device,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+
+
+def test_a_restore_plan_records_no_snapshot_and_no_operation(fake_kindle, tmp_path, capsys):
+    """A run without `--yes` writes nothing, so it has nothing to protect and nothing
+    to undo — a missing VALUE, never a missing key."""
+    device = prepare_device(fake_kindle)
+    root = tmp_path / "media"
+
+    kindle_cli.run_remove(
+        _remove_args(root, "--match", EN_AUTHOR, "--yes"),
+        device_finder=lambda: device,
+        backend_factory=_mass_storage_factory,
+    )
+    removal_id = _events(capsys)[-1]["data"]["operation"]
+    before = len(backup_module.journal_read(root, device.serial))
+
+    assert (
+        kindle_cli.run_restore(
+            _restore_args(root, "--op", removal_id),
+            device_finder=lambda: device,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+    data = _events(capsys)[-1]["data"]
+    assert data["snapshot"] is None
+    assert data["operation"] is None
+    assert data["restore"]["undoing"] == removal_id
+    assert len(backup_module.journal_read(root, device.serial)) == before
+
+
+def test_a_restore_that_put_nothing_back_records_no_operation(fake_kindle, tmp_path, capsys):
+    """Undoing an ADD restores nothing — the snapshot that protected it was taken
+    before those files existed. Nothing changed, so there is nothing to undo, and
+    `data.operation` says so rather than naming an empty journal entry."""
+    device = prepare_device(fake_kindle)
+    root = tmp_path / "media"
+    source = tmp_path / "books" / "Brand New.azw3"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(mobi_bytes(book_id=NEW_ID, title="Brand New", language="en"))
+
+    add_args = build_parser().parse_args(
+        ["ebook", "kindle", "add", str(source), "--json", "-o", str(root)]
+    )
+    assert (
+        kindle_cli.run_add(
+            add_args, device_finder=lambda: device, backend_factory=_mass_storage_factory
+        )
+        == EXIT_OK
+    )
+    add_id = _events(capsys)[-1]["data"]["operation"]
+
+    assert (
+        kindle_cli.run_restore(
+            _restore_args(root, "--op", add_id, "--yes"),
+            device_finder=lambda: device,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+    data = _events(capsys)[-1]["data"]
+    assert data["snapshot"]["snapshot"], "the mandatory backup still ran and is reported"
+    assert data["operation"] is None
+    assert not any(
+        entry["op"] == "restore" for entry in backup_module.journal_read(root, device.serial)
+    )
+
+
 def test_restore_of_a_whole_snapshot_puts_every_backed_up_file_back(fake_kindle, tmp_path, capsys):
     device = prepare_device(fake_kindle)
     root = tmp_path / "media"

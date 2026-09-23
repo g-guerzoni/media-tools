@@ -1373,6 +1373,9 @@ def test_thumbnails_reports_the_protecting_snapshot_and_journals_the_run(
     assert entries[0]["snapshot"] == snapshot_name
     thumb_path = f"system/thumbnails/thumbnail_{PT_ID}_EBOK_portrait.jpg"
     assert thumb_path in entries[0]["paths"]
+    # The id was journalled and then DISCARDED, so nothing a user can read named the
+    # operation they would have to pass to `restore --op`.
+    assert result["data"]["operation"] == entries[0]["id"]
 
 
 def test_thumbnails_dry_run_reports_a_plan_and_writes_nothing(fake_kindle, tmp_path, capsys):
@@ -1399,6 +1402,7 @@ def test_thumbnails_dry_run_reports_a_plan_and_writes_nothing(fake_kindle, tmp_p
     # The real run's `data` has a `snapshot` key even when it's `null` — an agent
     # parsing either shape gets a missing VALUE, never a missing KEY.
     assert result["data"]["snapshot"] is None
+    assert result["data"]["operation"] is None
     assert result["data"]["thumbnails"] == {}
 
     # No backup was taken, and nothing was written.

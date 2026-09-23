@@ -861,11 +861,11 @@ missing key, so one parser reads both shapes.
 | `status` | `device` (`mode`, `backend`, `model_hint`, `serial`, `free_space`, `held_by` — **MTP only**, see below), `backup` (`last`, `abandoned_partials`, `header_cache_bytes`) |
 | `scan` | `books[]`; `compare` (`batch`, `device_only`, `library_only`, `both`) only with `--compare` |
 | `backup` | `snapshot` |
-| `thumbnails` | `thumbnails` (`{book id or device path: "installed"\|"rejected"\|"no_cover"\|"failed"}`), `snapshot` |
+| `thumbnails` | `thumbnails` (`{book id or device path: "installed"\|"rejected"\|"no_cover"\|"failed"}`), `snapshot`, `operation` |
 | `add` | `books[]`, `thumbnails`, `snapshot`, `operation`, `free_space`, `bytes_planned`, `device_books_unreadable` |
 | `remove` | `books[]`, `removed[]`, `snapshot`, `operation` |
 | `sync` | `books[]`, `removals[]`, `extras[]`, `removed[]`, `thumbnails`, `snapshot`, `operation`, `remove_operation`, `free_space`, `bytes_planned`, `device_books_unreadable` |
-| `restore` | `restore` (`snapshot`, `operation`, `plan_only`, `files`, `bytes`, `missing`, `corrupt`, `no_thumbnail`, `not_in_snapshot`) |
+| `restore` | `snapshot`, `operation`, and `restore` (`snapshot`, `undoing`, `plan_only`, `files`, `bytes`, `missing`, `corrupt`, `no_thumbnail`, `not_in_snapshot`) |
 | `eject` | `device` (`mode`, `backend`) |
 
 `data.books[]` means two different things and the fields say which: for `add`/`sync` it
@@ -876,7 +876,13 @@ is the planned SOURCES (`source`, `device_path`, `book_id`, `title`, `author`,
 `not_removed`, `kept`, `shared_with`).
 
 `data.operation` is the id `restore --op ID` takes, `null` when the run changed
-nothing. A removal reports **no `outputs`** — deliberately: a removal produces nothing,
+nothing. **Every command that writes to the device reports one** — `thumbnails`, `add`,
+`remove`, `sync` (twice: `operation` and `remove_operation`) and `restore` itself, which
+records what it put back so the restore can be undone in its turn. `restore` also
+reports `data.restore.undoing`, which is the OPPOSITE direction: the `--op` it was
+asked to undo, echoed back. The two are named apart on purpose; one field meaning two
+opposite things depending on where it is read is what `remove`'s absent `outputs`
+already refuses to do. A removal reports **no `outputs`** — deliberately: a removal produces nothing,
 and reporting deleted paths as `outputs` would make one field mean two opposite things
 across `sync`'s two halves. What went away is `data.removed`.
 
@@ -1044,7 +1050,10 @@ is `remove`'s job.
 
 Every selected file is hashed against the manifest before a byte is written, including
 in the plan; one that disagrees is `failed` with `detail: "corrupt: ..."` rather than
-restored. A snapshot from a DIFFERENT Kindle is refused unless `--force`. The snapshot
+restored. A snapshot from a DIFFERENT Kindle is refused unless `--force`. A run that
+actually put files back reports the protecting snapshot (`data.snapshot`) and its own
+journalled `data.operation`, exactly as every other write command does — a run that
+wrote nothing (a plan, or undoing an `add`) reports `null` for both. The snapshot
 is resolved BEFORE the mandatory backup, never after — that backup becomes the newest
 snapshot, and a `restore` with no SNAPSHOT argument resolved afterwards would restore
 the state it had just recorded. One `item` per selected FILE, not per book.

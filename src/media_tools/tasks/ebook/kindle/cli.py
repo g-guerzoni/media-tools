@@ -1452,6 +1452,7 @@ def run_thumbnails(
     def body(reporter: Reporter, root: Path, device: Device, backend: DeviceBackend) -> dict:
         key = backup_module.device_key(device)
         snap: backup_module.Snapshot | None = None
+        operation: str | None = None
 
         if not dry_run:
             reporter.stage(stage="backup", index=2, count=len(stages))
@@ -1546,10 +1547,10 @@ def run_thumbnails(
                 "pending": pending,
                 "outputs": [],
                 "run_file": None,
-                # Same two keys the real run's `data` carries (`snapshot` explicitly
-                # `None` here, never omitted) — an agent parsing either shape gets a
-                # missing VALUE, never a missing KEY.
-                "data": {"thumbnails": {}, "snapshot": None},
+                # The same three keys the real run's `data` carries (`snapshot` and
+                # `operation` explicitly `None` here, never omitted) — an agent
+                # parsing either shape gets a missing VALUE, never a missing KEY.
+                "data": {"thumbnails": {}, "snapshot": None, "operation": None},
             }
 
         def on_install_progress(done: int, total: int) -> None:
@@ -1634,7 +1635,9 @@ def run_thumbnails(
             # a `--force` run overwriting one already there) — the bytes are inside
             # the backup `snap` just took, but nothing recorded WHICH operation put
             # them there until now.
-            backup_module.journal_append(
+            # Kept, not discarded: an id nothing reports is an id nobody can pass to
+            # `restore --op`, which is the whole point of writing it down.
+            operation = backup_module.journal_append(
                 root, key, {"op": "thumbnails", "paths": outputs, "snapshot": snap.path.name}
             )
 
@@ -1650,6 +1653,7 @@ def run_thumbnails(
             "data": {
                 "thumbnails": statuses,
                 "snapshot": _snapshot_summary(snap.path, fallback=snap) if snap else None,
+                "operation": operation,
             },
         }
 
@@ -4086,6 +4090,14 @@ def run_restore(
     One `item` is emitted per SELECTED FILE — not per book — so undoing an operation
     reports the book, its sidecar and its thumbnail separately, and a whole-snapshot
     restore reports every file in it.
+
+    **A run that wrote leaves the same trail every other write command leaves**: the
+    protecting snapshot in `data.snapshot`, and its own journalled id in
+    `data.operation`, so `restore --op <that id>` puts those paths back as they were
+    before this run — which is what "so the restore itself can be undone", two
+    paragraphs up, actually requires. `data.restore.undoing` is the other direction:
+    the `--op` this run was asked to undo. A run that wrote nothing — a plan, or
+    undoing an `add`, which restores nothing — reports `null` for both.
     """
     plan_only = not args.yes
     stages = ["detect", "restore"] if plan_only else ["detect", "backup", "restore"]
@@ -4160,9 +4172,10 @@ def run_restore(
                 exit_code=EXIT_USAGE,
             )
 
+        snap: backup_module.Snapshot | None = None
         if not plan_only:
             announce("backup")
-            failure, _ = _mandatory_backup(reporter, root, backend, key)
+            failure, snap = _mandatory_backup(reporter, root, backend, key)
             if failure is not None:
                 return failure
 
@@ -4244,6 +4257,22 @@ def run_restore(
             )
 
         counts, failed, pending, outputs = _report_rows(reporter, rows)
+
+        # The same trail every other write command leaves. `restore` used to leave
+        # none at all — no protecting snapshot in `data`, no journal entry, no id —
+        # while its own contract says the mandatory backup exists so that the restore
+        # ITSELF can be undone, and `README.md` promised every run that changed the
+        # device records an id undoable on its own. `report.paths` is exactly what was
+        # written, so `restore --op <this id>` puts back whatever those paths held
+        # before, out of the snapshot this run took first.
+        operation: str | None = None
+        if report.paths and snap is not None:
+            operation = backup_module.journal_append(
+                root,
+                key,
+                {"op": "restore", "paths": list(report.paths), "snapshot": snap.path.name},
+            )
+
         ok = not failed
         return {
             "ok": ok,
@@ -4254,9 +4283,16 @@ def run_restore(
             "outputs": outputs,
             "run_file": None,
             "data": {
+                "snapshot": _snapshot_summary(snap.path, fallback=snap) if snap else None,
+                "operation": operation,
                 "restore": {
                     "snapshot": str(snapshot_dir),
-                    "operation": args.op,
+                    # The `--op` this run was asked to UNDO, which is a different
+                    # thing from `data.operation` (the id this run itself recorded).
+                    # Named apart deliberately: one field meaning two opposite things
+                    # depending on where you read it is exactly what this subsystem
+                    # refuses to do elsewhere (see `remove`'s absent `outputs`).
+                    "undoing": args.op,
                     "plan_only": plan_only,
                     "files": report.files,
                     "bytes": report.bytes,
@@ -4264,7 +4300,7 @@ def run_restore(
                     "corrupt": report.corrupt,
                     "no_thumbnail": report.no_thumbnail,
                     "not_in_snapshot": report.not_in_snapshot,
-                }
+                },
             },
         }
 
