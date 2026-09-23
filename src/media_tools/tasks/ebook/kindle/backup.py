@@ -670,14 +670,20 @@ def restore(
     reported as `not_in_snapshot` rather than silently dropped.
 
     Every file's hash is checked against the manifest before a single byte is written,
-    and one that disagrees is refused rather than restored — see `RestoreReport`.
+    and one that disagrees is refused rather than restored — see `RestoreReport`. That
+    is literally true, not approximately: EVERY selected file is verified in a first
+    pass and only then is anything written. A single loop that hashed and wrote file
+    by file would have written the first forty-nine books before discovering that the
+    fiftieth is corrupt, on the one path where the user is already recovering from
+    something — leaving them a half-restored device and a report that says so.
 
     `dry_run` computes the same report, hashes included, and writes nothing at all.
 
     `on_progress(done, total, phase)` fires once per selected file, with `phase`
-    always `"restore"` — the same shape `snapshot()`'s own callback uses. It exists
-    because the hashing above is a full read of every selected file and happens under
-    `dry_run` too: a whole-library dry run would otherwise sit silent for minutes.
+    either `"verify"` (the hashing pass) or `"restore"` (the writing one, skipped
+    entirely under `dry_run`). It exists because that verification is a full read of
+    every selected file and happens under `dry_run` too: a whole-library dry run would
+    otherwise sit silent for minutes.
     """
     directory = Path(snapshot)
     data = _read_json(directory / MANIFEST_NAME)
@@ -697,24 +703,32 @@ def restore(
     else:
         wanted, no_thumbnail, unmatched = _expand(directory, index, only)
 
-    restored: list[str] = []
     missing: list[str] = []
     corrupt: list[str] = []
+    verified: list[tuple[str, Path]] = []
     total = 0
     selected = sorted(wanted)
     for done, path in enumerate(selected, start=1):
         stored = directory / FILES_DIR / _stored_of(index[path])
-        if stored.is_file() and _hash_agrees(stored, index[path]):
-            total += stored.stat().st_size
-            if not dry_run:
-                device_backend.write(stored, path)
-            restored.append(path)
-        elif stored.is_file():
+        if not stored.is_file():
+            missing.append(path)
+        elif not _hash_agrees(stored, index[path]):
             corrupt.append(path)
         else:
-            missing.append(path)
+            total += stored.stat().st_size
+            verified.append((path, stored))
         if on_progress:
-            on_progress(done, len(selected), "restore")
+            on_progress(done, len(selected), "verify")
+
+    restored: list[str] = []
+    if not dry_run:
+        for done, (path, stored) in enumerate(verified, start=1):
+            device_backend.write(stored, path)
+            restored.append(path)
+            if on_progress:
+                on_progress(done, len(verified), "restore")
+    else:
+        restored = [path for path, _ in verified]
     return RestoreReport(
         files=len(restored),
         bytes=total,
@@ -725,6 +739,16 @@ def restore(
         not_in_snapshot=sorted(set(unmatched)),
         dry_run=dry_run,
     )
+
+
+def manifest_serial(snapshot: Path) -> str | None:
+    """The device key the snapshot at `snapshot` was taken from, or `None` when its
+    manifest does not say. `restore` compares this against the device in front of it:
+    writing one Kindle's library onto another is not a restore, it is a swap, and
+    nothing downstream could tell the difference afterwards."""
+    data = _read_json(Path(snapshot) / MANIFEST_NAME)
+    serial = data.get("serial") if isinstance(data, dict) else None
+    return serial if isinstance(serial, str) and serial else None
 
 
 def _hash_agrees(stored: Path, entry: dict) -> bool:

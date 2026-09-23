@@ -9,14 +9,21 @@ per-book failure handling. Do not read this module's name or this docstring's hi
 as a promise that nothing here writes: that was true through Task 5 and is no longer
 true of anything below `run_backup`.
 
-**Nothing is ever deleted without `--yes`.** `remove` and `sync --delete-extras`
-without it are plans: they list what they would take, write nothing at all (not to the
-device, not a backup, not a journal entry) and exit. With `--yes` the mandatory backup
-runs FIRST and the deletions follow it, in one backend instance, never re-detected in
-between. A removal takes the book, its `.sdr` folder and its thumbnail together, and
-refuses outright for `audible/`, for `system/` outside `thumbnails/`, and for a
-purchased `*.kfx` (`_protection_refusal`). `restore` is the other side of that: it
-only ever writes files back out of a snapshot, and never deletes anything itself.
+**Nothing is ever deleted without `--yes`.** For `remove` and `restore` that covers
+the whole run: without `--yes` they report what they would take (or put back), write
+nothing at all — not to the device, not a backup, not a journal entry — and exit.
+`sync` is deliberately not the same, and the difference matters when reading this
+file: its ADDING half needs no confirmation and runs regardless (backup, copy,
+journal, exactly as `add` does), and `--delete-extras` without `--yes` only adds the
+removals to the PLAN. With `--yes` the mandatory backup runs FIRST and the deletions
+follow it, in one backend instance, never re-detected in between.
+
+A removal takes the book, its `.sdr` folder and its thumbnail together, and refuses
+outright for anything outside the area every backup covers (`backup.DEFAULT_SCOPE` —
+what the snapshot does not hold, `restore` could not put back), for `audible/`, for
+`system/` outside `thumbnails/`, and for a purchased `*.kfx` (`_protection_refusal`).
+`restore` is the other side of that: it only ever writes files back out of a snapshot,
+and never deletes anything itself.
 
 **Device resolution lives in exactly one helper, `resolve_device`.** It does detection
 (`device_finder`, defaulting to `detect.find_device`) and backend construction
@@ -432,10 +439,16 @@ def register_subparsers(kindle_parser) -> None:
         "that protected it (`result.data.operation` of the run that made it).",
     )
     restore_parser.add_argument(
-        "--dry-run",
+        "--yes",
         action="store_true",
-        help="Report what would be put back — hashes checked, exactly as a real run "
-        "checks them — and write nothing.",
+        help="Actually write. Without it the run reports what it would put back — "
+        "hashes checked, exactly as a real run checks them — and writes nothing.",
+    )
+    restore_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow a snapshot taken from a DIFFERENT Kindle to be written to this "
+        "one. Refused without it.",
     )
 
 
@@ -1823,9 +1836,10 @@ def _sources_from_paths(paths: list[Path]) -> list[_SourceBook]:
     return found
 
 
-def _library_batch(root: Path, batch: str, *, flag: str) -> tuple[list[_SourceBook], set[str]]:
-    """`(every book an `ebook build` run placed, every book id it recorded)`, from ONE
-    read of that batch's `run.json`.
+def _library_batch(root: Path, batch: str, *, flag: str) -> tuple[list[_SourceBook], set[str], int]:
+    """`(every book an `ebook build` run placed, every book id it recorded, how many
+    of its items are still pending or failed)`, from ONE read of that batch's
+    `run.json`.
 
     The SOURCES are filtered by `ADDABLE_SUFFIXES`, exactly as a FOLDER given on the
     command line is: a batch is a scan result, not a file the user pointed at, so an
@@ -1844,8 +1858,13 @@ def _library_batch(root: Path, batch: str, *, flag: str) -> tuple[list[_SourceBo
     sources: list[_SourceBook] = []
     ids: set[str] = set()
     seen: set[str] = set()
+    unfinished = 0
     for item in _read_library_items(root, batch, flag=flag):
-        if not isinstance(item, dict) or item.get("status") != "done":
+        if not isinstance(item, dict):
+            continue
+        if item.get("status") in ("pending", "failed"):
+            unfinished += 1
+        if item.get("status") != "done":
             continue
         data = item.get("data") if isinstance(item.get("data"), dict) else {}
         book_id = data.get("book_id")
@@ -1864,13 +1883,13 @@ def _library_batch(root: Path, batch: str, *, flag: str) -> tuple[list[_SourceBo
                 language=language if isinstance(language, str) else None,
             )
         )
-    return sources, ids
+    return sources, ids, unfinished
 
 
 def _sources_from_batch(root: Path, name: str) -> list[_SourceBook]:
     """`_library_batch`'s sources alone, for `add --batch NAME`, which has no use for
-    the library's ids (it matches what is already on the DEVICE, not what the library
-    lacks)."""
+    the library's ids or for how complete the batch is (it matches what is already on
+    the DEVICE, and it never deletes anything)."""
     try:
         batch = sanitize_batch(name)
     except BatchNameError as error:
@@ -2827,8 +2846,20 @@ def _sidecar_prefix(book_path: str) -> str:
 def _protection_refusal(path: str, all_paths: set[str], *, sidecars_visible: bool) -> str | None:
     """Why this tool will never delete `path`, or `None` if it may.
 
-    Three rules, all about content this tool did not put there and could not put back:
+    Five rules. The first is structural and the rest are about content this tool did
+    not put there and could not put back:
 
+    - **Anything the mandatory backup does not cover** (`backup.DEFAULT_SCOPE`) —
+      a book in a folder of the user's own making, or sitting at the device root. The
+      snapshot taken moments earlier does not hold it, so `restore` could not put it
+      back and would say `not_in_snapshot` while the book stayed gone. Deleting only
+      what the backup holds is the invariant that makes "every deletion is undoable"
+      true rather than merely intended, and it costs nothing: everything this tool
+      itself places lives under `documents/<lang>/`, which is in scope.
+    - **An absolute path, or one with a `.`/`..` component** — the same shapes
+      `validate_writable_path` refuses before a write. Unreachable from a device
+      listing, reachable from a command line, and the two checks are otherwise
+      line-for-line mirrors: they should not diverge.
     - **`audible/`** is Amazon's audiobook data, off-limits to this whole plan.
     - **`system/`** is device internals — Wi-Fi credentials, logs, settings — with
       only its `thumbnails/` child being ordinary cache data this tool writes.
@@ -2849,10 +2880,15 @@ def _protection_refusal(path: str, all_paths: set[str], *, sidecars_visible: boo
     still called immediately before every delete as the backstop (`_guarded_remove`);
     this is the layer that can explain itself to a user.
     """
-    cleaned = str(path).strip("/")
+    cleaned = str(path).replace("\\", "/").strip("/")
     parts = PurePosixPath(cleaned).parts
     if not cleaned or not parts:
         return "an empty device path names nothing to remove"
+    if str(path).startswith(("/", "~")) or any(part in ("..", ".") for part in parts):
+        return (
+            f"{path!r} is not a plain device-relative path (as `ebook kindle scan` "
+            "reports one), so this tool will not delete it"
+        )
     directories = parts[:-1]
     if PROTECTED_DIRS & set(directories):
         return (
@@ -2880,15 +2916,32 @@ def _protection_refusal(path: str, all_paths: set[str], *, sidecars_visible: boo
                 f"{cleaned} is a purchased KFX book: its DRM assets sit in {assets}, "
                 "and nothing on the host could put them back"
             )
+    if not backup_module.DEFAULT_SCOPE.includes(cleaned):
+        return (
+            f"{cleaned} is outside the area every backup covers "
+            f"({', '.join(backup_module.DEFAULT_SCOPE.directories)}), so the snapshot "
+            "taken to protect this run does not hold it and nothing could put it back"
+        )
     return None
 
 
 def _guarded_remove(backend: DeviceBackend, path: str) -> None:
-    """`validate_writable_path` FIRST, then the delete — the same backstop `write`
-    already has, for the same reason: a path handed to this can be built from a book's
-    own EXTH records (a thumbnail's name is), and neither backend's `remove` checks
-    anything itself."""
-    backend.remove(validate_writable_path(path))
+    """`validate_writable_path` FIRST, then the backup scope, then the delete — the
+    same backstop `write` already has, for the same reason: a path handed to this can
+    be built from a book's own EXTH records (a thumbnail's name is), and neither
+    backend's `remove` checks anything itself.
+
+    The scope check is what makes "nothing is deleted that the last snapshot does not
+    hold" an invariant of the one function that deletes, rather than a property of
+    whichever planner happened to call it (`_protection_refusal` explains the same
+    rule to the user, earlier and in words)."""
+    cleaned = validate_writable_path(path)
+    if not backup_module.DEFAULT_SCOPE.includes(cleaned):
+        raise DeviceWritePathRejected(
+            f"refusing to delete {path!r}: outside the area every backup covers, so "
+            "no snapshot holds it"
+        )
+    backend.remove(cleaned)
 
 
 def _companions_on_device(
@@ -2908,6 +2961,16 @@ def _companions_on_device(
     """
     prefix = _sidecar_prefix(book_path)
     sidecar = sorted(path for path in all_paths if path.startswith(prefix))
+    if any(
+        PurePosixPath(path).suffix.lower() == ".kfx" and _sidecar_prefix(path) == prefix
+        for path in all_paths
+    ):
+        # A `.kfx` shares this stem, so this `.sdr` is a purchased book's — belt and
+        # braces behind `_books_sharing_sidecar`: a sideloaded conversion sitting
+        # beside a purchase (`Book.kfx` + `Book.azw3`) must never be able to take the
+        # purchase's DRM assets with it, whatever any caller decides about the rest.
+        assets = f"{prefix}{ASSETS_DIR}/"
+        sidecar = [path for path in sidecar if not path.startswith(assets)]
     thumbnail = None
     if book_id:
         candidate = f"{thumbnails.THUMBNAIL_DIR}{thumbnails.thumbnail_name(book_id, cdetype)}"
@@ -2925,6 +2988,14 @@ def _books_sharing_sidecar(book_path: str, all_paths: set[str], removing: set[st
     reading position, highlights and page numbers of a book the user is KEEPING. That
     is the one case where a removal must leave the sidecar exactly where it is; it is
     reported as `kept` on the item rather than passed over in silence.
+
+    **`removing` must be the books that will ACTUALLY be removed, not the ones that
+    were selected.** A selection can contain books this tool then refuses — a
+    purchased `Book.kfx` beside a sideloaded `Book.azw3` is exactly that shape, and
+    both match one `--match`. Counting the refused purchase as "being removed" makes
+    its own `.sdr/assets` look unshared, and the conversion beside it would take the
+    purchase's DRM with it and report `done`. `_plan_removals` therefore resolves
+    every refusal BEFORE it computes this.
     """
     prefix = _sidecar_prefix(book_path)
     return sorted(
@@ -2975,7 +3046,12 @@ class _PlannedRemoval:
     title: str = ""
     author: str = ""
     size: int | None = None
-    companions: list[str] = field(default_factory=list)
+    # The sidecar files THIS row is slated to take (empty when another book keeps them
+    # or another row of the same run takes them), the co-selected books that share
+    # them, and the book's own thumbnail.
+    sidecar: list[str] = field(default_factory=list)
+    sidecar_siblings: list[str] = field(default_factory=list)
+    thumbnail: str | None = None
     kept: list[str] = field(default_factory=list)
     shared_with: list[str] = field(default_factory=list)
     sidecar_dir: str | None = None
@@ -2996,8 +3072,22 @@ class _PlannedRemoval:
         self.status, self.reason, self.detail = "done", None, None
 
     @property
+    def companions(self) -> list[str]:
+        """Everything that goes WITH the book, in deletion order."""
+        return [*self.sidecar, *([self.thumbnail] if self.thumbnail else [])]
+
+    @property
     def would_remove(self) -> list[str]:
         return [self.device_path, *self.companions]
+
+    @property
+    def is_off_the_device(self) -> bool:
+        """Did this row's book actually leave? `skipped`/`source_missing` counts: it
+        was not there to begin with. Anything else (refused, failed, not yet
+        attempted) means the book is still on the device."""
+        return self.status == "done" or (
+            self.status == "skipped" and self.reason == "source_missing"
+        )
 
     # --- what `_report_rows` reads off every reported row ----------------------
     @property
@@ -3046,18 +3136,73 @@ def _plan_removals(
     all_paths: set[str],
     start_id: int,
     sidecars_visible: bool,
+    protected_status: str = "failed",
+    ids_by_path: dict[str, str] | None = None,
 ) -> list[_PlannedRemoval]:
     """One row per book to remove, each already carrying the `.sdr` sidecar and the
     thumbnail that will go with it — and already refused if it names something this
-    tool never deletes."""
+    tool never deletes.
+
+    **Refusals are resolved FIRST**, before anything is decided about shared
+    sidecars, because a refused book stays on the device and therefore still needs
+    the sidecar it shares (see `_books_sharing_sidecar`).
+
+    `protected_status` is `"failed"` for `remove`, where the user aimed a selector at
+    that specific book and it did not happen, and `"skipped"` for `sync
+    --delete-extras`, where the user asked to mirror a batch and a protected book is a
+    permanent structural exclusion rather than a failed attempt — a mirror run that
+    can never exit 0 teaches everyone reading it to ignore exit 1 on the one command
+    that deletes books.
+
+    `ids_by_path`, when the caller has the whole device's ids (`sync` does, for free),
+    keeps a thumbnail that ANOTHER surviving book with the same EXTH 113 id also uses.
+    Partial or absent, it simply finds fewer sharers.
+    """
+    refusals = {
+        path: _protection_refusal(path, all_paths, sidecars_visible=sidecars_visible)
+        for path in paths
+    }
+    removing = {path.casefold() for path, refusal in refusals.items() if refusal is None}
+    ids = ids_by_path or {}
+
     rows: list[_PlannedRemoval] = []
-    removing = {path.casefold() for path in paths}
     for offset, path in enumerate(paths):
         records = records_by_path.get(path) or {}
         book_id = exth.record_text(records, exth.TAG_UUID) or ""
         cdetype = exth.record_text(records, exth.TAG_CDETYPE) or thumbnails.DEFAULT_CDETYPE
         sidecar, thumbnail, sidecar_dir = _companions_on_device(path, book_id, cdetype, all_paths)
-        shared_with = _books_sharing_sidecar(path, all_paths, removing)
+        # Tracked apart from the thumbnail's own sharers below, because only THIS one
+        # decides whether the sidecar stays: a cover shared with another book says
+        # nothing about who reads the reading position.
+        sidecar_sharers = _books_sharing_sidecar(path, all_paths, removing)
+        # Among the books that WILL go and share this one sidecar, exactly one takes
+        # it — the last of them, so that by the time it runs every other has already
+        # been attempted and `_remove_one` can check they really went.
+        siblings = [
+            other
+            for other in paths
+            if other.casefold() != path.casefold()
+            and other.casefold() in removing
+            and _sidecar_prefix(other) == _sidecar_prefix(path)
+        ]
+        takes_sidecar = (
+            path.casefold() in removing
+            and not sidecar_sharers
+            and not any(paths.index(other) > paths.index(path) for other in siblings)
+        )
+        thumbnail_sharers: list[str] = []
+        kept_thumbnail: str | None = None
+        if thumbnail and book_id:
+            # Another book on the device carrying the same EXTH 113 id reads the same
+            # cover — regenerable (`ebook kindle thumbnails`), but still not this
+            # removal's to take while that book is there.
+            thumbnail_sharers = sorted(
+                other
+                for other, other_id in ids.items()
+                if other != path and other_id == book_id and other.casefold() not in removing
+            )
+            if thumbnail_sharers:
+                kept_thumbnail, thumbnail = thumbnail, None
         row = _PlannedRemoval(
             id=start_id + offset,
             device_path=path,
@@ -3065,21 +3210,32 @@ def _plan_removals(
             title=exth.record_text(records, exth.TAG_TITLE) or "",
             author=exth.record_text(records, exth.TAG_AUTHOR) or "",
             size=sizes.get(path),
-            # A sidecar another surviving book also reads is KEPT, not removed — and
+            # A sidecar another SURVIVING book also reads is KEPT, not removed — and
             # the `.sdr` directory is then not offered for cleanup either.
-            companions=([] if shared_with else sidecar) + ([thumbnail] if thumbnail else []),
-            kept=sidecar if shared_with else [],
-            shared_with=shared_with,
-            sidecar_dir=None if shared_with else sidecar_dir,
+            sidecar=sidecar if takes_sidecar else [],
+            sidecar_siblings=siblings if takes_sidecar else [],
+            thumbnail=thumbnail,
+            kept=([*sidecar] if sidecar_sharers else [])
+            + ([kept_thumbnail] if kept_thumbnail else []),
+            shared_with=sorted({*sidecar_sharers, *thumbnail_sharers}),
+            sidecar_dir=sidecar_dir if takes_sidecar else None,
         )
-        refusal = _protection_refusal(path, all_paths, sidecars_visible=sidecars_visible)
+        refusal = refusals[path]
         if refusal is not None:
-            row.fail("engine_error", DETAIL_PROTECTED, refusal)
+            if protected_status == "skipped":
+                row.skip("unsupported_input", DETAIL_PROTECTED, refusal)
+            else:
+                row.fail("engine_error", DETAIL_PROTECTED, refusal)
         rows.append(row)
     return rows
 
 
-def _remove_one(backend: DeviceBackend, device: Device, row: _PlannedRemoval) -> None:
+def _remove_one(
+    backend: DeviceBackend,
+    device: Device,
+    row: _PlannedRemoval,
+    siblings: list[_PlannedRemoval],
+) -> None:
     """Delete one book and then its companions, settling `row`'s own verdict.
 
     **The book goes FIRST and its companions only after it is gone.** The other order
@@ -3087,6 +3243,13 @@ def _remove_one(backend: DeviceBackend, device: Device, row: _PlannedRemoval) ->
     device that refuses the book would leave it sitting there stripped of its reading
     position and its cover, which is precisely the damage a removal is supposed to
     take care of. If the book cannot go, nothing else does either.
+
+    `siblings` are the other books of this same run that share this one's `.sdr`
+    folder, all of them already attempted (the planner hands the sidecar to the last
+    of the group). A sidecar is only taken when every one of them really did leave:
+    the plan said they would, but a device that refused one at runtime turns this into
+    the shared-sidecar case, and the reading position of a book that is still there
+    must not go.
     """
     try:
         _guarded_remove(backend, row.device_path)
@@ -3118,7 +3281,15 @@ def _remove_one(backend: DeviceBackend, device: Device, row: _PlannedRemoval) ->
         return
     row.removed.append(row.device_path)
 
-    for companion in row.companions:
+    companions = row.companions
+    still_there = [sibling.device_path for sibling in siblings if not sibling.is_off_the_device]
+    if row.sidecar and still_there:
+        row.kept.extend(row.sidecar)
+        row.shared_with.extend(still_there)
+        companions = [path for path in companions if path not in row.sidecar]
+        row.sidecar_dir = None
+
+    for companion in companions:
         try:
             _guarded_remove(backend, companion)
         except mtp.MtpPathNotInCachedTree:
@@ -3199,9 +3370,15 @@ def _remove_books(
     snapshot behind it holds the bytes either way.
     """
     pending = [row for row in rows if row.status == "pending"]
+    by_path = {row.device_path.casefold(): row for row in rows}
     try:
         for index, row in enumerate(pending, start=1):
-            _remove_one(backend, device, row)
+            siblings = [
+                by_path[other.casefold()]
+                for other in row.sidecar_siblings
+                if other.casefold() in by_path
+            ]
+            _remove_one(backend, device, row, siblings)
             reporter.progress(
                 stage="remove",
                 index=index,
@@ -3274,12 +3451,17 @@ def run_remove(
     Identity is read from the books themselves, never from their filenames.
 
     **Some things are never removed** and are refused per item with a clear message
-    (`detail: "protected: ..."`), rather than aborting the whole run: anything under
-    `audible/`, anything under `system/` but its `thumbnails/` child, and a purchased
-    `*.kfx` whose `.sdr/assets` holds its DRM — over MTP, where that marker cannot be
-    listed at all, EVERY `*.kfx` instead (`_protection_refusal`). A refusal makes the
-    run's own exit code 1, because something the user asked for demonstrably did not
-    happen.
+    (`detail: "protected: ..."`), rather than aborting the whole run: anything the
+    mandatory backup does not cover (`backup.DEFAULT_SCOPE` — a book in a folder of
+    the user's own making, or at the device root, which no snapshot holds and
+    `restore` could therefore never put back), anything under `audible/`, anything
+    under `system/` but its `thumbnails/` child, and a purchased `*.kfx` whose
+    `.sdr/assets` holds its DRM — over MTP, where that marker cannot be listed at all,
+    EVERY `*.kfx` instead (`_protection_refusal`). A refusal makes the run's own exit
+    code 1, because something the user asked for demonstrably did not happen. Only
+    books INSIDE that backed-up area are selectable in the first place, so `--match`
+    can never sweep in one of them; a path named explicitly still gets its refusal, so
+    the user learns why rather than watching nothing happen.
 
     **Over MTP a `.sdr` sidecar and anything under `system/` cannot be deleted at
     all** — Calibre 9.15 exposes no delete-by-name and its cached tree omits both, so
@@ -3329,7 +3511,13 @@ def run_remove(
         sizes = {entry.path: entry.size for entry in entries}
         all_paths = set(sizes)
         books = [
-            entry for entry in entries if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
+            entry
+            for entry in entries
+            if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
+            # Only what the mandatory backup holds is selectable at all, so a
+            # `--match` can never sweep in a book nothing could put back. A path
+            # NAMED explicitly still reaches `_protection_refusal`, which says why.
+            and backup_module.DEFAULT_SCOPE.includes(entry.path)
         ]
 
         # `--match` needs every book's own title/author and `--asin` needs every
@@ -3435,14 +3623,25 @@ def run_sync(
     second implementation, so the two commands cannot drift into placing books
     differently.
 
-    **An extra is a device book whose EXTH 113 id the batch does not carry.** A book
-    whose id could not be read at all is NEVER an extra: absence from the library
-    cannot be proven for it, and guessing costs the user a book. Extras are reported
-    in `result.data.extras` whether or not `--delete-extras` was given, so the removal
-    can be seen before it is armed; with `--delete-extras` they become planned
-    removals (`pending`), and only with `--yes` as well are they actually deleted —
-    after the same mandatory backup, with the same `.sdr`-and-thumbnail pairing and
-    the same refusals `remove` applies.
+    **An extra is a device book whose EXTH 113 id the batch does not carry.** Four
+    things are never extras, each for its own reason: a book whose id could not be
+    read at all (absence from the library cannot be PROVEN for it, and guessing costs
+    the user a book), a book outside the area every backup covers (no snapshot holds
+    it, so no `restore` could undo it), a book at a path this run's own plan targets
+    (the copy phase is about to write there, or already refused to), and — because
+    `--delete-extras` reads a batch as a statement about the whole library — every
+    book of a batch that never finished, which is refused up front as a usage error
+    rather than silently treated as "the library does not have these".
+
+    Extras are reported in `result.data.extras` whether or not `--delete-extras` was
+    given, so the removal can be seen before it is armed; with `--delete-extras` they
+    become planned removals (`pending`), and only with `--yes` as well are they
+    actually deleted — after the same mandatory backup, with the same
+    `.sdr`-and-thumbnail pairing and the same refusals `remove` applies. A protected
+    extra is `skipped`, not `failed`: the user asked for a mirror, and a purchased
+    book is a permanent structural exclusion from one rather than a failed attempt at
+    anything — a run that can never exit 0 would teach everyone reading it to ignore
+    exit 1 on the one command that deletes books.
 
     **The two halves are journalled as two operations**, an `add` and a `remove`,
     exactly as if the two commands had been run in turn. `restore --op ID` therefore
@@ -3468,9 +3667,20 @@ def run_sync(
         batch = sanitize_batch(args.batch)
     except BatchNameError as error:
         raise UsageError(str(error)) from error
-    sources, library_ids = _library_batch(root, batch, flag="--batch")
+    sources, library_ids, unfinished = _library_batch(root, batch, flag="--batch")
     if not sources:
         raise UsageError(f"no books found in batch {batch!r}", code="no_input_matched")
+    if delete_extras and unfinished:
+        # An interrupted or partly-failed build still writes a `run.json`, and every
+        # book it never got to is then missing from `library_ids` — which would make
+        # the device's copy of it an EXTRA and delete it. The batch has to describe
+        # the whole library before it can be used to decide what the library is not.
+        raise UsageError(
+            f"batch {batch!r} has {unfinished} item(s) still pending or failed, so it "
+            "does not describe the whole library yet — --delete-extras would treat "
+            "every book it never placed as an extra. Finish the build (or re-run it) "
+            "first, or sync without --delete-extras."
+        )
 
     deletions_armed = delete_extras and bool(args.yes) and not dry_run
     stages = (
@@ -3532,6 +3742,11 @@ def run_sync(
             for entry in view.books
             if (view.ids_by_path.get(entry.path) or "") not in ("", *library_ids)
             and entry.path.casefold() not in planned_paths
+            # ...and nothing the mandatory backup does not hold: a book outside
+            # `backup.DEFAULT_SCOPE` cannot be restored afterwards, so it is not this
+            # command's to delete. `remove` refuses such a path by name (with a
+            # message); here there is no name to answer, so it is simply not an extra.
+            and backup_module.DEFAULT_SCOPE.includes(entry.path)
         ]
         extra_records: dict[str, dict[int, bytes]] = {}
         if extra_entries:
@@ -3553,6 +3768,14 @@ def run_sync(
                 all_paths=view.paths,
                 start_id=len(planned) + 1,
                 sidecars_visible=device.mode == "mass_storage",
+                # A protected book is a permanent structural exclusion from a MIRROR,
+                # not a failed attempt at something the user aimed at — see
+                # `_plan_removals`. `remove` keeps `failed`.
+                protected_status="skipped",
+                # `sync` knows every device book's id already, so a thumbnail another
+                # surviving book also uses can be kept here (it cannot in `remove`,
+                # which does not always read the whole device).
+                ids_by_path=view.ids_by_path,
             )
             if delete_extras
             else []
@@ -3658,12 +3881,17 @@ class _RestoredFile:
 
 
 def _resolve_snapshot(root: Path, key: str, name: str | None) -> Path | None:
-    """The snapshot directory a restore will read: `name` as a path, or as a name
-    under this device's own `backups/`, or — with no name at all — the newest complete
-    snapshot. `None` when nothing readable answers to it."""
+    """The snapshot directory a restore will read: a name under THIS device's own
+    `backups/` first, then `name` as a path, or — with no name at all — the newest
+    complete snapshot. `None` when nothing readable answers to it.
+
+    The order matters. A snapshot name is a bare timestamp, and trying it as a path
+    first resolves it against the current working directory: a directory of that name
+    sitting next to the user (another device's backups, copied there to look at) would
+    win over this device's own snapshot of the same name."""
     if not name:
         return backup_module.latest(root, key)
-    for candidate in (Path(name), backup_module.backup_root(root, key) / "backups" / name):
+    for candidate in (backup_module.backup_root(root, key) / "backups" / name, Path(name)):
         if (candidate / backup_module.MANIFEST_NAME).is_file():
             return candidate
     return None
@@ -3685,30 +3913,43 @@ def run_restore(
     than as a silent success. Taking an added book off the device is `remove`'s job,
     behind its own `--yes`.
 
+    **Nothing is written without `--yes`**, the same gate `remove` has and for a
+    closely related reason: this is the one operation that overwrites files the user
+    still has. A bare `restore` would otherwise roll a whole device back to the newest
+    snapshot — destroying a book they replaced since, and resurrecting ones they
+    deliberately removed — from a command line with no confirmation in it at all.
+    Without `--yes` the run reports exactly what it would put back and writes nothing.
+
     **Every selected file is hashed against the manifest before a byte is written**,
-    including under `--dry-run`, and one that disagrees is refused rather than
-    restored: recovery is exactly where a corrupt snapshot does the most damage. That
-    hashing is a full read of everything selected, which is why this run reports
-    `progress` — a whole-library dry run would otherwise sit silent for minutes.
+    including in that plan, and one that disagrees is refused rather than restored:
+    recovery is exactly where a corrupt snapshot does the most damage. That hashing is
+    a full read of everything selected, which is why this run reports `progress` in
+    two phases (`verify`, then `restore`) — a whole-library plan would otherwise sit
+    silent for minutes.
+
+    **A snapshot from a DIFFERENT Kindle is refused** unless `--force` says otherwise
+    (the manifest records the device it came from). Writing one device's library onto
+    another is not a restore, and nothing downstream could tell afterwards.
 
     **The snapshot is resolved BEFORE the mandatory pre-write backup**, never after.
     Restoring writes to the device, so it takes the same backup every write command
     takes (so the restore itself can be undone) — and that backup becomes the newest
     snapshot, so a `restore` with no SNAPSHOT argument resolved afterwards would
-    restore the state it had just recorded and do nothing at all. `--dry-run` takes no
-    backup, since it writes nothing.
+    restore the state it had just recorded and do nothing at all. A run without
+    `--yes` takes no backup, since it writes nothing.
 
     One `item` is emitted per SELECTED FILE — not per book — so undoing an operation
     reports the book, its sidecar and its thumbnail separately, and a whole-snapshot
     restore reports every file in it.
     """
-    dry_run = bool(args.dry_run)
-    stages = ["detect", "restore"] if dry_run else ["detect", "backup", "restore"]
+    plan_only = not args.yes
+    stages = ["detect", "restore"] if plan_only else ["detect", "backup", "restore"]
     options = {
         "kindle_command": "restore",
         "snapshot": args.snapshot,
         "op": args.op,
-        "dry_run": dry_run,
+        "yes": bool(args.yes),
+        "force": bool(args.force),
     }
 
     def body(reporter: Reporter, root: Path, device: Device, backend: DeviceBackend) -> dict:
@@ -3745,9 +3986,12 @@ def run_restore(
 
         snapshot_dir = _resolve_snapshot(root, key, snapshot_name)
         if snapshot_dir is None:
+            # `dependency_missing`, not `backup_failed`: nothing was attempted, and
+            # `_EXIT_FOR_CODE` maps `backup_failed` to exit 1 — a code whose own table
+            # disagrees with the exit code beside it is worse than a looser code.
             return _body_failure(
                 reporter,
-                code="backup_failed",
+                code="dependency_missing",
                 message=(
                     f"no readable snapshot {snapshot_name!r} for this device under "
                     f"{backup_module.backup_root(root, key) / 'backups'}"
@@ -3758,7 +4002,20 @@ def run_restore(
                 exit_code=EXIT_DEPENDENCY,
             )
 
-        if not dry_run:
+        taken_from = backup_module.manifest_serial(snapshot_dir)
+        if taken_from and taken_from != key and not args.force:
+            return _body_failure(
+                reporter,
+                code="usage",
+                message=(
+                    f"{snapshot_dir} was taken from a different Kindle ({taken_from}, "
+                    f"not {key}): writing its library onto this device would not be a "
+                    "restore. Pass --force if that is genuinely what you want."
+                ),
+                exit_code=EXIT_USAGE,
+            )
+
+        if not plan_only:
             announce("backup")
             failure, _ = _mandatory_backup(reporter, root, backend, key)
             if failure is not None:
@@ -3777,14 +4034,16 @@ def run_restore(
 
         try:
             report = backup_module.restore(
-                backend, snapshot_dir, only=only, dry_run=dry_run, on_progress=on_progress
+                backend, snapshot_dir, only=only, dry_run=plan_only, on_progress=on_progress
             )
         except backup_module.BackupFailed as error:
             # Caught here rather than left to `_run`, which would map it to exit 1
             # ("an item failed"): nothing was attempted, which is exit 3's meaning —
             # the same reading `_mandatory_backup` applies to a failed precondition.
+            # `dependency_missing` for the same reason as above: the snapshot named is
+            # not usable, and `backup_failed`'s own table says exit 1.
             return _body_failure(
-                reporter, code="backup_failed", message=str(error), exit_code=EXIT_DEPENDENCY
+                reporter, code="dependency_missing", message=str(error), exit_code=EXIT_DEPENDENCY
             )
 
         rows: list[_RestoredFile] = []
@@ -3793,7 +4052,7 @@ def run_restore(
                 _RestoredFile(
                     id=len(rows) + 1,
                     device_path=path,
-                    status="pending" if dry_run else "done",
+                    status="pending" if plan_only else "done",
                 )
             )
         for path in report.missing:
@@ -3853,7 +4112,7 @@ def run_restore(
                 "restore": {
                     "snapshot": str(snapshot_dir),
                     "operation": args.op,
-                    "dry_run": dry_run,
+                    "plan_only": plan_only,
                     "files": report.files,
                     "bytes": report.bytes,
                     "missing": report.missing,

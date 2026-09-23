@@ -102,7 +102,11 @@ def prepare_device(fake_kindle, *, purchased: bool = False, mode: str = "mass_st
         mobi_bytes(book_id=PT_ID, title="Um Livro", author="Um Autor", language="pt")
     )
     if purchased:
-        (mount / KFX_PATH).write_bytes(b"KFX container bytes")
+        # Given a readable EXTH 113 id on purpose: a real KFX container is one this
+        # project's parser cannot read at all, and an id-less device book is excluded
+        # from `sync`'s extras one step BEFORE the protection rule is ever consulted —
+        # which would leave that rule untested here for the wrong reason.
+        (mount / KFX_PATH).write_bytes(mobi_bytes(book_id=KFX_ID, title="A Purchased Book"))
         assets = mount / KFX_SDR / "assets"
         assets.mkdir(parents=True)
         (assets / "resource.res").write_bytes(b"drm asset")
@@ -266,7 +270,10 @@ def test_remove_sync_and_restore_are_registered_with_their_flags():
     assert restore.kindle_command == "restore"
     assert restore.snapshot == "2026-01-01T000000Z"
     assert restore.op is None
-    assert restore.dry_run is False
+    # Restore writes over files the user still has, so it is gated exactly like
+    # `remove`: without --yes it plans.
+    assert restore.yes is False
+    assert restore.force is False
 
 
 def test_remove_with_no_selector_at_all_is_a_usage_error(tmp_path, fake_kindle):
@@ -376,6 +383,8 @@ def test_remove_with_yes_takes_the_book_its_sdr_and_its_thumbnail_after_a_backup
     thumb = mount / "system" / "thumbnails" / f"thumbnail_{EN_ID}_EBOK_portrait.jpg"
     assert not (mount / EN_PATH).exists()
     assert not (mount / EN_SDR / "position.mbp").exists()
+    # ...and the emptied `.sdr` folder itself, not just the files inside it.
+    assert not (mount / EN_SDR).exists()
     assert not thumb.exists()
     # The other book is untouched — only what matched was removed.
     assert (mount / PT_PATH).is_file()
@@ -839,7 +848,7 @@ def test_restore_op_puts_back_exactly_what_that_operation_removed(fake_kindle, t
     (mount / PT_PATH).unlink()
 
     exit_code = kindle_cli.run_restore(
-        _restore_args(root, "--op", operation_id),
+        _restore_args(root, "--op", operation_id, "--yes"),
         device_finder=lambda: device,
         backend_factory=_mass_storage_factory,
     )
@@ -861,7 +870,7 @@ def test_restore_op_puts_back_exactly_what_that_operation_removed(fake_kindle, t
     assert result["counts"]["done"] == 3
 
 
-def test_restore_dry_run_reports_the_same_plan_and_writes_nothing(fake_kindle, tmp_path, capsys):
+def test_restore_without_yes_reports_the_plan_and_writes_nothing(fake_kindle, tmp_path, capsys):
     device = prepare_device(fake_kindle)
     root = tmp_path / "media"
     mount = device.mount
@@ -874,7 +883,7 @@ def test_restore_dry_run_reports_the_same_plan_and_writes_nothing(fake_kindle, t
     operation_id = _events(capsys)[-1]["data"]["operation"]
 
     exit_code = kindle_cli.run_restore(
-        _restore_args(root, "--op", operation_id, "--dry-run"),
+        _restore_args(root, "--op", operation_id),
         device_finder=lambda: device,
         backend_factory=_mass_storage_factory,
     )
@@ -882,12 +891,14 @@ def test_restore_dry_run_reports_the_same_plan_and_writes_nothing(fake_kindle, t
     assert not (mount / EN_PATH).exists()
 
     events = _events(capsys)
+    # No --yes, so no backup stage either: this run cannot write anything.
     assert events[0]["stages"] == ["detect", "restore"]
     statuses = {e["status"] for e in events if e["type"] == "item"}
     assert statuses == {"pending"}
     # Hashing every selected file is what a restore does before it writes anything,
     # even here — so it reports progress rather than going silent.
-    assert any(e["type"] == "progress" and e["stage"] == "restore" for e in events)
+    assert any(e["type"] == "progress" and e["stage"] == "verify" for e in events)
+    assert not any(e["type"] == "progress" and e["stage"] == "restore" for e in events)
 
 
 def test_restore_of_a_whole_snapshot_puts_every_backed_up_file_back(fake_kindle, tmp_path, capsys):
@@ -904,7 +915,7 @@ def test_restore_of_a_whole_snapshot_puts_every_backed_up_file_back(fake_kindle,
     (mount / PT_PATH).unlink()
 
     exit_code = kindle_cli.run_restore(
-        _restore_args(root, snapshot_name),
+        _restore_args(root, snapshot_name, "--yes"),
         device_finder=lambda: device,
         backend_factory=_mass_storage_factory,
     )
@@ -935,7 +946,7 @@ def test_restore_of_an_add_operation_puts_nothing_back_and_says_so(fake_kindle, 
     operation_id = _events(capsys)[-1]["data"]["operation"]
 
     exit_code = kindle_cli.run_restore(
-        _restore_args(root, "--op", operation_id),
+        _restore_args(root, "--op", operation_id, "--yes"),
         device_finder=lambda: device,
         backend_factory=_mass_storage_factory,
     )
@@ -964,3 +975,401 @@ def test_restore_with_an_unknown_operation_id_fails_without_touching_the_device(
     assert events[-1]["type"] == "result"
     assert any(e["type"] == "error" for e in events)
     assert (device.mount / EN_PATH).is_file()
+
+
+# --- the two defects the review caught ----------------------------------------------------
+
+
+class _RefusingBackend:
+    """Mass storage underneath, except that `remove` of one named path always fails —
+    the way a real device refuses one file and accepts the next."""
+
+    def __init__(self, mount: Path, *, refuse: str) -> None:
+        self._inner = massstorage.MassStorageBackend(mount)
+        self._refuse = refuse
+
+    def list_files(self, prefix: str = ""):
+        return self._inner.list_files(prefix)
+
+    def read(self, path: str, dest: Path) -> None:
+        self._inner.read(path, dest)
+
+    def read_many(self, items) -> None:
+        self._inner.read_many(items)
+
+    def write(self, local: Path, path: str) -> None:
+        self._inner.write(local, path)
+
+    def remove(self, path: str) -> None:
+        if path == self._refuse:
+            raise OSError(f"the device refused to delete {path} (simulated)")
+        self._inner.remove(path)
+
+    def exists(self, path: str) -> bool:
+        return self._inner.exists(path)
+
+    def free_space(self) -> int:
+        return self._inner.free_space()
+
+    def eject(self) -> None:
+        self._inner.eject()
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+class _InterruptingBackend:
+    """Deletes the first book and then takes a Ctrl+C, so the journal guard around the
+    delete loop is exercised for real."""
+
+    def __init__(self, mount: Path) -> None:
+        self._inner = massstorage.MassStorageBackend(mount)
+        self._books_removed = 0
+
+    def list_files(self, prefix: str = ""):
+        return self._inner.list_files(prefix)
+
+    def read(self, path: str, dest: Path) -> None:
+        self._inner.read(path, dest)
+
+    def read_many(self, items) -> None:
+        self._inner.read_many(items)
+
+    def write(self, local: Path, path: str) -> None:
+        self._inner.write(local, path)
+
+    def remove(self, path: str) -> None:
+        if path.endswith((".azw3", ".mobi", ".kfx")):
+            if self._books_removed >= 1:
+                raise KeyboardInterrupt
+            self._books_removed += 1
+        self._inner.remove(path)
+
+    def exists(self, path: str) -> bool:
+        return self._inner.exists(path)
+
+    def free_space(self) -> int:
+        return self._inner.free_space()
+
+    def eject(self) -> None:
+        self._inner.eject()
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def test_a_sideloaded_conversion_never_takes_a_refused_purchases_drm_assets(
+    fake_kindle, tmp_path, capsys
+):
+    """The defect this closes: `A Purchased Book.kfx` (refused) and `A Purchased
+    Book.azw3` (a sideloaded conversion) share one `.sdr`. If the refused book counts
+    as "being removed", the conversion sees an unshared sidecar and takes the
+    purchase's `assets/` with it — leaving a book that can never be read again."""
+    device = prepare_device(fake_kindle, purchased=True)
+    mount = device.mount
+    conversion = mount / "documents" / "A Purchased Book.azw3"
+    conversion.write_bytes(mobi_bytes(book_id="CONVERSION000001", title="A Purchased Book"))
+
+    args = _remove_args(tmp_path / "media", "--match", "purchased", "--yes")
+    exit_code = kindle_cli.run_remove(
+        args, device_finder=lambda: device, backend_factory=_mass_storage_factory
+    )
+    # The refused purchase still makes the run exit 1 — but the conversion went.
+    assert exit_code == EXIT_FAILED
+    assert not conversion.exists()
+    assert (mount / KFX_PATH).is_file()
+    assert (mount / KFX_SDR / "assets" / "resource.res").is_file()
+
+    result = _events(capsys)[-1]
+    assert f"{KFX_SDR}/assets/resource.res" not in result["data"]["removed"]
+    row = next(b for b in result["data"]["books"] if b["device_path"].endswith(".azw3"))
+    assert row["status"] == "done"
+    assert row["shared_with"] == [KFX_PATH]
+
+
+def test_a_sidecar_is_kept_when_a_co_selected_book_fails_to_leave(fake_kindle, tmp_path, capsys):
+    """Both books were planned for removal, so the last of them takes their shared
+    `.sdr` — unless the device refuses one at runtime, which turns it back into the
+    shared case."""
+    device = prepare_device(fake_kindle)
+    mount = device.mount
+    sibling = mount / "documents" / "en" / "A Book - An Author.mobi"
+    sibling.write_bytes(mobi_bytes(book_id="SIBLINGBOOK00001", title=EN_TITLE, author=EN_AUTHOR))
+
+    args = _remove_args(tmp_path / "media", "--match", EN_AUTHOR, "--yes")
+    exit_code = kindle_cli.run_remove(
+        args,
+        device_finder=lambda: device,
+        backend_factory=lambda d, *, cache_dir: _RefusingBackend(d.mount, refuse=EN_PATH),
+    )
+    assert exit_code == EXIT_FAILED
+
+    assert (mount / EN_PATH).is_file()  # refused
+    assert not sibling.exists()  # removed
+    # The reading position belongs to the book that is still there.
+    assert (mount / EN_SDR / "position.mbp").is_file()
+    result = _events(capsys)[-1]
+    row = next(b for b in result["data"]["books"] if b["device_path"].endswith(".mobi"))
+    assert row["kept"] == [f"{EN_SDR}/position.mbp"]
+    assert row["shared_with"] == [EN_PATH]
+
+
+def test_a_book_outside_the_backed_up_area_is_never_selected_and_is_refused_by_name(
+    fake_kindle, tmp_path, capsys
+):
+    """The defect this closes: a book in a folder of the user's own making is not in
+    the snapshot the run just took, so deleting it could never be undone — and
+    `restore --op` would have reported success while the book stayed gone."""
+    device = prepare_device(fake_kindle)
+    root = tmp_path / "media"
+    outside = device.mount / "Books" / "Novel.azw3"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(mobi_bytes(book_id="OUTSIDEBOOK00001", title="Novel", author="An Author"))
+
+    # A --match never reaches it at all.
+    assert (
+        kindle_cli.run_remove(
+            _remove_args(root, "--match", "novel", "--yes"),
+            device_finder=lambda: device,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+    assert [e for e in _events(capsys) if e["type"] == "item"] == []
+    assert outside.is_file()
+
+    # Naming it explicitly says why, rather than silently doing nothing.
+    exit_code = kindle_cli.run_remove(
+        _remove_args(root, "Books/Novel.azw3", "--yes"),
+        device_finder=lambda: device,
+        backend_factory=_mass_storage_factory,
+    )
+    assert exit_code == EXIT_FAILED
+    item = next(e for e in _events(capsys) if e["type"] == "item")
+    assert item["detail"].startswith(f"{kindle_cli.DETAIL_PROTECTED}: ")
+    assert outside.is_file()
+
+
+def test_sync_never_treats_a_book_outside_the_backed_up_area_as_an_extra(
+    fake_kindle, tmp_path, capsys
+):
+    device = prepare_device(fake_kindle)
+    root = tmp_path / "media"
+    outside = device.mount / "Books" / "Novel.azw3"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(mobi_bytes(book_id="OUTSIDEBOOK00001", title="Novel"))
+
+    new_book = tmp_path / "library" / "A Brand New Book.azw3"
+    new_book.parent.mkdir(parents=True)
+    new_book.write_bytes(mobi_bytes(book_id=NEW_ID, title="A Brand New Book", language="en"))
+    plant_library_batch(
+        root,
+        "library",
+        [(NEW_ID, new_book, "en"), (EN_ID, new_book, "en"), (PT_ID, new_book, "pt")],
+    )
+
+    assert (
+        kindle_cli.run_sync(
+            _sync_args(root, "--batch", "library", "--delete-extras", "--yes"),
+            device_finder=lambda: device,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+    assert outside.is_file()
+    assert _events(capsys)[-1]["data"]["removed"] == []
+
+
+def test_a_protected_extra_is_skipped_by_sync_not_failed(fake_kindle, tmp_path, capsys):
+    """A mirror that can never exit 0 teaches everyone to ignore exit 1 on the one
+    command that deletes books. A purchased KFX is a permanent structural exclusion
+    from a mirror, not a failed attempt."""
+    device = prepare_device(fake_kindle, purchased=True)
+    root = tmp_path / "media"
+    new_book = tmp_path / "library" / "A Brand New Book.azw3"
+    new_book.parent.mkdir(parents=True)
+    new_book.write_bytes(mobi_bytes(book_id=NEW_ID, title="A Brand New Book", language="en"))
+    plant_library_batch(
+        root,
+        "library",
+        [(NEW_ID, new_book, "en"), (EN_ID, new_book, "en"), (PT_ID, new_book, "pt")],
+    )
+
+    exit_code = kindle_cli.run_sync(
+        _sync_args(root, "--batch", "library", "--delete-extras", "--yes"),
+        device_finder=lambda: device,
+        backend_factory=_mass_storage_factory,
+    )
+    assert exit_code == EXIT_OK
+
+    assert (device.mount / KFX_PATH).is_file()
+    events = _events(capsys)
+    item = next(e for e in events if e["type"] == "item" and e["input"] == KFX_PATH)
+    assert item["status"] == "skipped"
+    assert item["reason"] == "unsupported_input"
+    assert item["detail"].startswith(f"{kindle_cli.DETAIL_PROTECTED}: ")
+    assert events[-1]["counts"]["failed"] == 0
+
+
+def test_delete_extras_is_refused_for_a_batch_that_never_finished(fake_kindle, tmp_path):
+    """An interrupted build still writes a `run.json`; every book it never placed is
+    missing from its ids, and would be read as "the library does not have this"."""
+    root = tmp_path / "media"
+    new_book = tmp_path / "library" / "A Brand New Book.azw3"
+    new_book.parent.mkdir(parents=True)
+    new_book.write_bytes(mobi_bytes(book_id=NEW_ID, title="A Brand New Book", language="en"))
+    batch_dir = root / "library"
+    batch_dir.mkdir(parents=True)
+    (batch_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "v": 1,
+                "items": [
+                    {
+                        "id": 1,
+                        "status": "done",
+                        "data": {"book_id": NEW_ID, "language": "en", "output": str(new_book)},
+                    },
+                    {"id": 2, "status": "pending", "data": {}},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UsageError):
+        kindle_cli.run_sync(
+            _sync_args(root, "--batch", "library", "--delete-extras", "--yes"),
+            device_finder=lambda: fake_kindle,
+            backend_factory=_mass_storage_factory,
+        )
+    # Without --delete-extras the same batch is fine: adding is not deleting.
+    assert (
+        kindle_cli.run_sync(
+            _sync_args(root, "--batch", "library"),
+            device_finder=lambda: prepare_device(fake_kindle),
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+
+
+def test_asin_removes_every_copy_carrying_that_id(fake_kindle, tmp_path, capsys):
+    device = prepare_device(fake_kindle)
+    mount = device.mount
+    second = mount / "documents" / "en" / "Another Copy.azw3"
+    second.write_bytes(mobi_bytes(book_id=EN_ID, title=EN_TITLE, author=EN_AUTHOR))
+
+    exit_code = kindle_cli.run_remove(
+        _remove_args(tmp_path / "media", "--asin", EN_ID, "--yes"),
+        device_finder=lambda: device,
+        backend_factory=_mass_storage_factory,
+    )
+    assert exit_code == EXIT_OK
+    assert not (mount / EN_PATH).exists()
+    assert not second.exists()
+    items = [e for e in _events(capsys) if e["type"] == "item"]
+    assert {e["input"] for e in items} == {EN_PATH, "documents/en/Another Copy.azw3"}
+
+
+def test_an_interrupted_removal_still_journals_what_it_already_took(fake_kindle, tmp_path, capsys):
+    device = prepare_device(fake_kindle)
+    root = tmp_path / "media"
+
+    exit_code = kindle_cli.run_remove(
+        _remove_args(root, "--match", "documents/", "--yes"),
+        device_finder=lambda: device,
+        backend_factory=lambda d, *, cache_dir: _InterruptingBackend(d.mount),
+    )
+    assert exit_code == 130
+
+    entries = backup_module.journal_read(root, device.serial)
+    assert len(entries) == 1
+    assert entries[0]["op"] == "remove"
+    # Exactly what really went, and nothing the run never got to.
+    assert entries[0]["paths"]
+    for path in entries[0]["paths"]:
+        assert not (device.mount / path).exists()
+
+
+def test_restore_refuses_a_snapshot_taken_from_another_kindle(fake_kindle, tmp_path, capsys):
+    device = prepare_device(fake_kindle)
+    root = tmp_path / "media"
+    kindle_cli.run_remove(
+        _remove_args(root, "--match", EN_AUTHOR, "--yes"),
+        device_finder=lambda: device,
+        backend_factory=_mass_storage_factory,
+    )
+    snapshot_dir = _events(capsys)[-1]["data"]["snapshot"]["path"]
+
+    other = Device(
+        serial="G000OTHERSERIAL",
+        product_id=device.product_id,
+        mode="mass_storage",
+        mount=device.mount,
+    )
+    exit_code = kindle_cli.run_restore(
+        _restore_args(root, snapshot_dir, "--yes"),
+        device_finder=lambda: other,
+        backend_factory=_mass_storage_factory,
+    )
+    assert exit_code == EXIT_USAGE
+    assert not (device.mount / EN_PATH).exists()
+
+    # ...and --force is how a user says they really meant it.
+    assert (
+        kindle_cli.run_restore(
+            _restore_args(root, snapshot_dir, "--yes", "--force"),
+            device_finder=lambda: other,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+    assert (device.mount / EN_PATH).is_file()
+
+
+def test_sync_keeps_a_thumbnail_another_surviving_book_still_uses(fake_kindle, tmp_path, capsys):
+    """`sync` knows every device book's id, so it can tell that a cover belongs to a
+    book it is NOT removing — here one outside the backed-up area, which can never be
+    an extra — and leaves it alone."""
+    device = prepare_device(fake_kindle)
+    root = tmp_path / "media"
+    mount = device.mount
+    shared_id = "TWOCOPIESONEID01"
+    keeper = mount / "Books" / "Novel.azw3"
+    keeper.parent.mkdir(parents=True)
+    keeper.write_bytes(mobi_bytes(book_id=shared_id, title="Novel"))
+    (mount / "documents" / "en" / "Novel Copy.azw3").write_bytes(
+        mobi_bytes(book_id=shared_id, title="Novel")
+    )
+    thumb = mount / "system" / "thumbnails" / f"thumbnail_{shared_id}_EBOK_portrait.jpg"
+    thumb.write_bytes(b"thumb")
+
+    new_book = tmp_path / "library" / "A Brand New Book.azw3"
+    new_book.parent.mkdir(parents=True)
+    new_book.write_bytes(mobi_bytes(book_id=NEW_ID, title="A Brand New Book", language="en"))
+    plant_library_batch(
+        root,
+        "library",
+        [(NEW_ID, new_book, "en"), (EN_ID, new_book, "en"), (PT_ID, new_book, "pt")],
+    )
+
+    assert (
+        kindle_cli.run_sync(
+            _sync_args(root, "--batch", "library", "--delete-extras", "--yes"),
+            device_finder=lambda: device,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+
+    assert not (mount / "documents" / "en" / "Novel Copy.azw3").exists()
+    assert keeper.is_file()
+    assert thumb.is_file()
+    row = next(
+        r
+        for r in _events(capsys)[-1]["data"]["removals"]
+        if r["device_path"].endswith("Novel Copy.azw3")
+    )
+    assert row["kept"] == [f"system/thumbnails/thumbnail_{shared_id}_EBOK_portrait.jpg"]
+    assert row["shared_with"] == ["Books/Novel.azw3"]
