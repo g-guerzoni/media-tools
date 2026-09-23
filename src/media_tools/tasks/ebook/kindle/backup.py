@@ -190,12 +190,15 @@ DEFAULT_SCOPE = Scope(
         "documents",
         "system/thumbnails",
         "amazon-cover-bug",
-        "fonts",  # unverified against hardware: the documented user-font folder
+        "fonts",  # confirmed on hardware: present at the root of a real Kindle
     ),
     root_suffixes=(".calibre",),
-    # unverified against hardware: the only witness for a ROOT copy of this file is
-    # this repo's own `fake_kindle` fixture, not firmware. It is kept because
-    # over-collecting one small text file is cheaper than missing the user's clippings.
+    # Confirmed on hardware, and the guess was wrong: a real Kindle keeps
+    # `My Clippings.txt` in `documents/`, not at the root. The root entry is KEPT
+    # anyway -- it costs nothing when the file is not there (it simply never matches),
+    # `documents/` is already in scope so the real copy is backed up either way, and a
+    # different firmware putting it back at the root would otherwise lose the user's
+    # clippings silently. Over-collecting one small text file stays the cheap direction.
     root_names=frozenset({"My Clippings.txt"}),
 )
 

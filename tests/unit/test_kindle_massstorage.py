@@ -407,6 +407,29 @@ def test_list_files_skips_volume_litter_and_never_descends_into_audible(fake_kin
     assert any(p.endswith(".azw3") for p in paths)
 
 
+def test_list_files_survives_an_unreadable_macos_volume_directory(fake_kindle):
+    """The failure the first real Kindle produced, reproduced with a real EPERM.
+
+    macOS puts `.TemporaryItems` on removable volumes and denies `scandir` on it. The
+    walk must skip it by NAME, before descending -- not by catching the error, which
+    would put back the swallowing that the B1 fix removed. `chmod 0` here is not a
+    stand-in for an exception the production path cannot raise: it is the same errno
+    the device produced, from the same call.
+    """
+    litter = fake_kindle.mount / ".TemporaryItems"
+    litter.mkdir()
+    (litter / "folders.501").mkdir()
+    litter.chmod(0o000)
+    try:
+        device = massstorage.MassStorageBackend(fake_kindle.mount)
+        paths = {f.path for f in device.list_files()}
+    finally:
+        litter.chmod(0o700)
+
+    assert any(p.endswith(".azw3") for p in paths)
+    assert not any(".TemporaryItems" in p for p in paths)
+
+
 def test_list_files_never_descends_into_audible_even_as_the_requested_prefix(fake_kindle):
     (fake_kindle.mount / "audible" / "book.aax").write_bytes(b"audiobook bytes")
     device = massstorage.MassStorageBackend(fake_kindle.mount)

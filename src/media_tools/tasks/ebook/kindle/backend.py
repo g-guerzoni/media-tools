@@ -30,7 +30,17 @@ _FAT32_ILLEGAL = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
 # guard below — import ONE copy rather than `mtp.py` importing massstorage's and this
 # file duplicating them a second time. `massstorage.py` and `mtp.py` both import these
 # back from here; nothing else changed about what they mean.
-VOLUME_LITTER = {".Trashes", ".fseventsd", ".Spotlight-V100"}
+# `.TemporaryItems` was added the first time a real Kindle was attached. macOS creates
+# it on any removable volume the Finder touches, and -- exactly like `.Trashes` and
+# `.Spotlight-V100`, which were already listed here -- it refuses `scandir` with EPERM.
+# The two that were listed were skipped before the descent and so never raised; this
+# one was not, and since the B1 fix made `_walk` propagate `OSError` instead of
+# swallowing it, a name missing from this set is no longer a quiet miscount: it aborts
+# the whole command. `ebook kindle scan` failed on EVERY mass-storage Kindle on macOS
+# until this name was here, reported as `device_not_found` on a device that was plugged
+# in and mounted. Only hardware could surface it: the fixture volume has no
+# `.TemporaryItems`, and nothing in the offline suite makes one that cannot be read.
+VOLUME_LITTER = {".Trashes", ".fseventsd", ".Spotlight-V100", ".TemporaryItems"}
 # Fully off-limits, at any depth: `audible/` is Amazon's audiobook data, untouchable
 # by this whole plan. `system/` is different — only `system/thumbnails/` is ordinary
 # cache data; everything else under `system/` is device internals, not book content.

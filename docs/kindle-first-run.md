@@ -45,12 +45,15 @@ confirmed. These are the ones that matter most, worst first:
    and fails the book as `short_write`. Confirm what `put_file` actually leaves behind
    when a transfer is cut, whether it replaces a same-named file by default, and what
    it raises when the device is full.
-3. **`fonts/` and a root `My Clippings.txt` are unverified guesses.** The backup scope
-   includes `fonts/` as the user-font folder, and `My Clippings.txt` at the device
-   root. The only witness for the root copy is this project's own test fixture, not
-   firmware — a real Kindle most likely keeps it in `documents/`. Both are backed up,
-   which over-collects; that is the safe direction for a backup, and the scope is
-   worth correcting once a real device says which is true.
+3. ~~**`fonts/` and a root `My Clippings.txt` are unverified guesses.**~~ **Settled on
+   hardware.** `fonts/` exists at the root of a real Kindle, as assumed. The root
+   `My Clippings.txt` was wrong: the real file is `documents/My Clippings.txt` (with a
+   `My Clippings.sdr` beside it), which `documents/` already puts in scope, so it is
+   backed up. The root entry is kept because it never matches on this firmware and
+   costs nothing, while removing it would silently lose the file on firmware that does
+   put it at the root. The same real device also shows two root entries the scope does
+   not mention: `voice/` and `.active_content_sandbox/`, neither of which is book
+   content and neither of which is collected.
 4. **`eject` has never run against the real binaries.** The mass-storage path runs
    `sync`, then `diskutil info -plist <mount>` to read `ParentWholeDisk` and
    `diskutil eject <disk>` on macOS, or `udisksctl unmount -b` + `udisksctl power-off
@@ -103,7 +106,11 @@ Expected: exit 0, and a final `result` event whose `data.device` reports
 
 - `mode` — `"mass_storage"` or `"mtp"`,
 - `backend` — the matching `"mass_storage"` / `"mtp"` literal,
-- `serial`, `model_hint` and `free_space` — reported in both modes,
+- `serial`, `model_hint` and `free_space` — **`free_space` is reported in both modes;
+  `serial` is not.** On the first real mass-storage Kindle, `serial` came back `null`
+  and `model_hint` was `"Internal Storage"` — the volume's name, not a model. Device
+  identity therefore rests on `device_key`'s mount-name fallback there, not on a
+  serial. Do not treat a null serial on mass storage as a detection failure,
 - `held_by` — **MTP only**: it reads `"calibre_gui"` when Calibre's GUI has the device,
   and is `null` on a mass-storage Kindle even with Calibre open, because mass storage
   has no single-holder lock to report on,
