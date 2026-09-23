@@ -220,10 +220,16 @@ def _deno_check() -> Check:
 #: and `ebook-meta` for `media-tools convert`'s ebook engine, and all three for
 #: `media-tools ebook build` (metadata reads, conversion, and online cover lookup).
 CALIBRE_TOOLS = ("ebook-convert", "ebook-meta", "fetch-ebook-metadata")
+# The install hint is `calibre.INSTALL_HINT`, not a literal, because this used to
+# say `brew install --cask calibre` unconditionally -- correct on the machine this is
+# developed on, and useless on the platform where Calibre is most often MISSING. On a
+# stock Ubuntu there is no `brew`, so doctor's only guidance for its most consequential
+# missing dependency named a command the reader cannot run. `integrations/calibre.py`
+# already carried cross-platform wording; doctor had simply duplicated it wrongly.
 _CALIBRE_HINT = (
-    "brew install --cask calibre -- ebook-convert/ebook-meta are needed by "
-    "`media-tools convert` for ebook formats; all three tools are needed by "
-    "`media-tools ebook build`"
+    "ebook-convert/ebook-meta are needed by `media-tools convert` for ebook formats; "
+    "all three tools are needed by `media-tools ebook build`. "
+    f"{calibre.INSTALL_HINT}"
 )
 
 
@@ -309,8 +315,8 @@ _MTP_PROBE = (
 _MTP_PROBE_TIMEOUT_S = 30.0
 _MTP_DRIVER_HINT = (
     "needed only by `media-tools ebook kindle ...` against a 2024-or-later Kindle "
-    "(or a Scribe), which speaks MTP and has no disk to mount: install Calibre "
-    "(brew install --cask calibre). A mass-storage Kindle needs none of this"
+    "(or a Scribe), which speaks MTP and has no disk to mount; a mass-storage Kindle "
+    f"needs none of this. {calibre.INSTALL_HINT}"
 )
 _KINDLE_DEVICE_HINT = (
     "only `media-tools ebook kindle ...` needs one; connect a Kindle over USB and "

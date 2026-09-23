@@ -22,7 +22,7 @@ _EXTRA_DIRS = (
     Path("/opt/homebrew/bin"),
     Path("/opt/calibre"),
 )
-_INSTALL_HINT = (
+INSTALL_HINT = (
     "install Calibre — macOS: brew install --cask calibre; "
     "Linux: sudo -v && wget -nv -O- https://download.calibre-ebook.com/linux-installer.sh "
     "| sudo sh /dev/stdin"
@@ -94,20 +94,20 @@ def find_tool(name: str) -> str | None:
 
 
 EBOOK_CONVERT = Dependency(
-    name="ebook-convert", locate=lambda: find_tool("ebook-convert"), install_hint=_INSTALL_HINT
+    name="ebook-convert", locate=lambda: find_tool("ebook-convert"), install_hint=INSTALL_HINT
 )
 EBOOK_META = Dependency(
-    name="ebook-meta", locate=lambda: find_tool("ebook-meta"), install_hint=_INSTALL_HINT
+    name="ebook-meta", locate=lambda: find_tool("ebook-meta"), install_hint=INSTALL_HINT
 )
 FETCH_COVER = Dependency(
     name="fetch-ebook-metadata",
     locate=lambda: find_tool("fetch-ebook-metadata"),
-    install_hint=_INSTALL_HINT,
+    install_hint=INSTALL_HINT,
 )
 # Calibre's own interpreter, used to run `integrations/kindle_mtp.py` — the only way
 # to reach `calibre.devices.mtp.driver`, which cannot be imported from outside it.
 CALIBRE_DEBUG = Dependency(
-    name="calibre-debug", locate=lambda: find_tool("calibre-debug"), install_hint=_INSTALL_HINT
+    name="calibre-debug", locate=lambda: find_tool("calibre-debug"), install_hint=INSTALL_HINT
 )
 
 
@@ -147,7 +147,7 @@ def read_metadata(path: Path, *, cache_dir: Path, timeout: int = 120) -> BookMet
     """
     tool = EBOOK_META.locate()
     if tool is None:
-        raise CalibreError(f"ebook-meta not found. {_INSTALL_HINT}")
+        raise CalibreError(f"ebook-meta not found. {INSTALL_HINT}")
     empty = BookMetadata(None, None, None, None, False)
     cache_dir = Path(cache_dir)
     config_env(cache_dir)  # ensure cache_dir exists before writing the temp OPF into it
@@ -209,7 +209,7 @@ def convert(
 ) -> None:
     tool = EBOOK_CONVERT.locate()
     if tool is None:
-        raise CalibreError(f"ebook-convert not found. {_INSTALL_HINT}")
+        raise CalibreError(f"ebook-convert not found. {INSTALL_HINT}")
     argv = [tool, str(src), str(dst)]
     if opf is not None:
         argv += ["--from-opf", str(opf)]
@@ -240,7 +240,7 @@ def update_metadata(
     the right path with stale metadata that `_verify_output` (rightly) rejects."""
     tool = EBOOK_META.locate()
     if tool is None:
-        raise CalibreError(f"ebook-meta not found. {_INSTALL_HINT}")
+        raise CalibreError(f"ebook-meta not found. {INSTALL_HINT}")
     argv = [tool, str(path), f"--title={title}"]
     if author:
         argv.append(f"--authors={author}")
