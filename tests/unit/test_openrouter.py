@@ -111,3 +111,36 @@ def test_resolve_key_without_any_source_explains_itself():
 def test_key_present_never_returns_the_value():
     assert openrouter.key_present(env={"OPENROUTER_API_KEY": "super-secret"}) is True
     assert openrouter.key_present(env={}, runner=lambda argv: "") is False
+
+
+def test_chat_raises_a_clear_error_when_response_has_no_choices():
+    # A malformed or unexpected OpenRouter response (no "choices" at all) must
+    # surface as a clear OpenRouterError, not a raw KeyError/IndexError leaking
+    # out of chat()'s internals.
+    def opener(request, timeout=None):
+        return _Response({"usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    with pytest.raises(openrouter.OpenRouterError):
+        openrouter.chat([], model="m", api_key="k", opener=opener)
+
+
+def test_default_runner_returns_empty_string_when_op_is_not_installed(monkeypatch):
+    # resolve_key's default runner (used whenever a test - or a real caller -
+    # does not inject one) must degrade to "no value from this source" rather
+    # than crash when the `op` binary itself is missing from PATH.
+    def fake_run(argv, **kwargs):
+        raise FileNotFoundError("op: command not found")
+
+    monkeypatch.setattr(openrouter.subprocess, "run", fake_run)
+    assert openrouter._default_runner(["op", "read", "op://x"]) == ""
+
+
+@pytest.mark.parametrize(
+    "fenced",
+    [
+        '```json\n{"books": ["a", "b"]}\n```',
+        '```\n{"books": ["a", "b"]}\n```',
+    ],
+)
+def test_parse_json_content_tolerates_a_fenced_code_block(fenced):
+    assert openrouter.parse_json_content(fenced) == {"books": ["a", "b"]}

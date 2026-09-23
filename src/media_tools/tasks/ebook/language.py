@@ -4,6 +4,18 @@ Deliberately conservative: a title that does not clearly belong to one of the
 supported languages returns None, so the book lands in the review folder instead
 of the wrong shelf. With the LLM enabled, the model answers instead; this module
 is the offline path and the fallback when the model abstains.
+
+Design: every marker below (a stopword or a diacritic) is exclusive to one
+language among the seven supported here — a word or character that two languages
+share is dropped from both rather than counted for either. An earlier version of
+this module scored shared words (`de`, `le`, ...) per language and only tried to
+break ties after the fact; that produced real mis-shelving (e.g. "Notre-Dame de
+Paris" and "Cien Años de Soledad" both landing on "pt" because `de` counted for
+Portuguese unconditionally), and a tie-break patch for one collision (French vs.
+Italian's shared `le`) only pushed the false positives to a different pair.
+Refusing to score shared words at all is not a smaller version of that bug — it
+removes its cause, at the cost of more titles coming back None. That trade is the
+point: a wrong shelf is worse than a review folder.
 """
 
 from __future__ import annotations
@@ -13,137 +25,46 @@ import unicodedata
 
 SUPPORTED = ("en", "pt", "es", "it", "fr", "de", "pl")
 
+# Every word below is, to the best of this review, exclusive to its language among
+# the seven in SUPPORTED — checked pairwise (see test_no_word_is_shared_between_two_languages).
+# Entries are stored already folded (lowercase, accents stripped) because matching
+# folds the title the same way (see `_fold`): a real accented word like Portuguese
+# "às" is written here as "as", and Polish "się" as "sie", since that is the form
+# they take after folding and it is what a folded title word is compared against.
+# A collision found during review is resolved by deleting the word from BOTH
+# lists, never by picking a winner: "das" is the Portuguese contraction of "de"+
+# "as" *and* the German neuter "the", so it appears in neither list.
 _STOPWORDS = {
-    "en": frozenset(
-        {
-            "the",
-            "of",
-            "and",
-            "in",
-            "on",
-            "to",
-            "a",
-            "an",
-            "for",
-            "from",
-            "with",
-            "his",
-            "her",
-            "is",
-            "at",
-        }
-    ),
+    "en": frozenset({"the", "of", "and", "to", "on", "for", "from", "with", "his", "her"}),
     "pt": frozenset(
-        {
-            "de",
-            "da",
-            "do",
-            "dos",
-            "das",
-            "e",
-            "o",
-            "a",
-            "os",
-            "as",
-            "um",
-            "uma",
-            "no",
-            "na",
-            "nos",
-            "nas",
-            "para",
-            "com",
-            "que",
-        }
+        {"do", "da", "dos", "no", "na", "nos", "nas", "uma", "pelo", "pela", "aos", "as"}
     ),
-    "es": frozenset(
-        {
-            "el",
-            "la",
-            "los",
-            "las",
-            "del",
-            "y",
-            "en",
-            "un",
-            "una",
-            "por",
-            "para",
-            "con",
-            "que",
-        }
-    ),
-    "it": frozenset(
-        {
-            "il",
-            "lo",
-            "la",
-            "i",
-            "gli",
-            "le",
-            "dei",
-            "della",
-            "e",
-            "un",
-            "una",
-            "nel",
-            "con",
-            "che",
-        }
-    ),
-    "fr": frozenset(
-        {
-            "le",
-            "la",
-            "les",
-            "des",
-            "du",
-            "et",
-            "un",
-            "une",
-            "dans",
-            "sur",
-            "pour",
-            "avec",
-            "qui",
-        }
-    ),
-    "de": frozenset(
-        {"der", "die", "das", "und", "des", "ein", "eine", "im", "von", "zu", "mit", "den", "dem"}
-    ),
-    "pl": frozenset({"i", "w", "na", "z", "do", "nie", "się", "od", "po", "za"}),
+    "es": frozenset({"el", "los", "las", "del", "una", "unos", "unas", "y"}),
+    "it": frozenset({"il", "lo", "gli", "della", "dei", "delle", "degli", "nel", "nella", "che"}),
+    "fr": frozenset({"les", "des", "du", "une", "dans", "sur", "pour", "avec"}),
+    "de": frozenset({"der", "die", "und", "ein", "eine", "im", "von", "zu", "mit", "den", "dem"}),
+    "pl": frozenset({"w", "z", "nie", "sie", "oraz", "przez"}),
 }
 
-# Words common enough across Romance languages that, alone, they are not decisive —
-# they only confirm a language once one of that language's own (less ambiguous)
-# stopwords has already matched. "de" already sits in `_STOPWORDS["pt"]` above and
-# is not shared with any other language's set there, so it stays a fully decisive,
-# standalone signal for Portuguese (e.g. a bare "de" is enough: see
-# test_detects_the_obvious_cases and the accent-invariance test). For French, "de"
-# would otherwise tie a Portuguese-only title 1-for-1 (both match nothing but "de"),
-# which is exactly the kind of shared-vocabulary collision this module must not
-# guess through — so it counts for French only once a French-specific stopword
-# (le/la/les/un/une/...) has already matched, the same way "La Sombra del Viento"
-# is only decisive for Spanish because "del" backs up the "la" it shares with
-# Italian and French.
-_CONFIRMING = {
-    "fr": frozenset({"de"}),
-}
-
-# Characters that only a few languages use; weaker than a stopword but decisive
-# for a short title.
+# Diacritics kept here are exclusive too (checked against the title's lowercased
+# but *unfolded* form, so the accent itself is still there to find — see
+# `_HINT_CHARS` usage below). Italian has no exclusive diacritic among these seven
+# languages and relies on its stopwords alone; that is fine, not a gap to fill.
 _HINT_CHARS = {
-    "pt": "ãõç",
+    "pt": "ãõ",
     "es": "ñ¿¡",
-    "de": "ßüöä",
-    "pl": "łżźćęąś",
-    "fr": "çœàèùâêî",
-    "it": "àèìòù",
+    "de": "ß",
+    "pl": "łżźęąśćń",
+    "fr": "œ",
 }
 
 _WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
 MIN_SCORE = 2
 MIN_MARGIN = 1
+# A stopword and an exclusive diacritic are equally strong, exclusive evidence, so
+# each is worth the same amount: one hit already clears MIN_SCORE on its own,
+# exactly as a single unambiguous stopword hit always has.
+_HIT_WEIGHT = 2
 
 
 def _fold(text: str) -> str:
@@ -163,12 +84,9 @@ def detect(title: str, author: str | None = None) -> str | None:
     lowered = (title or "").lower()
     scores: dict[str, int] = {}
     for code in SUPPORTED:
-        primary_hits = words & _STOPWORDS[code]
-        confirming = _CONFIRMING.get(code, frozenset())
-        confirming_hits = (words & confirming) if primary_hits else frozenset()
-        stopword_hits = len(primary_hits) + len(confirming_hits)
+        stopword_hits = len(words & _STOPWORDS[code])
         hint_hits = sum(1 for c in _HINT_CHARS.get(code, "") if c in lowered)
-        score = 2 * stopword_hits + hint_hits
+        score = _HIT_WEIGHT * (stopword_hits + hint_hits)
         if score:
             scores[code] = score
     if not scores:
@@ -176,8 +94,6 @@ def detect(title: str, author: str | None = None) -> str | None:
     ranked = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
     best, best_score = ranked[0]
     runner_up = ranked[1][1] if len(ranked) > 1 else 0
-    # Portuguese and Spanish share several stopwords: when they (or any pair) tie
-    # within the margin, say nothing rather than guess.
     if best_score < MIN_SCORE or best_score - runner_up < MIN_MARGIN:
         return None
     return best
