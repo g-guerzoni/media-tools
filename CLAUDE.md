@@ -9,6 +9,10 @@ code.
 all work today. `ebook build <folder>` turns a folder of mixed ebook formats into a
 language-sorted AZW3 (or other format) library, deduplicated and (optionally)
 LLM-cleaned — see "The `ebook` task" below for the full contract before you drive it.
+`ebook kindle <subcommand>` puts that library on a connected Kindle and takes it off
+again; it is the only part of this tool that writes to hardware, every one of its
+write commands takes a mandatory backup first, and it has its own contract — see "The
+`ebook kindle` subsystem" below and read it before driving anything destructive.
 
 ## 1. Session start
 
@@ -34,6 +38,14 @@ Each entry in `checks` is `{"name", "status", "detail", "hint"}` with `status` o
   them; `calibre` not found only matters for `ebook build` and for `convert` on ebook
   formats). `doctor --json` reports both, plus `--op-item NAME` if you need to check a
   named 1Password item rather than an env var.
+- **The two Kindle checks are warnings ABSOLUTELY, never `"missing"`.**
+  `kindle-mtp-driver` reports whether Calibre's own MTP driver imports inside
+  Calibre's interpreter (needed only for an MTP Kindle; a mass-storage one needs none
+  of it), and `kindle-device` reports whether a Kindle is connected and in which mode.
+  A machine with no Kindle attached is not a broken machine, so neither can move
+  `doctor`'s exit code, and neither should be relayed as something to fix unless the
+  user is actually trying to drive `ebook kindle`. `kindle-device` never prints a
+  serial — `ebook kindle status` is where that is asked for deliberately.
 - With `--check-updates`, an extra `"<package>-update"` entry (status `"warn"`) appears
   for every pip-managed dependency (`yt-dlp`, `yt-dlp-ejs`, `deno`, `imageio-ffmpeg` —
   never `media-tools` itself) that has a newer version on PyPI. If you see one, run:
@@ -55,7 +67,11 @@ Each entry in `checks` is `{"name", "status", "detail", "hint"}` with `status` o
   "Output rules" below). Everything under it is generated: batch folders, downloaded or
   converted files, and each batch's `run.json` book-keeping. Hand-editing `run.json`
   desyncs it from the files actually on disk, and a later run trusts it for skip/resume
-  decisions.
+  decisions. The same goes double for `_kindle/` under that root: its snapshots,
+  `manifest.json` files and `journal.jsonl` are what makes every Kindle write undoable,
+  and a hand-edited journal entry can authorise overwriting a file on a real device.
+  **Never delete a snapshot on the user's behalf** — this tool never prunes them, and
+  neither should you without being asked.
 
 ## 2. Using the tools
 
@@ -74,6 +90,14 @@ media-tools download "https://example.com/video" --json
 media-tools download --list examples/download-list.json --json
 media-tools ebook build books/ --no-llm --json
 media-tools ebook build books/ --dry-run --json
+media-tools ebook kindle status --json
+media-tools ebook kindle scan --json
+media-tools ebook kindle backup --json
+media-tools ebook kindle add book.azw3 --json
+media-tools ebook kindle remove "documents/en/Book.azw3" --yes --json
+media-tools ebook kindle sync --batch mylibrary --json
+media-tools ebook kindle restore --op <ID> --yes --json
+media-tools ebook kindle eject --json
 media-tools formats --json
 media-tools status --json
 media-tools status <batch> --json
@@ -96,10 +120,10 @@ the `Reporter` class (`core/events.py`) actually emits:
 | `start` | once, at the beginning of a run that got past argument/input validation | `tool`, `batch`, `output_dir`, `stages` (list of names), `items` (count), `options` |
 | `stage` | once per entry in `start`'s `stages` list, in that order | `stage`, `index`, `count` |
 | `progress` | zero or more times per item, while an engine is working | `stage`, `item: {index, count, path}`, `percent`, `eta_s` |
-| `item` | once per item, when it finishes | `id`, `status`, `input`, `outputs`, `bytes_in`, `bytes_out`, `reason`, `warnings` |
+| `item` | once per item, when it finishes | `id`, `status`, `input`, `outputs`, `bytes_in`, `bytes_out`, `reason`, `detail`, `warnings` |
 | `warning` | rarely, for a warning not tied to one item | `code`, `message` |
 | `error` | on a hard failure | `code`, `message`, `hint`, `retryable` |
-| `result` | once, at the very end of a run that started | `ok`, `exit_code`, `counts`, `failed`, `pending`, `outputs`, `run_file`, `elapsed_s`, optionally `data` (`ebook` only: `{"llm": {...}}`, its LLM cost summary, plus `{"placement": {"kept", "renamed", "leftover"}}` once the run reached the convert stage — see "`run.json`" below) |
+| `result` | once, at the very end of a run that started | `ok`, `exit_code`, `counts`, `failed`, `pending`, `outputs`, `run_file`, `elapsed_s`, optionally `data` — left out entirely by `compress`/`convert`/`split`/`download`. `ebook build` puts `{"llm": {...}}` (its LLM cost summary) there, plus `{"placement": {"kept", "renamed", "leftover"}}` once the run reached the convert stage (see "`run.json`" below); every `ebook kindle` command puts its own shape there instead — see "The `ebook kindle` subsystem" |
 
 `stage`'s own `stage` field is distinct both from `progress`'s `stage` field (which
 names the sub-step an individual item is in, e.g. `"encode"`) and from the `stages` list
@@ -197,15 +221,19 @@ Item statuses (`item.status`, and `run.json`'s per-item `status`):
 | `engine_error` | the engine raised, or its subprocess failed |
 | `dependency_missing` | a required external tool/binary is missing |
 | `device_rejected` | `ebook kindle thumbnails`: the device accepted a thumbnail write and then silently discarded it (Colorsoft and newer, by design) |
-| `no_cover` | `ebook kindle thumbnails`: no cover anywhere for this book — no EXTH 113 id at all (paired with the `book_id_missing` warning), or an id but no cover in the library's cache or embedded in the book itself |
+| `no_cover` | `ebook kindle thumbnails`: no thumbnail could be produced. **Four distinct causes share this one code** and `thumbnails.install` does not tell them apart: (1) no EXTH 113 id at all — the only one that is paired with the `book_id_missing` warning; (2) an id (or CDE type) that IS present but is rejected as unsafe to use as a filename, e.g. a `urn:uuid:...` form whose colon FAT32 refuses; (3) an id but no cover anywhere — nothing in the library's `covers/` cache and nothing embedded in the book; (4) a cover that was found but that ffmpeg could not resize. Only cause (1) is distinguishable from the event stream |
 | `no_audio_only_format` | (reserved; see the `no_audio_only_format` warning below) |
 | `llm_unavailable` | (reserved; a failed/unavailable LLM call currently falls back to the offline heuristic per batch instead of failing the item) |
 
 `error` event `code`:
 
 `usage`, `no_input_matched`, `batch_in_use`, `batch_task_mismatch`, `dependency_missing`,
-`config_missing`, `device_not_found`, `device_busy`, `backup_failed`, `interrupted`,
-`output_not_writable`, `internal_error`, `extraction_failed`. `config_missing` is what
+`config_missing`, `device_not_found`, `device_busy`, `device_write_protected`,
+`backup_failed`, `interrupted`, `output_not_writable`, `internal_error`,
+`extraction_failed`. `device_write_protected` is raised by both Kindle backends when
+the device refuses a write as read-only (locked, or mounted read-only), as distinct
+from `device_busy` (something else holds it) and `device_not_found` (it went away);
+`config_missing` is what
 `ebook build`/`normalize`/`dedup`/`covers`/`convert` (every subcommand but `scan`) raise
 when the LLM is enabled and no OpenRouter key resolves.
 
@@ -239,6 +267,39 @@ also produced by `ebook kindle scan` and `ebook kindle thumbnails`, both for a d
 book with no EXTH 113 id). They're listed here regardless because the set is closed
 and this is the authoritative source.)
 
+### `detail`: the free-text field that NARROWS `reason`
+
+**`detail` is emitted on every `item` event, by every task in this project** — `null`
+for every task that has nothing to add, never an absent key, so a parser always gets a
+missing VALUE rather than a missing KEY. It exists because the `reason` registry above
+is closed and several genuinely different causes therefore share one code (`ebook
+kindle add`'s `engine_error` alone covers out-of-space, a refused write, a short write
+and a failed verification).
+
+**Branch on the PREFIX, never on the English.** Every producer writes
+`"<term>: <human sentence>"`, with the term drawn from one closed vocabulary
+(`tasks/ebook/kindle/cli.py`'s `DETAIL_TERMS`, checked the same way `Reporter` checks a
+`reason` — an unlisted term raises). The prose after the colon is for a human and may
+change at any time; the term is the contract:
+
+| term | on which `reason` | meaning |
+| --- | --- | --- |
+| `exists` | `exists` | already on the device — by EXTH 113 id, or by provenance for an id-less book |
+| `source_missing` | `source_missing` | `add`/`sync`: the host file is gone (`failed`). `remove`: a device path the user NAMED that no book answers to (`failed`), or a book that vanished between the listing and the delete (`skipped` — nothing was removed for it). `restore`: the manifest names a file the snapshot no longer holds (`failed`) |
+| `output_collision` | `output_collision` | two sources in one run resolve to the same device path, or the target path is occupied by a file that is not this book |
+| `out_of_space` | `engine_error` | the book no longer fits in the device's remaining free space |
+| `write_refused` | `engine_error` | the device refused the write outright (full disk, yanked cable, write-protected, an MTP error) |
+| `short_write` | `engine_error` | the file on the device is a different size than what was sent — the MTP failure mode, caught only by the verify stage |
+| `verify_failed` | `engine_error` | the device could not be listed afterwards, or the file is not there at all |
+| `protected` | `engine_error` (`remove`) / `unsupported_input` (`sync --delete-extras`) | this tool never deletes that path — see the refusal rules below |
+| `not_a_book` | `engine_error` | a named device path exists but is not a book; a sidecar or thumbnail is only ever removed with its book |
+| `remove_failed` | `engine_error` | the delete itself failed |
+| `corrupt` | `engine_error` | `restore`: the stored copy no longer hashes to what the manifest recorded, so it was NOT written |
+| `not_in_snapshot` | `source_missing` | `restore`: this snapshot holds no copy of that path — undoing an ADD reports this, since `restore` never deletes |
+
+`detail` also appears on every entry of `result.failed` for these commands, with the
+same shape.
+
 `-e/--extensions` only filters a **folder** scan. A file named directly on the command
 line is still processed as long as some engine accepts it, even when its extension is
 not in an explicitly given `-e` list — with an `extension_filter_bypassed` warning
@@ -253,6 +314,16 @@ noting the mismatch, not a silent pass-through.
 | 2 | usage error: bad flags, invalid input, nothing matched, or a batch name/task/options conflict |
 | 3 | missing dependency or configuration (a missing tool, or `ebook`'s LLM enabled with no OpenRouter key resolvable and `--no-llm` not passed) |
 | 130 | interrupted (Ctrl+C / SIGINT) |
+
+**`ebook kindle` splits 1 and 3 on a rule worth reading before you write a parser.** A
+failed device backup is exit **1** for `ebook kindle backup` and exit **3** for every
+command that takes a backup as a precondition (`thumbnails`, `add`, `remove --yes`,
+`sync`, `restore --yes`). It is not an inconsistency: in `backup` the snapshot IS the
+work being asked for, so a failure there is "at least one item failed" and the run
+reports `counts.failed: 1` with a real `failed` entry; in a WRITE command the snapshot
+is a precondition that was never met, nothing the user asked for was attempted at all,
+and the run reports all-zero counts. Every other mapped device code — `device_not_found`,
+`device_busy`, `device_write_protected`, `dependency_missing` — is exit 3.
 
 ### `run.json`
 
@@ -623,13 +694,362 @@ config) but nothing persists to `.cache/`.
 Per-book fields in `run.json`, and the LLM cost summary on the final `result` event,
 are documented in "`run.json`" below.
 
+### The `ebook kindle` subsystem
+
+`media-tools ebook kindle <subcommand>` is the only part of this tool that writes to
+hardware. Read this whole section before driving `add`, `remove`, `sync` or `restore`.
+
+```bash
+media-tools ebook kindle status --json
+media-tools ebook kindle scan --json [--compare BATCH]
+media-tools ebook kindle backup --json [--full] [--verify-hashes]
+media-tools ebook kindle thumbnails --json [--force] [--match TEXT] [--dry-run]
+media-tools ebook kindle add BOOK... --json [--batch NAME] [--lang XX] [--match TEXT] [--dry-run]
+media-tools ebook kindle remove PATH... --json [--match TEXT] [--asin ID] [--yes]
+media-tools ebook kindle sync --batch NAME --json [--lang XX] [--match TEXT] [--delete-extras] [--yes] [--dry-run]
+media-tools ebook kindle restore [SNAPSHOT] --json [--op ID] [--yes] [--force]
+media-tools ebook kindle eject --json
+```
+
+Every one of these emits the same event stream as the other tasks (`start` … `result`,
+`result` always last), and every one accepts `-o/--output-dir`, `--json` and
+`-q/--quiet` and nothing else in common. None of them writes a `run.json` or takes a
+batch lock: `result.run_file` is always `null`.
+
+**Identity is read from the books, never from their filenames.** Every command matches
+on a book's embedded EXTH 113 id (title/author/language come from EXTH 503/100/524, and
+the content type from 501). A book renamed on the device is the same book; two files
+with the same name are not.
+
+#### The two modes
+
+`detect.find_device` never consults a model table: a Kindle that exposes a mount is
+`mass_storage`, a Kindle with no matching mount is `mtp` (2024-or-later models and the
+Scribe, though firmware has moved that line before). `status` reports which, in
+`data.device.mode`, alongside `data.device.backend` — a stable JSON literal
+(`"mass_storage"`, `"mtp"`, or `"unknown"` for a backend this module does not
+recognise), never a Python class name.
+
+The MTP backend cannot import Calibre's driver from this process; it shells out to
+`calibre-debug` running `integrations/kindle_mtp.py`. So MTP needs Calibre installed;
+mass storage needs none of it. `doctor` reports both facts (`kindle-mtp-driver`,
+`kindle-device`) as warnings — a machine with no Kindle attached is not a broken
+machine, and neither check can ever report `missing` or move `doctor`'s exit code.
+
+Three things behave differently over MTP, all because of what Calibre's cached device
+tree exposes:
+
+- a book's `.sdr` sidecar and anything under `system/` **cannot be deleted at all**
+  (`mtp.MtpPathNotInCachedTree`) — reported as the `sidecar_not_removed` warning on a
+  book that is still `done`;
+- **every** `*.kfx` is refused for removal, sideloaded or not: the `assets/` marker
+  that tells a purchase apart cannot be listed there, and the wrong guess costs a
+  purchase;
+- there is no local path, so reading a book's EXTH needs a full fetch of it into the
+  host-side header cache below.
+
+#### The mandatory backup, and where snapshots live
+
+**Every command that writes to the device takes a full snapshot first, and there is no
+flag to skip it.** A failed backup aborts before a single byte is written (exit 3 — see
+the exit-code split above). Exactly which runs take one:
+
+- `thumbnails`, `add` and `sync` — always, unless `--dry-run`, which writes nothing to
+  the device and therefore takes none.
+- `remove` and `restore` — only with `--yes`, which is also the only way either one
+  writes anything at all.
+- `status`, `scan` and `eject` — never; none of them writes to the device.
+
+`--dry-run` and a `--yes`-less plan are not "a backup you can skip": they are runs that
+do not write, and a run that does not write has nothing to protect.
+
+```
+<output root>/_kindle/<serial>/
+    backups/<UTC timestamp>/manifest.json
+    backups/<UTC timestamp>/files/<the device's own paths>
+    backups/latest                 a pointer file, not a symlink
+    journal.jsonl                  one line per operation that changed the device
+    .cache/headers/                MTP per-book header cache (+ its own index.json)
+    .cache/book-ids.json           `add`'s EXTH 113 index
+```
+
+`_kindle` is one of `core.paths.RESERVED_ROOT_ENTRIES`; never point an input at it. A
+device with no serial gets `unknown-<8 hex>` derived from its mount name or model hint,
+never a shared constant. Snapshots are incremental (hard links from the previous one
+for a file whose path/size match and whose mtime differs by at most 2s, or by a whole
+number of hours — FAT stores local time, so DST shifts every mtime by exactly an hour).
+
+**Snapshots are never pruned.** Nothing in this tool deletes a backup; the only
+directory it ever removes is its own `.partial` staging area after a failure it caught.
+Do not offer to "clean up old snapshots" as if the tool did it.
+
+A completed snapshot is built under a `.partial` name and renamed only when complete,
+so an interrupted run can leave an unfinished snapshot but never one that looks
+finished. `status` reports both (`data.backup.last`, `data.backup.abandoned_partials`).
+The guarantee is against a killed process, **not** against power loss: the manifest and
+the `latest` pointer are fsynced, the transferred files are not.
+
+#### Stage names, exactly
+
+`start.stages` is built per run from the flags, and `stage` events fire live as each
+one begins. The lists are exactly:
+
+| command | stages |
+| --- | --- |
+| `status` | `detect` |
+| `scan` | `detect`, `scan` (+ `compare` with `--compare`) |
+| `backup` | `detect`, `backup` |
+| `thumbnails` | `detect`, `backup`, `thumbnails` — `--dry-run`: `detect`, `thumbnails` |
+| `add` | `detect`, `backup`, `plan`, `copy`, `thumbnails`, `verify` — `--dry-run`: `detect`, `plan` |
+| `remove` | `--yes`: `detect`, `backup`, `plan`, `remove` — without: `detect`, `plan` |
+| `sync` | `detect`, `backup`, `plan`, `copy`, `thumbnails`, `verify`, + `remove` only when `--delete-extras --yes` and not `--dry-run` — `--dry-run`: `detect`, `plan` |
+| `restore` | `--yes`: `detect`, `backup`, `restore` — without: `detect`, `restore` |
+| `eject` | `detect`, `eject` |
+
+A `--dry-run` list never contains `backup`, because a dry run takes none.
+
+#### What each command puts in `result.data`
+
+Every key below is always present for that command — a plan or a `--dry-run` reports a
+missing VALUE (`snapshot: null`, `operation: null`, `thumbnails: {}`) rather than a
+missing key, so one parser reads both shapes.
+
+| command | `data` keys |
+| --- | --- |
+| `status` | `device` (`mode`, `backend`, `model_hint`, `serial`, `free_space`, `held_by`), `backup` (`last`, `abandoned_partials`, `header_cache_bytes`) |
+| `scan` | `books[]`; `compare` (`batch`, `device_only`, `library_only`, `both`) only with `--compare` |
+| `backup` | `snapshot` |
+| `thumbnails` | `thumbnails` (`{book id or device path: "installed"\|"rejected"\|"no_cover"\|"failed"}`), `snapshot` |
+| `add` | `books[]`, `thumbnails`, `snapshot`, `operation`, `free_space`, `bytes_planned`, `device_books_unreadable` |
+| `remove` | `books[]`, `removed[]`, `snapshot`, `operation` |
+| `sync` | `books[]`, `removals[]`, `extras[]`, `removed[]`, `thumbnails`, `snapshot`, `operation`, `remove_operation`, `free_space`, `bytes_planned`, `device_books_unreadable` |
+| `restore` | `restore` (`snapshot`, `operation`, `plan_only`, `files`, `bytes`, `missing`, `corrupt`, `no_thumbnail`, `not_in_snapshot`) |
+| `eject` | `device` (`mode`, `backend`) |
+
+`data.books[]` means two different things and the fields say which: for `add`/`sync` it
+is the planned SOURCES (`source`, `device_path`, `book_id`, `title`, `author`,
+`language`, `size`, `status`, `reason`, `detail`, `thumbnail`); for `remove` and
+`sync`'s `removals[]` it is the planned REMOVALS (`device_path`, `book_id`, `title`,
+`author`, `size`, `status`, `reason`, `detail`, `would_remove`, `removed`,
+`not_removed`, `kept`, `shared_with`).
+
+`data.operation` is the id `restore --op ID` takes, `null` when the run changed
+nothing. A removal reports **no `outputs`** — deliberately: a removal produces nothing,
+and reporting deleted paths as `outputs` would make one field mean two opposite things
+across `sync`'s two halves. What went away is `data.removed`.
+
+#### `--yes`: what it gates, and what it does not
+
+- **`remove`** without `--yes` reports what it would take and writes **nothing at
+  all** — not to the device, not a backup, not a journal entry — then exits. The plan
+  IS the dry run; there is no `--dry-run` flag on this command. A bare `remove --yes`
+  with no selector is a usage error: it never means "everything".
+- **`sync`** is deliberately not the same. Its ADDING half needs no confirmation and
+  runs regardless. `--delete-extras` alone only adds the removals to the plan
+  (`pending`); `--delete-extras --yes` is what arms them.
+- **`restore`** without `--yes` reports exactly what it would put back — hashes
+  checked against the manifest, as a real run checks them — and writes nothing.
+
+#### Selection: the `--match` rule
+
+`--match TEXT` (on `thumbnails`, `add`, `remove`, `sync`) matches **the device path OR
+the book's own EXTH title OR its author, case-insensitively, with any hit counting**
+(`_matches`). A device's filenames are often opaque, so a user typing an author name
+must not silently match nothing. This is why `--match` is never applied before every
+matched book's records have been read — pre-filtering by path would be cheaper and
+would silently break title/author matching.
+
+`--match` is a NET and never casts outside the area every backup covers, so it never
+selects a book `restore` could not put back. A named device path and `--asin ID` are
+IDENTITIES: they reach the refusal and get its message, rather than a run that reports
+nothing and exits 0.
+
+#### Where `add`/`sync` put a book
+
+`documents/<language>/<FAT32-safe name>`, always — one rule, which is also what
+`restore --op` has to undo. The language is the first usable candidate of `--lang`, the
+`--batch` run's own recorded verdict, then the book's own EXTH 524 tag; a two- or
+three-letter code that is not `und`/`mul`/`zxx`. Anything else lands in
+`documents/unknown/`. A `--lang` value the USER typed is rejected outright as a usage
+error rather than silently falling back, because that value becomes a folder name.
+
+**The whole path is capped: 250 characters over mass storage, 230 over MTP**
+(`MAX_DEVICE_PATH`). `sanitize_device_name` caps the NAME component; joining the
+directory on is what applies the whole-path budget, and a name too long for it is
+shortened by `core.paths.truncate_name`, which preserves the extension and inserts a
+content hash rather than slicing (two long names sharing a prefix must not collapse
+onto one device path).
+
+#### `add`: identity in two layers, and the provenance rule
+
+A book carrying an EXTH 113 id is `skipped`/`exists` when the device already holds that
+id, wherever it sits and whatever it is called.
+
+A book with **no** id — an `.epub`, a `.pdf`, a MOBI nobody wrote one into — is
+recognised by PROVENANCE instead. All three of these must hold: the journal records
+that this tool put these exact bytes (the source hashes to the `sha256` recorded with
+the placement) at path P, and the device still holds P at the size that was sent. The
+journal alone is a memory; the listing alone is a name comparison; without the digest
+an edited source would read as already-there.
+
+**`verified` means "this tool never CONFIRMED the write", not "the write failed."** A
+run interrupted during the thumbnails stage, or one whose verify-stage listing failed,
+records a perfectly-landed book as `verified: false`. That flag is what waives the
+occupied-path refusal — an unverified placement may be re-sent, a verified one
+describes a file that landed correctly, so anything different at that path now was put
+there by something else and is refused. Only the LATEST record for a (source, path)
+pair counts, so a successful re-run revokes an earlier waiver. The journal never
+REDIRECTS a write: the target path is recomputed from scratch every run.
+
+Residual exposure, stated rather than hidden: a run whose verify listing failed records
+a book that landed perfectly as unconfirmed, and nothing revises that. If the user then
+replaces that file with their own, the next `add` of the same source overwrites theirs.
+What stands behind it is the mandatory snapshot and `restore --op`.
+
+**Nothing is `done` until the device confirms it.** After the copy, `verify` lists
+`documents/` once and compares each written file's size against the source's. A write
+that left nothing, or the wrong number of bytes, is `failed` (`verify_failed` /
+`short_write`), not done — the real MTP failure mode, since there is no rename
+primitive there. The short file is left where it is; this command never deletes.
+
+#### The two host-side caches, and what invalidates them
+
+| path | holds | keyed by | invalidated by |
+| --- | --- | --- | --- |
+| `_kindle/<serial>/.cache/headers/` | whole books pulled off an MTP device so their EXTH can be read | device path + size + mtime | the file changing on the device. A superseded copy is pruned via the directory's own `index.json`; delete the directory to force a full re-fetch |
+| `_kindle/<serial>/.cache/book-ids.json` | `{device path: (size\|mtime, EXTH 113 id)}` for `add`/`sync` | device path + size + mtime | the same. **A read that RAISED is never cached** — only a book that parsed, id or no id |
+
+Both are best-effort: an unreadable or unwritable cache costs one re-read, never a
+failed command, and is never reported as if the DEVICE were the problem. Neither is a
+cache of the LIBRARY — scanning a library is `scan`'s job, not `add`'s.
+
+`result.data.device_books_unreadable` (on `add` and `sync`) counts device books whose
+EXTH 113 could not be read AT ALL on this run, and a `book_id_unreadable` warning is
+emitted alongside. **Non-zero means the "already on the device" check was blind for
+that many books** — a source the device already holds reads as new and is copied again,
+under a name the device copy need not share. Check this before wondering why duplicates
+appeared. It is a different thing from `book_id_missing` (a book that legitimately
+carries none: permanent, and cached as such); aggregating the two would sum two
+populations.
+
+#### `remove`: what goes, and what is never touched
+
+A removal takes **the book, its `.sdr` folder and its thumbnail** together. The `.sdr`
+folder holds the reading position, highlights and page numbers; leaving it behind is
+why a re-added book resumes where it was, and leaving the thumbnail behind leaves a
+cover for a book that is gone.
+
+A `.sdr` folder another surviving book still reads, or a thumbnail another book with
+the same id still uses, is **kept** — reported in `data.books[].kept` with **no**
+warning. Nothing went wrong there; this removal simply does not own it. That is
+different from `sidecar_not_removed`, which means something that SHOULD have gone could
+not.
+
+`_protection_refusal` lists six rules, checked in this order, first match winning: an
+empty path; an absolute path or one with a `.`/`..` component; anything under
+`audible/`; anything under `system/` but its `thumbnails/` child; a `*.kfx` whose
+`.sdr/assets/` holds its DRM (and, over MTP, every `*.kfx`); and **anything outside
+`backup.DEFAULT_SCOPE`** — a book in a folder of the user's own making, or at the
+device root, which no snapshot holds and `restore` could therefore never put back.
+`_guarded_remove` re-applies the path validation and the scope check immediately before
+every delete, so "nothing is deleted that the last snapshot does not hold" is an
+invariant of the function that deletes, not a property of whichever planner called it.
+
+**A protected book reports differently depending on which command swept it up**, and
+this is deliberate: named to `remove`, it is `failed`/`engine_error` with
+`detail: "protected: ..."`, because the user aimed a selector at that specific book and
+it did not happen. Swept up by `sync --delete-extras`, it is
+`skipped`/`unsupported_input` with the same detail, because the user asked for a mirror
+and a purchased book is a permanent structural exclusion from one — a mirror command
+that can never exit 0 teaches everyone reading it to ignore exit 1 on the one command
+that deletes books.
+
+#### `sync`: what counts as an extra
+
+The adding half IS `add --batch NAME` — shared code, not a second implementation. An
+extra is a device book whose EXTH 113 id the batch does not carry. **Four things are
+never extras**: a book whose id could not be read (absence cannot be PROVEN for it), a
+book outside `backup.DEFAULT_SCOPE`, a book at a path this run's own plan targets, and
+every book of a batch that never finished — which is refused up front as a usage error
+rather than silently treated as "the library does not have these".
+
+Extras are reported in `result.data.extras` whether or not `--delete-extras` was given.
+The two halves are journalled as TWO operations, an `add` and a `remove`
+(`data.operation` and `data.remove_operation`), so `restore --op` undoes either alone.
+
+**The hazard, plainly**: an extra is anything the batch does not name, including a book
+somebody else put on the device. `--delete-extras --yes` on a batch that is not actually
+the whole library will remove books the user wanted.
+
+#### `restore`
+
+It only ever WRITES files back; it never deletes. Undoing an operation that REMOVED
+files restores them; undoing one that ADDED files restores nothing and reports
+`skipped`/`source_missing` with `detail: "not_in_snapshot: ..."`, because the snapshot
+that protected it was taken before those files existed. Taking an added book off again
+is `remove`'s job.
+
+Every selected file is hashed against the manifest before a byte is written, including
+in the plan; one that disagrees is `failed` with `detail: "corrupt: ..."` rather than
+restored. A snapshot from a DIFFERENT Kindle is refused unless `--force`. The snapshot
+is resolved BEFORE the mandatory backup, never after — that backup becomes the newest
+snapshot, and a `restore` with no SNAPSHOT argument resolved afterwards would restore
+the state it had just recorded. One `item` per selected FILE, not per book.
+
+#### `eject`
+
+`detect`, `eject`, no items, and nothing written to the device — the one device command
+with no backup, because it has nothing to protect. Mass storage runs `sync` and then the
+platform eject (`diskutil eject` on the mount's parent whole disk on macOS, `udisksctl
+unmount` + `power-off` on Linux, retried once on a busy volume); MTP closes the session.
+A failure maps through the same table as every other command, which means a missing
+`diskutil`/`udisksctl` AND a volume still busy after the retry both surface as
+`dependency_missing`/exit 3 — the closed registry has no narrower code, and the device
+is untouched either way.
+
+#### `scan`'s report, field by field
+
+`data.books[]` carries `path`, `book_id`, `title`, `author`, `language`, `size`,
+`mtime`, `has_sdr`, `has_thumbnail`. Two readings that are easy to get wrong:
+
+- **`has_sdr` means "has `.sdr` CONTENT".** It is computed from the listing, and a
+  listing holds files, so an EMPTY `.sdr` directory reports `False`.
+- **A book with a readable id but an unreadable title is reported `done`, with
+  `title: null` and NO warning.** Only a missing `book_id` produces `book_id_missing`.
+  Do not treat a null title as an error.
+
+`scan --compare BATCH` adds `data.compare` with `device_only` / `library_only` / `both`,
+compared by book id against an `ebook build`/`ebook scan` batch's `run.json`. Items with
+status `done` OR `skipped` count as "the library has it" — a book a rebuild did not have
+to reconvert is still in the library.
+
+Note the key names: `data.books[].path` is a device-relative POSIX path, while
+`data.compare.library_only[].output` is an absolute HOST path. They are named
+differently on purpose.
+
+#### Thumbnails and the Colorsoft limitation
+
+`ebook kindle thumbnails` installs a cover for every device book lacking one (or every
+book with `--force`). On a Colorsoft and newer the device accepts the write and then
+silently discards it, **by design**: that is `skipped` / `reason: device_rejected` /
+`device_rejected_thumbnail`, never `failed`, and the run still exits 0. A genuine device
+fault mid-write is `failed`/`engine_error` and does make the run exit 1. `add`/`sync`
+install thumbnails as they copy and a thumbnail never fails the BOOK — the outcome lands
+in `result.data.thumbnails` and, for a rejection, as the same warning on the item.
+
 ### Safety guarantees
 
 - **Never prompts.** No task falls back to interactive input; a format/quality choice
   that would need one instead picks a safe default or fails with a `usage`/
   `dependency_missing` error.
 - **Never overwrites an input.** `output_equals_input` is checked and refused before any
-  write; outputs live in the batch folder, never mixed into the input tree.
+  write; outputs live in the batch folder, never mixed into the input tree. On a Kindle
+  the equivalent is `output_collision`: a device path already occupied by a file that is
+  not this book is refused, never overwritten — the only waiver is a placement this tool
+  itself recorded and never confirmed (see "The `ebook kindle` subsystem").
+- **Every Kindle write is preceded by a backup that cannot be skipped**, and a failed
+  backup aborts before a single byte is written. Snapshots are never pruned — this tool
+  never deletes a user's backup. Nothing is deleted from a device without `--yes`.
 - **`--dry-run` writes nothing** — not the output files, not `run.json`, not the batch
   directory itself. It only prints the plan (as `item`/`result` events with no `start`
   producing real state).
@@ -665,11 +1085,21 @@ src/media_tools/
                        metadata.py (read_all, cached ebook-meta) · normalize.py (heuristic/classify)
                        dedup.py (group/refine) · covers.py (resolve) · library.py (plan_placement/reconcile)
                        names.py · language.py · opf.py · exth.py (EXTH-record helpers)
+      kindle/          cli.py (every `ebook kindle` subcommand, resolve_device, the one
+                       `_run` skeleton) · detect.py (find_device, Device, the two modes)
+                       backend.py (the DeviceBackend protocol, FAT32 name rules,
+                       validate_writable_path) · massstorage.py · mtp.py (the two backends)
+                       backup.py (snapshot/restore/journal, DEFAULT_SCOPE)
+                       thumbnails.py (cover install, the Colorsoft rejection)
     formats.py         lists every task's ENGINES (formats.TASK_MODULES)
     status.py          reads run.json across batches
     doctor.py          environment checks
   integrations/
     calibre.py         ebook-convert/ebook-meta/fetch-ebook-metadata: locate, read metadata, convert, fetch a cover
+    kindle_mtp.py      NOT importable from this package: a standalone script run under
+                       `calibre-debug`, the only Calibre-aware part of the MTP path. Its
+                       FIRST-RUN VERIFICATION block lists what has never run against real
+                       hardware — keep it correct rather than working around it downstream
     openrouter.py      OpenRouter chat client + the 3-way key lookup (resolve_key/key_present)
 ```
 
@@ -815,7 +1245,11 @@ its own declared outputs (only truly temporary files it created outside that lis
   touch the user's own Calibre library/settings. `doctor`'s `calibre` check looks for
   all three CLI tools it uses: `ebook-convert`, `ebook-meta`, and `fetch-ebook-metadata`
   (the last one only for `ebook build`'s online cover lookup, skipped entirely by
-  `--no-cover-fetch`) — via `calibre.find_tool` (I6), the same lookup `ebook build`/
+  `--no-cover-fetch`). A FOURTH Calibre tool, `calibre-debug`, is used only by the MTP
+  Kindle backend and is reported separately as `kindle-mtp-driver` rather than folded
+  into the `calibre` check — a machine with no MTP Kindle needs it and a machine with
+  no Kindle at all does not, so one status for both would be wrong for somebody either
+  way. All of them are located via `calibre.find_tool` (I6), the same lookup `ebook build`/
   `convert` themselves use, not a bare `shutil.which`. `find_tool` also searches e.g.
   `/Applications/calibre.app/Contents/MacOS` on macOS, so a .dmg/App-bundle install
   that isn't on PATH is still found; before this fix `doctor` alone used `shutil.which`

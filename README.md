@@ -5,7 +5,9 @@ one command, one subcommand per task, replacing several older single-purpose scr
 
 `compress`, `convert`, `split`, `download`, `ebook`, `formats`, `status` and `doctor`
 all work today. `ebook build` turns a folder of mixed-format ebooks into a
-language-sorted, deduplicated library — see "Building an ebook library" below.
+language-sorted, deduplicated library — see "Building an ebook library" below — and
+`ebook kindle` puts that library on a Kindle, with a backup before every write; see
+"Putting books on a Kindle".
 
 ## Install
 
@@ -50,8 +52,12 @@ your PATH, without a local clone.
 - **A JS runtime for YouTube extraction** — ships with the `yt-dlp[default,deno]`
   dependency (it installs the `deno` pip package, which vendors the Deno binary).
   Some sites need this to decode signature ciphers before `download` can fetch them.
-- **Calibre** — needed by `ebook build` (all of it) and by `convert` when converting
-  to/from an ebook format. Install with `brew install --cask calibre`.
+- **Calibre** — needed by `ebook build` (all of it), by `convert` when converting
+  to/from an ebook format, and by `ebook kindle` for a Kindle that speaks MTP (see
+  "Putting books on a Kindle"). Install with `brew install --cask calibre`.
+- **A Kindle** — only for `ebook kindle`, and only when you actually want to touch
+  one. `media-tools doctor` reports whether one is connected as a warning, never a
+  failure.
 - **An OpenRouter API key** — optional, only for `ebook build`'s LLM-assisted cleanup.
   Skip it entirely with `--no-llm`. See "Building an ebook library" below.
 
@@ -86,6 +92,9 @@ media-tools ebook build books/ --no-llm
 
 # Same, with an OpenRouter key configured: an LLM pass also cleans titles/languages
 media-tools ebook build books/
+
+# Put a library on a connected Kindle (a backup is always taken first)
+media-tools ebook kindle sync --batch mylibrary
 
 # See what each task can read and write
 media-tools formats
@@ -282,6 +291,143 @@ were folded into it as duplicates, and where it was written. The language's own 
 `unknown`) is recorded separately, since it can come from a different step than the
 title/author did.
 
+## Putting books on a Kindle
+
+`media-tools ebook kindle <subcommand>` talks to a Kindle plugged in over USB:
+
+```bash
+media-tools ebook kindle status                 # which Kindle, which mode, how much room
+media-tools ebook kindle scan                   # every book on it, read from the books
+media-tools ebook kindle backup                 # snapshot it onto this machine
+media-tools ebook kindle thumbnails             # install missing cover thumbnails
+media-tools ebook kindle add book.azw3          # copy books onto it
+media-tools ebook kindle remove "documents/en/Book.azw3" --yes
+media-tools ebook kindle sync --batch mylibrary # mirror an `ebook build` batch
+media-tools ebook kindle restore --yes          # put a snapshot's files back
+media-tools ebook kindle eject                  # flush and release it
+```
+
+**Everything is read from the books themselves, never from their filenames.** A book
+is identified by the stable id embedded in it, so the same book under a different name
+is still the same book, and a book renamed on the device is not a new one.
+
+### The two connection modes, and how to tell them apart
+
+- **Mass storage** — the Kindle mounts as a disk and shows up in your file manager.
+- **MTP** — a 2024-or-later model (or a Scribe) shows *no disk at all*. That's
+  expected, not a fault: those models speak MTP, and media-tools reaches them through
+  Calibre's own device driver (so Calibre must be installed for that half; a
+  mass-storage Kindle needs none of it).
+
+`media-tools ebook kindle status` says which one it found, and `media-tools doctor`
+reports the same thing plus whether Calibre's MTP driver is available. Detection never
+trusts a model table — it looks for the mount, because firmware updates have moved
+that line before.
+
+Two things work differently over MTP, both because of what Calibre's driver exposes:
+a book's `.sdr` sidecar can't be deleted at all (see `remove` below), and every `.kfx`
+book is refused for removal, because a purchased one can't be told apart from a
+sideloaded one there.
+
+### Every write is preceded by a backup, and there is no flag to skip it
+
+Every run that writes to the device takes a full snapshot of it *first*, and aborts
+if that snapshot fails — nothing is copied or deleted after a failed backup, and there
+is no flag to turn this off. `thumbnails`, `add` and `sync` always take one (except
+under `--dry-run`, which writes nothing anyway); `remove` and `restore` take one when
+you pass `--yes`, which is the only way either of them writes at all. `status`, `scan`
+and `eject` write nothing and take none.
+
+Snapshots live under the output root:
+
+```
+<output root>/_kindle/<serial>/backups/<UTC timestamp>/
+```
+
+Each holds a `manifest.json` and a `files/` tree mirroring the device's own paths. A
+snapshot is built under a temporary name and renamed only once complete, so an
+interrupted run can leave an unfinished snapshot but never one that looks finished.
+Backups are incremental: a file that hasn't changed is hard-linked from the previous
+snapshot instead of being transferred again.
+
+**Snapshots are never pruned.** This tool does not delete your backups — not the
+oldest, not the largest, not ever. Over months of use that adds up, and clearing space
+is yours to do. `media-tools ebook kindle status` reports the most recent snapshot and
+any unfinished ones left behind.
+
+### What `remove` actually deletes
+
+A removal takes **three things together**: the book, its `.sdr` folder and its
+thumbnail.
+
+The `.sdr` folder is the part worth knowing about: it holds your **reading position,
+highlights and page numbers** for that book. Removing the book takes those with it —
+that is the point, and it's also why a book you delete and later re-add starts from
+the beginning. A book whose `.sdr` folder is still being read by another copy on the
+device keeps it.
+
+Over MTP the sidecar can't be deleted at all (Calibre's driver offers no way to reach
+it), so the book goes and the sidecar stays. The run says so with a warning rather
+than pretending otherwise.
+
+Some things are never removed, and each is refused individually with a reason rather
+than aborting the run: anything the backup doesn't cover (nothing could put it back),
+anything under `audible/`, anything under `system/` except its `thumbnails/` folder,
+and a purchased `.kfx` book whose DRM assets nothing on this machine could
+reconstitute.
+
+### `--yes` is required for anything that deletes or overwrites
+
+```bash
+media-tools ebook kindle remove "documents/en/Book.azw3"        # plans; changes nothing
+media-tools ebook kindle remove "documents/en/Book.azw3" --yes  # actually deletes
+```
+
+- **`remove`** without `--yes` lists what it would take and writes nothing at all —
+  not to the device, not a backup, not a journal entry. The plan *is* the dry run,
+  which is why `remove` has no separate `--dry-run` flag. `remove` never means
+  "remove everything": it needs a device path, `--match TEXT` or `--asin ID`.
+- **`sync --delete-extras`** needs `--yes` as well before it deletes anything. Without
+  it, the extras are listed in the plan and left alone. Adding books never needs
+  `--yes`. Be careful with this one: an "extra" is anything the batch doesn't name,
+  *including a book somebody else put on the device*.
+- **`restore`** without `--yes` reports exactly what it would put back — hashes
+  checked, exactly as a real run checks them — and writes nothing. It only ever writes
+  files back; it never deletes. Undoing a removal restores the books; undoing an
+  *addition* restores nothing, because the snapshot that protected it was taken before
+  those files existed. Taking an added book off again is `remove`'s job.
+
+Every run that changed the device records an operation id, so a single operation can
+be undone on its own:
+
+```bash
+media-tools ebook kindle restore --op <ID> --yes
+```
+
+### Cover thumbnails, and the Colorsoft limitation
+
+`media-tools ebook kindle thumbnails` installs a cover for every book on the device
+that lacks one, using the covers `ebook build` already resolved (or the cover embedded
+in the book itself).
+
+**On a Colorsoft — and newer models — this does not work, and cannot.** Those devices
+accept the write and then silently discard the file; it's how they're built, not a
+bug in this tool and nothing you did wrong. media-tools verifies the write afterwards
+and reports those books as skipped rather than claiming a success that isn't there.
+The run still succeeds. On older models, thumbnails install normally.
+
+A book can also come back without a cover simply because there wasn't one to use —
+nothing in the library cache, nothing embedded in the book, or a cover that couldn't
+be resized.
+
+### First time with a real Kindle
+
+Large parts of this — everything MTP-specific, and the eject path — have been built
+and tested against a simulated device, not a real one. `docs/kindle-first-run.md` is
+the checklist to work through the first time an actual Kindle is attached: read-only
+commands first, then a backup, then a single book added, then a single book removed
+and restored. It is explicit about what has never run against real hardware.
+
 ## Where output goes
 
 The output root is chosen in this order:
@@ -344,7 +490,15 @@ media-tools convert media/lecture --to mp3 --batch lecture-mp3
   per-call timeout and stops at the first one that times out (rather than a plain empty
   result), so the health check itself never hangs anywhere near that long — but the
   real `ebook build`/`convert`/etc. run still uses the full timeout.
-- **Calibre missing** — needed by `ebook build` and by `convert` for ebook formats:
-  `brew install --cask calibre`.
+- **Calibre missing** — needed by `ebook build`, by `convert` for ebook formats, and
+  by `ebook kindle` against an MTP Kindle: `brew install --cask calibre`.
+- **`ebook kindle` says no Kindle found** — plug it in over USB and unlock the screen.
+  A 2024-or-later model (or a Scribe) shows no disk at all; that's expected, it speaks
+  MTP and needs Calibre installed. `media-tools doctor` reports both the device and
+  Calibre's MTP driver, as warnings.
+- **`ebook kindle` exits 3 before doing anything** — the mandatory pre-write backup
+  failed, so nothing was attempted. Exit 3 means "a precondition was not met"; the one
+  command that exits 1 instead is `ebook kindle backup` itself, where the snapshot is
+  the work being asked for.
 - Run `media-tools doctor` any time — it checks all of the above and gives an
   install/upgrade hint for anything missing.
