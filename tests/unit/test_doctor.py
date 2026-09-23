@@ -286,3 +286,61 @@ def test_update_propagates_quiet_but_not_check_updates_to_the_fresh_recheck(monk
 def test_fetch_pypi_version_real_network():
     version = doctor_task._fetch_pypi_version("yt-dlp")
     assert version is None or isinstance(version, str)
+
+
+# -- Task 12: Calibre's tools and the OpenRouter key are optional, ebook-flavoured ---
+
+
+def test_doctor_reports_calibre_and_the_key_as_optional(tmp_path):
+    payload = json.loads(_cli("doctor", "--json", "-o", str(tmp_path)).stdout)
+    names = {c["name"]: c for c in payload["checks"]}
+    assert "calibre" in names and "openrouter-key" in names
+    for name in ("calibre", "openrouter-key"):
+        assert names[name]["status"] in {"ok", "warn"}
+        assert (
+            "ebook" in names[name]["detail"].lower()
+            or "ebook" in (names[name].get("hint") or "").lower()
+        )
+
+
+def test_doctor_never_prints_the_key(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-m", "media_tools", "doctor", "--json", "-o", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "OPENROUTER_API_KEY": "sk-do-not-print-me"},
+    )
+    assert "sk-do-not-print-me" not in result.stdout + result.stderr
+
+
+# -- RULING RB2: doctor must ask integrations.openrouter.key_present(...), not read
+# OPENROUTER_API_KEY itself - otherwise an op:// reference or a --op-item resolves for
+# the ebook task but doctor reports the key "missing" anyway. -----------------------
+
+
+def test_openrouter_check_resolves_an_op_style_reference():
+    def fake_runner(argv):
+        assert argv[:2] == ["op", "read"]
+        return "resolved-secret-value"
+
+    env = {"OPENROUTER_API_KEY": "op://vault/item/field"}
+    check = doctor_task._openrouter_check(env=env, runner=fake_runner)
+    assert check.status == "ok"
+    assert "resolved-secret-value" not in check.detail
+    assert "resolved-secret-value" not in (check.hint or "")
+
+
+def test_openrouter_check_honours_op_item():
+    def fake_runner(argv):
+        return "resolved-secret-value" if argv[:2] == ["op", "item"] else ""
+
+    check = doctor_task._openrouter_check(op_item="my-item", env={}, runner=fake_runner)
+    assert check.status == "ok"
+    assert "resolved-secret-value" not in check.detail
+    assert "resolved-secret-value" not in (check.hint or "")
+
+
+def test_openrouter_check_warns_when_nothing_resolves():
+    check = doctor_task._openrouter_check(env={}, runner=lambda argv: "")
+    assert check.status == "warn"
+    assert "ebook" in check.detail.lower() or "ebook" in (check.hint or "").lower()

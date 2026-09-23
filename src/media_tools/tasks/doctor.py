@@ -1,14 +1,21 @@
 """doctor: is this machine ready to run media-tools.
 
 Checks the interpreter, the package versions, the external tools every task depends on
-(ffmpeg, Deno, Calibre), the OpenRouter key the ebook task's LLM features will need, and
-that the output root is writable. Everything it prints is a *result*, so — like
-`formats` and `status` — it goes to stdout, never stderr: results on stdout, progress
-and logs on stderr. The progress/log stream convention (stderr for humans, stdout for
-`--json`) is for the multi-item file tasks, not for a one-shot report like this one.
+(ffmpeg, Deno, Calibre), whether an OpenRouter key resolves for `ebook build`'s
+LLM-assisted stages, and that the output root is writable. Everything it prints is a
+*result*, so — like `formats` and `status` — it goes to stdout, never stderr: results
+on stdout, progress and logs on stderr. The progress/log stream convention (stderr for
+humans, stdout for `--json`) is for the multi-item file tasks, not for a one-shot
+report like this one.
 
-`doctor` must never print a secret: the OpenRouter key check reports only whether the
-variable is set, never its value.
+Calibre and the OpenRouter key are both WARNINGS, never failures: `compress`,
+`convert` (for non-ebook formats), `split`, `download`, `formats` and `status` need
+neither. Each check's message says which command actually needs it.
+
+`doctor` must never print a secret: the OpenRouter key check goes through
+`integrations.openrouter.key_present` (RULING RB2) — the same lookup `ebook build`
+itself uses (a literal `OPENROUTER_API_KEY`, an `op://vault/item/field` reference, or
+a named `--op-item`) — and reports only whether a key resolves, never the value.
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ from pathlib import Path
 from media_tools.core.events import EXIT_DEPENDENCY, EXIT_OK, EXIT_USAGE
 from media_tools.core.ffmpeg import ffmpeg_exe
 from media_tools.core.paths import output_root
+from media_tools.integrations import openrouter
 
 NAME = "doctor"
 HELP = "Check the environment: ffmpeg, Calibre, Deno, output root, and more."
@@ -80,6 +88,13 @@ def register(subparsers):
         "--update",
         action="store_true",
         help="Upgrade pip dependencies, then re-check in a fresh process.",
+    )
+    parser.add_argument(
+        "--op-item",
+        default=None,
+        metavar="NAME",
+        help="Named 1Password item to check the OpenRouter key against "
+        "(same flag `media-tools ebook` accepts).",
     )
     return parser
 
@@ -185,33 +200,50 @@ def _deno_check() -> Check:
     return Check("deno-runtime", "ok", detail or exe)
 
 
+#: The three Calibre command-line tools `media-tools` shells out to: `ebook-convert`
+#: and `ebook-meta` for `media-tools convert`'s ebook engine, and all three for
+#: `media-tools ebook build` (metadata reads, conversion, and online cover lookup).
+CALIBRE_TOOLS = ("ebook-convert", "ebook-meta", "fetch-ebook-metadata")
+_CALIBRE_HINT = (
+    "brew install --cask calibre -- ebook-convert/ebook-meta are needed by "
+    "`media-tools convert` for ebook formats; all three tools are needed by "
+    "`media-tools ebook build`"
+)
+
+
 def _calibre_check() -> Check:
-    convert = shutil.which("ebook-convert")
-    meta = shutil.which("ebook-meta")
-    if not convert or not meta:
-        return Check(
-            "calibre",
-            "warn",
-            "ebook-convert/ebook-meta not found",
-            hint="brew install --cask calibre (needed by the ebook task)",
-        )
-    ok, detail = _run_version([convert, "--version"])
-    if not ok:
-        return Check("calibre", "warn", f"found at {convert} but --version failed")
-    return Check("calibre", "ok", detail or convert)
+    paths = {name: shutil.which(name) for name in CALIBRE_TOOLS}
+    missing = [name for name in CALIBRE_TOOLS if not paths[name]]
+    if missing:
+        return Check("calibre", "warn", f"{', '.join(missing)} not found", hint=_CALIBRE_HINT)
+
+    versions = []
+    for name in CALIBRE_TOOLS:
+        ok, detail = _run_version([paths[name], "--version"])
+        versions.append(detail if ok and detail else f"{name}: --version failed")
+    return Check("calibre", "ok", "; ".join(versions), hint=_CALIBRE_HINT)
 
 
-def _openrouter_check() -> Check:
-    # Presence only - the value itself is never read into a Check's `detail`/`hint`,
-    # so there is nothing here for --json or the human table to leak.
-    if os.environ.get(OPENROUTER_ENV):
-        return Check("openrouter-key", "ok", "configured")
-    return Check(
-        "openrouter-key",
-        "warn",
-        "not set",
-        hint=f"export {OPENROUTER_ENV}=... (needed by the ebook task's LLM features)",
+def _openrouter_check(op_item: str | None = None, *, env=None, runner=None) -> Check:
+    # RULING RB2: ask the ebook task's own key-lookup rules (a literal value, an
+    # op://vault/item/field reference, or a named --op-item) instead of re-reading
+    # OPENROUTER_API_KEY here - doctor's own lookup would miss the last two and
+    # report a key "missing" that `media-tools ebook build` reads just fine.
+    # `key_present` never returns the value itself, so there is nothing here for
+    # --json or the human table to leak.
+    hint = (
+        f"export {OPENROUTER_ENV}=... (a literal key or an op://vault/item/field "
+        "reference) or pass --op-item NAME; needed by `media-tools ebook build`'s "
+        "LLM-assisted normalize/dedup stages, or pass --no-llm to skip them"
     )
+    if openrouter.key_present(op_item, env=env, runner=runner):
+        return Check(
+            "openrouter-key",
+            "ok",
+            "configured",
+            hint="used by `media-tools ebook build`'s LLM-assisted normalize/dedup stages",
+        )
+    return Check("openrouter-key", "warn", "not configured", hint=hint)
 
 
 def _output_root_check(root: Path) -> Check:
@@ -299,7 +331,9 @@ def _update_checks(root: Path, installed: dict[str, Check]) -> list[Check]:
 # -- assembling everything -----------------------------------------------------------
 
 
-def check_all(*, check_updates: bool, output_dir: Path | None = None) -> list[Check]:
+def check_all(
+    *, check_updates: bool, output_dir: Path | None = None, op_item: str | None = None
+) -> list[Check]:
     root = output_root(output_dir)
     package_checks = {name: _package_check(name) for name in PACKAGES}
 
@@ -310,7 +344,7 @@ def check_all(*, check_updates: bool, output_dir: Path | None = None) -> list[Ch
         _ffmpeg_check(),
         _deno_check(),
         _calibre_check(),
-        _openrouter_check(),
+        _openrouter_check(op_item),
         _output_root_check(root),
     ]
     if check_updates:
@@ -417,6 +451,8 @@ def _run_update(args) -> int:
         fresh_argv.append("--quiet")
     if getattr(args, "output_dir", None):
         fresh_argv += ["-o", str(args.output_dir)]
+    if getattr(args, "op_item", None):
+        fresh_argv += ["--op-item", args.op_item]
     fresh = subprocess.run(fresh_argv, capture_output=args.json_mode, text=True)
     if args.json_mode:
         if fresh.stdout:
@@ -430,7 +466,11 @@ def run(args) -> int:
     if args.update:
         return _run_update(args)
 
-    checks = check_all(check_updates=args.check_updates, output_dir=args.output_dir)
+    checks = check_all(
+        check_updates=args.check_updates,
+        output_dir=args.output_dir,
+        op_item=getattr(args, "op_item", None),
+    )
     exit_code = _exit_code(checks)
 
     if args.json_mode:
