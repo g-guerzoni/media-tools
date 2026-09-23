@@ -81,7 +81,7 @@ from typing import Any
 from uuid import uuid4
 
 from media_tools.core.paths import fsync_replace, temp_path, truncate_name
-from media_tools.tasks.ebook.exth import TAG_CDETYPE, TAG_UUID, read_records, record_text
+from media_tools.tasks.ebook.exth import TAG_CDETYPE, TAG_UUID, read_records_safe, record_text
 from media_tools.tasks.ebook.kindle import thumbnails
 from media_tools.tasks.ebook.kindle.backend import DeviceFile
 from media_tools.tasks.ebook.kindle.massstorage import (
@@ -751,7 +751,15 @@ def _companions_of(directory: Path, index: dict[str, dict], path: str) -> tuple[
     found.update(p for p in index if p.startswith(sidecar))
 
     stored = directory / FILES_DIR / _stored_of(index[path])
-    records = read_records(stored) if stored.is_file() else {}
+    # `read_records_safe`, not `read_records`: this runs once per selected book on the
+    # RESTORE path, which is where an unreadable file aborting costs the most — the
+    # user is recovering, so the snapshot is the thing they have left. `read_records`
+    # absorbs a malformed MOBI itself; the wrapper covers the two families it does not
+    # (`ValueError`, `MemoryError` — see its own docstring), of which only
+    # `MemoryError` is reachable here, since the path comes from a snapshot this tool
+    # wrote and is gated on `is_file()` besides. Guarded regardless, so that every
+    # EXTH read in this subsystem behaves the same way rather than three of four.
+    records = read_records_safe(stored) if stored.is_file() else {}
     book_id = record_text(records, TAG_UUID)
     if not book_id:
         return found, False

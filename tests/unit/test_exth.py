@@ -1,3 +1,7 @@
+from pathlib import Path
+
+import pytest
+
 from media_tools.tasks.ebook import exth, opf
 
 
@@ -38,3 +42,56 @@ def test_write_opf_round_trips_the_fields(tmp_path):
     assert "Machado de Assis" in text
     assert 'opf:scheme="uuid"' in text
     assert "12345678-1234-5678-1234-567812345678" in text
+
+
+# --- the guarded wrappers ------------------------------------------------------------
+#
+# `read_records` absorbs everything a malformed MOBI can do itself (`struct.error`,
+# `IndexError`, and the `OSError` of a file it cannot open), so the wrappers exist for
+# the two families it does NOT absorb. Only one of those can be provoked for real.
+
+
+def test_read_records_or_none_answers_none_for_a_path_open_itself_refuses():
+    """The live arm, through the REAL function and no stub at all: `Path.read_bytes()`
+    opens the file, and `open()` raises `ValueError` — not `OSError` — for a path
+    carrying an embedded NUL byte, so `read_records`' own `except OSError` does not
+    catch it."""
+    with pytest.raises(ValueError):
+        exth.read_records(Path("no\0pe"))
+    assert exth.read_records_or_none(Path("no\0pe")) is None
+    assert exth.read_records_safe(Path("no\0pe")) == {}
+
+
+def test_read_records_or_none_answers_none_for_a_memory_error(monkeypatch):
+    """The other live arm. `MemoryError` cannot be provoked deterministically, so this
+    one IS a stub — of the whole-file read `read_records` performs to reach a header in
+    the first hundred bytes, which is where the real one would come from."""
+
+    def out_of_memory(self):
+        raise MemoryError("cannot allocate")
+
+    monkeypatch.setattr(Path, "read_bytes", out_of_memory)
+    assert exth.read_records_or_none(Path("anything.azw3")) is None
+
+
+def test_a_bug_in_this_module_is_not_disguised_as_a_book_with_no_records(monkeypatch):
+    """Deliberately NOT a bare `except Exception`: an `AttributeError`/`TypeError` from
+    a future refactor here is this project's own bug, and the convention is that those
+    escape as an honest `internal_error` rather than reading as an unparseable book."""
+
+    def refactored_away(path):
+        raise AttributeError("read_records no longer has that attribute")
+
+    monkeypatch.setattr(exth, "read_records", refactored_away)
+    with pytest.raises(AttributeError):
+        exth.read_records_or_none(Path("anything.azw3"))
+
+
+def test_a_malformed_mobi_still_reads_as_empty_rather_than_as_a_failure(tmp_path):
+    """Pinning the division of labour: a file that will not PARSE is `read_records`'
+    own business and comes back `{}`, never `None`. The wrappers are not what handles
+    it, and a test that assumes otherwise is testing the wrong layer."""
+    broken = tmp_path / "broken.azw3"
+    broken.write_bytes(b"\x00" * 64)
+    assert exth.read_records(broken) == {}
+    assert exth.read_records_or_none(broken) == {}

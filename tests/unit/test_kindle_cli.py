@@ -1456,11 +1456,19 @@ def test_thumbnails_match_also_matches_the_books_own_title_and_author(
 
 
 def _explode_on(monkeypatch, name: str) -> list[str]:
-    """Make `exth.read_records` raise an `OSError` for one file — the narrow family
-    `read_records` does NOT absorb itself (it already answers `{}` for its own
-    `struct.error`/`IndexError` parse failures and for an `OSError` opening the file).
+    """Make `exth.read_records` raise for one file, so a CALLER can be shown surviving
+    it.
+
+    The exception is an `OSError` purely because it is the cheapest thing to raise;
+    the real function cannot propagate one (its only I/O is inside `except OSError`),
+    and what the guard is actually for — a `ValueError` from a path with an embedded
+    NUL, a `MemoryError` — is pinned against the real function in
+    `tests/unit/test_exth.py`. These tests are about the CALLERS not aborting, which
+    is why stubbing is both necessary and sufficient here.
+
     Returns the list the stub records its calls in, so a test can prove it was
-    actually reached rather than passing because the patch never applied."""
+    actually reached rather than passing because the patch never applied.
+    """
     real = kindle_cli.exth.read_records
     calls: list[str] = []
 

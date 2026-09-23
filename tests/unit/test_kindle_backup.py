@@ -17,6 +17,7 @@ import pytest
 
 from media_tools.core.events import ERROR_CODES, WARNING_CODES
 from media_tools.integrations.calibre import CalibreError
+from media_tools.tasks.ebook import exth
 from media_tools.tasks.ebook.kindle import backup, massstorage, mtp
 from media_tools.tasks.ebook.kindle.detect import Device
 
@@ -692,6 +693,32 @@ def test_restore_puts_a_book_back_with_its_sdr_and_its_thumbnail(mass, tmp_path)
     assert (mass.mount / THUMB).read_bytes() == b"thumbnail bytes"
     # Nothing else was touched.
     assert (mass.mount / "documents/pt/Um Livro - Um Autor.azw3").exists()
+
+
+def test_restore_survives_a_stored_book_whose_records_cannot_be_read(mass, tmp_path, monkeypatch):
+    """The one EXTH read in this module, and the worst place for an unreadable file to
+    abort: the user is RECOVERING, so the snapshot is what they have left. The book
+    and its `.sdr` still go back; only the thumbnail cannot be paired, which is the
+    same outcome as a book that carries no EXTH 113 id at all."""
+    snap = backup.snapshot(mass, root=tmp_path / "out", serial="S")
+    for path in (BOOK, SDR, THUMB):
+        (mass.mount / path).unlink()
+
+    calls: list[str] = []
+
+    def exploding_read_records(path):
+        calls.append(str(path))
+        raise MemoryError("cannot allocate")
+
+    monkeypatch.setattr(exth, "read_records", exploding_read_records)
+
+    report = backup.restore(mass, snap.path, only=[BOOK], dry_run=False)
+
+    assert calls, "the exploding read was never called"
+    assert set(report.paths) == {BOOK, SDR}
+    assert report.no_thumbnail == [BOOK]
+    assert (mass.mount / BOOK).read_bytes() == mobi_bytes(BOOK_ID)
+    assert (mass.mount / SDR).read_bytes() == b"reading position"
 
 
 def test_restore_without_only_puts_the_whole_snapshot_back(mass, tmp_path):

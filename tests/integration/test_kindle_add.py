@@ -1806,8 +1806,11 @@ def test_a_device_book_whose_read_raises_is_counted_warned_about_and_never_cache
     events = _events(capsys)
     assert events[-1]["data"]["device_books_unreadable"] == 1
     warnings = [e for e in events if e["type"] == "warning"]
+    # Its OWN code, not `book_id_missing`: that one means a book legitimately carries
+    # no EXTH 113 (permanent, cacheable), while this means the read failed (transient,
+    # never cached). A consumer aggregating one must not be summing both.
     assert any(
-        w["code"] == "book_id_missing" and "Unreadable.azw3" in w["message"] for w in warnings
+        w["code"] == "book_id_unreadable" and "Unreadable.azw3" in w["message"] for w in warnings
     )
 
     # Nothing about that book was written to the id cache, so a later run (with the
@@ -1886,7 +1889,7 @@ def test_a_later_verified_placement_revokes_an_earlier_runs_overwrite_waiver(
 
 
 def test_a_source_whose_records_cannot_be_read_is_added_as_an_id_less_book(
-    fake_kindle, tmp_path, capsys
+    fake_kindle, tmp_path, capsys, monkeypatch
 ):
     """The plan loop reads the SOURCE's records too, three lines from the device-side
     guard. One malformed host file must not abort the command either — least of all
@@ -1909,16 +1912,12 @@ def test_a_source_whose_records_cannot_be_read_is_added_as_an_id_less_book(
             raise OSError(5, "Input/output error")
         return real_read_records(path)
 
-    kindle_cli.exth.read_records = exploding_read_records
-    try:
-        exit_code = kindle_cli.run_add(
-            _add_args(root, str(bad), str(good)),
-            device_finder=lambda: fake_kindle,
-            backend_factory=_mass_storage_factory,
-        )
-    finally:
-        kindle_cli.exth.read_records = real_read_records
-
+    monkeypatch.setattr(kindle_cli.exth, "read_records", exploding_read_records)
+    exit_code = kindle_cli.run_add(
+        _add_args(root, str(bad), str(good)),
+        device_finder=lambda: fake_kindle,
+        backend_factory=_mass_storage_factory,
+    )
     assert exit_code == EXIT_OK
     assert calls, "the exploding read was never called"
 

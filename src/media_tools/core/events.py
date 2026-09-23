@@ -66,6 +66,7 @@ WARNING_CODES = frozenset(
         "no_audio_only_format",
         "cover_not_embedded",
         "book_id_missing",
+        "book_id_unreadable",
         "extension_filter_bypassed",
         "device_rejected_thumbnail",
         "hash_from_previous",

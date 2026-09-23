@@ -316,7 +316,13 @@ def _read_cover_image(path: Path) -> bytes | None:
         field_start = 16 + _FIRST_IMAGE_INDEX_OFFSET
         first_image_index = struct.unpack(">I", record0[field_start : field_start + 4])[0]
 
-        records = exth.read_records(path)
+        # `read_records_safe`: the `except` below covers this function's own
+        # `struct` work, but not the two families `read_records` does not
+        # absorb (`ValueError`, `MemoryError`) — and those are outside what
+        # `_install_guarded` catches too, so an escape here would abort every
+        # book still queued. The same guard every other EXTH read in this
+        # subsystem now uses.
+        records = exth.read_records_safe(path)
         index = _image_record_index(records, exth.TAG_COVER_OFFSET, first_image_index)
         if index is None:
             index = _image_record_index(records, exth.TAG_THUMB_OFFSET, first_image_index)

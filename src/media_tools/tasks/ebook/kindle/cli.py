@@ -669,14 +669,14 @@ def run_scan(
 
         if device.mode == "mass_storage":
             records_by_path = {
-                book.path: _records_or_empty(device.mount / book.path) for book in books
+                book.path: exth.read_records_safe(device.mount / book.path) for book in books
             }
         else:
             key = backup_module.device_key(device)
             cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
             local_paths = _materialize_for_scan(backend, books, cache_dir)
             records_by_path = {
-                book.path: _records_or_empty(local_paths[book.path]) for book in books
+                book.path: exth.read_records_safe(local_paths[book.path]) for book in books
             }
 
         result_books = []
@@ -1208,13 +1208,13 @@ def run_thumbnails(
         local_paths: dict[str, Path] = {}
         if device.mode == "mass_storage":
             records_by_path = {
-                book.path: _records_or_empty(device.mount / book.path) for book in book_entries
+                book.path: exth.read_records_safe(device.mount / book.path) for book in book_entries
             }
         else:
             cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
             local_paths = _materialize_for_scan(backend, book_entries, cache_dir)
             records_by_path = {
-                book.path: _records_or_empty(local_paths[book.path]) for book in book_entries
+                book.path: exth.read_records_safe(local_paths[book.path]) for book in book_entries
             }
 
         # One (book, already_covered) pair per MATCHED device book, decided up
@@ -1747,63 +1747,26 @@ def _device_book_ids(
             else:
                 ids[book.path] = book_id
 
+    # A set, not the list: this is one membership test per book on the device, and a
+    # list scan makes that quadratic over a real library.
+    unreadable_paths = set(unreadable)
     cacheable = {
         book.path: (_book_id_key(book), ids[book.path])
         for book in books
-        if book.path not in unreadable
+        if book.path not in unreadable_paths
     }
     if unknown or set(index) != set(cacheable):
         _write_book_id_index(index_path, cacheable)
     return ids, unreadable
 
 
-def _read_exth(path: Path) -> dict[int, bytes] | None:
-    """`exth.read_records(path)`, or `None` when the call itself RAISED.
-
-    Every command in this module reads EXTH records for EVERY book on the device (and
-    `add` for every source too), so one malformed file must never abort a whole run —
-    least of all after the mandatory backup has already gone through, which is when
-    `add`/`thumbnails` reach this.
-
-    **A malformed MOBI is NOT what this guards against**: `exth.read_records` already
-    returns `{}` for `struct.error`/`IndexError` (its own parse failures) and for the
-    `OSError` of a file it cannot open, so none of those can reach here. What it does
-    NOT absorb, and what this catches, is narrow and specific:
-
-    - `ValueError` — `Path.read_bytes()` opens the file, and `open()` raises this (not
-      `OSError`) for a path carrying an embedded NUL byte. Device paths come from a
-      listing this project did not author; over MTP they come out of a helper's JSON.
-    - `MemoryError` — `read_records` reads the WHOLE file to reach a header in its
-      first hundred bytes, so a pathologically large file can exhaust memory where a
-      header-sized read never would.
-    - `OSError` — already absorbed inside `read_records` today. Caught again here only
-      so this wrapper's contract does not silently depend on that staying true.
-
-    Deliberately NOT a bare `except Exception`: an `AttributeError`/`TypeError` from a
-    future refactor of `exth` is a bug in this project, and this module's own rule
-    (see `_run`) is that those escape to an honest `internal_error` rather than being
-    disguised as a book with no id.
-    """
-    try:
-        return exth.read_records(path)
-    except (OSError, ValueError, MemoryError):
-        return None
-
-
-def _records_or_empty(path: Path) -> dict[int, bytes]:
-    """`_read_exth`'s records with a failure flattened to "no records" — exactly what
-    `exth.read_records` itself answers for a file it cannot parse. For the callers
-    (`scan`, `thumbnails`, `add`'s own source reads) that report a book with no
-    readable metadata the same way either way, and so have nothing to do differently
-    when the read RAISED rather than came back empty."""
-    return _read_exth(path) or {}
-
-
 def _book_id_of(path: Path) -> str | None:
     """`""` for a book that parsed and carries no EXTH 113 id; `None` when reading it
-    raised, which is a different thing and must not be cached as if it were the first
-    (see `_device_book_ids`)."""
-    records = _read_exth(path)
+    RAISED, which is a different thing and must not be cached as if it were the first
+    (see `_device_book_ids`). The guard itself lives in `exth.read_records_or_none`,
+    so `backup.py` — which reads records during the mandatory pre-write backup, before
+    any command in this module gets a turn — is covered by the same one."""
+    records = exth.read_records_or_none(path)
     if records is None:
         return None
     return exth.record_text(records, exth.TAG_UUID) or ""
@@ -1899,9 +1862,9 @@ def _previous_placements(root: Path, key: str) -> dict[str, dict[str, dict]]:
 def _provenance_verdict(
     placements: dict[str, dict[str, dict]], source: _SourceBook, sizes: dict[str, int]
 ) -> tuple[str | None, set[str]]:
-    """`(the path this source is already correctly at, the paths whose occupant is this
-    tool's own unfinished attempt at these exact bytes)` — both `None`/empty unless the
-    journal can be VERIFIED against the source as it is right now.
+    """`(the path this source is already correctly at, the paths holding a placement of
+    these exact bytes that this tool never CONFIRMED)` — both `None`/empty unless the
+    journal can be verified against the source as it is right now.
 
     The source is hashed once (only when the journal has anything to say about it at
     all) and every record whose recorded `sha256` differs is discarded outright. That
@@ -1932,8 +1895,17 @@ def _provenance_verdict(
     know. The waiver is defined against exactly that ignorance: a placement this tool
     never confirmed may be re-sent, while one it DID confirm describes a file that
     landed correctly, so anything different at that path now was changed by something
-    other than this tool — precisely the case the refusal exists for. The residual
-    exposure is a book re-sent that did not need to be, which costs a copy, not data.
+    other than this tool — precisely the case the refusal exists for.
+
+    **The residual exposure is real and worth stating.** A run whose verify-stage
+    listing failed records a book that landed PERFECTLY as unconfirmed, and nothing
+    later revises that. If the user then replaces that file with their own, the next
+    `add` of the same source overwrites THEIR file, not a redundant copy of ours. What
+    stands behind it is the mandatory snapshot every write command takes: those bytes
+    are inside the backup taken at the start of the overwriting run, and
+    `restore`/`restore --op` puts them back. Closing it properly would need the DEVICE
+    file hashed, which is a full read — and over MTP a full fetch — of every
+    candidate: the cost this design deliberately does not pay.
     """
     records = placements.get(source.key())
     if not records:
@@ -1950,8 +1922,8 @@ def _provenance_verdict(
         ),
         None,
     )
-    unfinished = {record["device_path"].casefold() for record in mine if not record["verified"]}
-    return placed_at, unfinished
+    unconfirmed = {record["device_path"].casefold() for record in mine if not record["verified"]}
+    return placed_at, unconfirmed
 
 
 # --- the command ------------------------------------------------------------------------
@@ -2127,15 +2099,18 @@ def run_add(
         ids_by_path, unreadable = _device_book_ids(root, device, backend, device_books, key)
         device_ids = set(ids_by_path.values()) - {""}
         if unreadable:
-            # A book whose EXTH could not be read looks ABSENT to the id check, so a
+            # A book whose EXTH could not be READ looks ABSENT to the id check, so a
             # source it already holds reads as new and gets copied a second time —
             # under a name the device copy need not share, which is how a systemic
-            # read failure quietly duplicates a whole library. `book_id_missing` is
-            # the registered code for "this device book has no usable EXTH 113 id",
-            # which is exactly the state these are in; the message says WHY, and
-            # `result.data.device_books_unreadable` carries the count for an agent.
+            # read failure quietly duplicates a whole library. Its own code, NOT
+            # `book_id_missing`: that one means a book legitimately carries no EXTH
+            # 113 (permanent, and cacheable as such), while this means the read itself
+            # failed (transient, and specifically never cached — see
+            # `_device_book_ids`). One code for both would re-conflate at the wire
+            # exactly what that function separates in the logic, and a consumer
+            # aggregating `book_id_missing` would be summing two populations.
             reporter.warning(
-                code="book_id_missing",
+                code="book_id_unreadable",
                 message=(
                     f"{len(unreadable)} book(s) on the device could not be read for "
                     "their EXTH 113 id and will look absent to this run (first: "
@@ -2151,7 +2126,7 @@ def run_add(
         queued: list[_PlannedBook] = []
         claimed: dict[str, str] = {}  # casefolded device path -> the source that took it
         for source in sources:
-            records = _records_or_empty(source.path)
+            records = exth.read_records_safe(source.path)
             book_id = exth.record_text(records, exth.TAG_UUID) or ""
             title = exth.record_text(records, exth.TAG_TITLE) or ""
             author = exth.record_text(records, exth.TAG_AUTHOR) or ""
@@ -2187,7 +2162,7 @@ def run_add(
                 # otherwise would blame the wrong thing.
                 book.warnings.append("book_id_missing")
 
-            placed_at, unfinished = (
+            placed_at, unconfirmed = (
                 (None, set()) if book_id else _provenance_verdict(placements, source, device_sizes)
             )
             if not source.path.is_file():
@@ -2214,7 +2189,7 @@ def run_add(
                     f"{claimed[device_path.casefold()]} in this same run already resolves "
                     f"to {device_path}",
                 )
-            elif device_path.casefold() in occupied and device_path.casefold() not in unfinished:
+            elif device_path.casefold() in occupied and device_path.casefold() not in unconfirmed:
                 book.fail(
                     "output_collision",
                     DETAIL_OUTPUT_COLLISION,
