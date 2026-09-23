@@ -1452,6 +1452,79 @@ def test_thumbnails_match_also_matches_the_books_own_title_and_author(
     assert item_events[EN_PATH]["reason"] == "exists"
 
 
+# --- one unreadable book never aborts a whole command --------------------------------
+
+
+def _explode_on(monkeypatch, name: str) -> list[str]:
+    """Make `exth.read_records` raise an `OSError` for one file — the narrow family
+    `read_records` does NOT absorb itself (it already answers `{}` for its own
+    `struct.error`/`IndexError` parse failures and for an `OSError` opening the file).
+    Returns the list the stub records its calls in, so a test can prove it was
+    actually reached rather than passing because the patch never applied."""
+    real = kindle_cli.exth.read_records
+    calls: list[str] = []
+
+    def exploding(path):
+        if Path(path).name == name:
+            calls.append(str(path))
+            raise OSError(5, "Input/output error")
+        return real(path)
+
+    monkeypatch.setattr(kindle_cli.exth, "read_records", exploding)
+    return calls
+
+
+def test_scan_survives_one_device_book_whose_records_cannot_be_read(
+    fake_kindle, tmp_path, capsys, monkeypatch
+):
+    kindle = kindle_device(fake_kindle)
+    calls = _explode_on(monkeypatch, Path(EN_PATH).name)
+
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "scan", "--json", "-o", str(tmp_path / "media")]
+    )
+    exit_code = kindle_cli.run_scan(
+        args, device_finder=lambda: kindle, backend_factory=_mass_storage_factory
+    )
+    assert exit_code == EXIT_OK
+    assert calls, "the exploding read was never called"
+
+    events = _events(capsys)
+    items = {e["input"]: e for e in events if e["type"] == "item"}
+    # The unreadable book is reported as a book with no id, and every other book is
+    # still scanned normally.
+    assert items[EN_PATH]["warnings"] == ["book_id_missing"]
+    assert items[PT_PATH]["status"] == "done"
+    books = {book["path"]: book for book in events[-1]["data"]["books"]}
+    assert books[EN_PATH]["book_id"] is None
+    assert books[PT_PATH]["book_id"] == PT_ID
+
+
+def test_thumbnails_survives_one_device_book_whose_records_cannot_be_read(
+    fake_kindle, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setattr(kindle_cli.thumbnails, "_resize", _stub_resize)
+    kindle = kindle_device(fake_kindle)
+    root = tmp_path / "media"
+    _write_dummy_cover(cache_path(root / ".cache", PT_ID))
+    calls = _explode_on(monkeypatch, Path(EN_PATH).name)
+
+    args = build_parser().parse_args(["ebook", "kindle", "thumbnails", "--json", "-o", str(root)])
+    exit_code = kindle_cli.run_thumbnails(
+        args, device_finder=lambda: kindle, backend_factory=_mass_storage_factory
+    )
+    assert exit_code == EXIT_OK
+    assert calls, "the exploding read was never called"
+
+    item_events = {e["input"]: e for e in _events(capsys) if e["type"] == "item"}
+    # No id could be read for EN, so it is the one book that can never get a
+    # thumbnail — reported as such, not as a crashed command.
+    assert item_events[EN_PATH]["status"] == "skipped"
+    assert item_events[EN_PATH]["reason"] == "no_cover"
+    assert item_events[EN_PATH]["warnings"] == ["book_id_missing"]
+    assert item_events[PT_PATH]["status"] == "done"
+
+
 # --- end-to-end (no real device in this environment) ---------------------------------
 
 

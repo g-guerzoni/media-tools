@@ -1725,21 +1725,56 @@ def test_a_record_with_no_digest_never_authorises_a_skip_or_an_overwrite(
 # --- one corrupt book on the device is not a failed add ---------------------------------
 
 
-def test_a_device_book_that_will_not_parse_does_not_abort_the_whole_add(
+def test_a_genuinely_corrupt_device_book_is_id_less_not_an_abort(
+    fake_kindle, tmp_path, capsys, ffmpeg_path
+):
+    """Through the REAL `exth.read_records`, which already answers `{}` for a file it
+    cannot parse. Pinned so the guard below is not mistaken for what handles this."""
+    (fake_kindle.mount / "documents" / "en" / "Corrupt.azw3").write_bytes(b"\x00" * 64)
+    assert kindle_cli._book_id_of(fake_kindle.mount / "documents" / "en" / "Corrupt.azw3") == ""
+
+    root = tmp_path / "media"
+    source = _plant_source(
+        tmp_path / "books",
+        "Fine Book.azw3",
+        book_id="FINEBOOK00000001",
+        title="Fine",
+        author="A",
+        language="en",
+    )
+    _plant_cover(root, "FINEBOOK00000001", ffmpeg_path)
+    assert (
+        kindle_cli.run_add(
+            _add_args(root, str(source)),
+            device_finder=lambda: fake_kindle,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+    assert (fake_kindle.mount / "documents" / "en" / "Fine Book.azw3").is_file()
+    assert _events(capsys)[-1]["data"]["device_books_unreadable"] == 0
+
+
+def test_a_device_book_whose_read_raises_is_counted_warned_about_and_never_cached(
     fake_kindle, tmp_path, capsys, monkeypatch, ffmpeg_path
 ):
-    """`exth.read_records` documents "unreadable -> no records", but it reaches that
-    verdict through struct-unpacked offsets a malformed file can send off the end. This
-    runs over EVERY book on the device, in the one command where aborting costs the
-    most — the backup has already run."""
-    corrupt = fake_kindle.mount / "documents" / "en" / "Corrupt.azw3"
-    corrupt.write_bytes(b"\x00" * 64)
-
+    """`exth.read_records` absorbs its own parse failures, so what this guards is the
+    narrow set it does NOT: an `OSError` reaching it, a `ValueError` from a path with
+    an embedded NUL, a `MemoryError`. Such a read must (a) not abort the run, (b) not
+    be cached as "this book has no id" — the index key is size+mtime and a device file
+    does not change, so the wrong answer would be served forever — and (c) be visible,
+    because a book that looks id-less looks ABSENT, which is how a systemic failure
+    silently writes a whole library twice."""
+    (fake_kindle.mount / "documents" / "en" / "Unreadable.azw3").write_bytes(
+        _mobi_bytes(book_id="UNREADABLE000001", title="Unreadable", language="en")
+    )
     real_read_records = kindle_cli.exth.read_records
+    calls: list[str] = []
 
     def exploding_read_records(path):
-        if Path(path).name == "Corrupt.azw3":
-            raise struct.error("unpack requires a buffer of 4 bytes")
+        if Path(path).name == "Unreadable.azw3":
+            calls.append(str(path))
+            raise OSError(5, "Input/output error")
         return real_read_records(path)
 
     monkeypatch.setattr(kindle_cli.exth, "read_records", exploding_read_records)
@@ -1755,11 +1790,143 @@ def test_a_device_book_that_will_not_parse_does_not_abort_the_whole_add(
     )
     _plant_cover(root, "FINEBOOK00000001", ffmpeg_path)
 
-    exit_code = kindle_cli.run_add(
-        _add_args(root, str(source)),
-        device_finder=lambda: fake_kindle,
-        backend_factory=_mass_storage_factory,
+    assert (
+        kindle_cli.run_add(
+            _add_args(root, str(source)),
+            device_finder=lambda: fake_kindle,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
     )
-    assert exit_code == EXIT_OK
+    # The stub really was reached — without this the test would pass even if the
+    # monkeypatch never applied.
+    assert calls, "the exploding read was never called"
     assert (fake_kindle.mount / "documents" / "en" / "Fine Book.azw3").is_file()
-    assert _events(capsys)[-1]["counts"]["done"] == 1
+
+    events = _events(capsys)
+    assert events[-1]["data"]["device_books_unreadable"] == 1
+    warnings = [e for e in events if e["type"] == "warning"]
+    assert any(
+        w["code"] == "book_id_missing" and "Unreadable.azw3" in w["message"] for w in warnings
+    )
+
+    # Nothing about that book was written to the id cache, so a later run (with the
+    # cause gone) reads it again instead of serving the wrong answer forever.
+    index = json.loads(
+        (root / "_kindle" / fake_kindle.serial / ".cache" / "book-ids.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "documents/en/Unreadable.azw3" not in index
+    capsys.readouterr()
+
+    monkeypatch.undo()
+    assert (
+        kindle_cli.run_add(
+            _add_args(root, str(source)),
+            device_finder=lambda: fake_kindle,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+    second = _events(capsys)[-1]
+    assert second["data"]["device_books_unreadable"] == 0
+    index = json.loads(
+        (root / "_kindle" / fake_kindle.serial / ".cache" / "book-ids.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert index["documents/en/Unreadable.azw3"]["book_id"] == "UNREADABLE000001"
+
+
+# --- the overwrite waiver expires -------------------------------------------------------
+
+
+def test_a_later_verified_placement_revokes_an_earlier_runs_overwrite_waiver(
+    fake_kindle, tmp_path, capsys
+):
+    """The journal is append-only, so an unverified record for (source, path) stays in
+    it forever. If the waiver were a union over every record, one short write would
+    leave that path permanently overwritable for that source — and a user who replaced
+    the book with their own copy months later would have it silently clobbered. Only
+    the LATEST record for the pair counts."""
+    root = tmp_path / "media"
+    source = tmp_path / "books" / "Some Book.epub"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"PK\x03\x04" + b"epub bytes" * 40)
+    landed = fake_kindle.mount / "documents" / kindle_cli.UNKNOWN_LANGUAGE / "Some Book.epub"
+
+    # Run 1 lands short: journalled unverified.
+    assert (
+        _add_epub(
+            root,
+            source,
+            fake_kindle,
+            backend_factory=lambda d, *, cache_dir: _ShortWriteBackend(d.mount),
+        )
+        == EXIT_FAILED
+    )
+    capsys.readouterr()
+
+    # Run 2 is the retry the waiver exists for, and completes.
+    assert _add_epub(root, source, fake_kindle) == EXIT_OK
+    assert landed.read_bytes() == source.read_bytes()
+    entries = backup_module.journal_read(root, fake_kindle.serial)
+    assert [entry["books"][0]["verified"] for entry in entries] == [False, True]
+    capsys.readouterr()
+
+    # The user now puts their own file at that path. The old unverified record must
+    # NOT still authorise overwriting it.
+    theirs = b"MY OWN COMPLETELY DIFFERENT FILE"
+    landed.write_bytes(theirs)
+    assert _add_epub(root, source, fake_kindle) == EXIT_FAILED
+    item = next(e for e in _events(capsys) if e["type"] == "item")
+    assert item["reason"] == "output_collision"
+    assert landed.read_bytes() == theirs
+
+
+def test_a_source_whose_records_cannot_be_read_is_added_as_an_id_less_book(
+    fake_kindle, tmp_path, capsys
+):
+    """The plan loop reads the SOURCE's records too, three lines from the device-side
+    guard. One malformed host file must not abort the command either — least of all
+    after the mandatory backup has already run."""
+    root = tmp_path / "media"
+    books = tmp_path / "books"
+    bad = _plant_source(
+        books, "Bad.azw3", book_id="BADBOOK000000001", title="Bad", author="A", language="en"
+    )
+    good = _plant_source(
+        books, "Good.azw3", book_id="GOODBOOK00000001", title="Good", author="B", language="en"
+    )
+
+    real_read_records = kindle_cli.exth.read_records
+    calls: list[str] = []
+
+    def exploding_read_records(path):
+        if Path(path).name == "Bad.azw3":
+            calls.append(str(path))
+            raise OSError(5, "Input/output error")
+        return real_read_records(path)
+
+    kindle_cli.exth.read_records = exploding_read_records
+    try:
+        exit_code = kindle_cli.run_add(
+            _add_args(root, str(bad), str(good)),
+            device_finder=lambda: fake_kindle,
+            backend_factory=_mass_storage_factory,
+        )
+    finally:
+        kindle_cli.exth.read_records = real_read_records
+
+    assert exit_code == EXIT_OK
+    assert calls, "the exploding read was never called"
+
+    items = {e["input"]: e for e in _events(capsys) if e["type"] == "item"}
+    # No records means no id and no language: it still lands, under documents/unknown/,
+    # flagged as the id-less book it now looks like.
+    assert items[str(bad)]["status"] == "done"
+    assert items[str(bad)]["warnings"] == ["book_id_missing"]
+    assert items[str(good)]["status"] == "done"
+    assert (fake_kindle.mount / "documents" / kindle_cli.UNKNOWN_LANGUAGE / "Bad.azw3").is_file()
+    assert (fake_kindle.mount / "documents" / "en" / "Good.azw3").is_file()

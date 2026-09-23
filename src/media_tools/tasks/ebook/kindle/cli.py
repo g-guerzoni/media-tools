@@ -669,14 +669,14 @@ def run_scan(
 
         if device.mode == "mass_storage":
             records_by_path = {
-                book.path: exth.read_records(device.mount / book.path) for book in books
+                book.path: _records_or_empty(device.mount / book.path) for book in books
             }
         else:
             key = backup_module.device_key(device)
             cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
             local_paths = _materialize_for_scan(backend, books, cache_dir)
             records_by_path = {
-                book.path: exth.read_records(local_paths[book.path]) for book in books
+                book.path: _records_or_empty(local_paths[book.path]) for book in books
             }
 
         result_books = []
@@ -1208,13 +1208,13 @@ def run_thumbnails(
         local_paths: dict[str, Path] = {}
         if device.mode == "mass_storage":
             records_by_path = {
-                book.path: exth.read_records(device.mount / book.path) for book in book_entries
+                book.path: _records_or_empty(device.mount / book.path) for book in book_entries
             }
         else:
             cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
             local_paths = _materialize_for_scan(backend, book_entries, cache_dir)
             records_by_path = {
-                book.path: exth.read_records(local_paths[book.path]) for book in book_entries
+                book.path: _records_or_empty(local_paths[book.path]) for book in book_entries
             }
 
         # One (book, already_covered) pair per MATCHED device book, decided up
@@ -1491,8 +1491,9 @@ class _PlannedBook:
         again. `sha256` and `verified` are filled in AFTERWARDS — the record is put on
         the journal's list the instant the write returns, so that a Ctrl+C during the
         hash (a window proportional to file size) cannot leave a book on the device
-        with no record of it. Until they are filled in, the record reads as
-        "unhashable, unverified", which is the conservative reading of both.
+        with no record of it. Until they are filled in, the record reads as "no
+        digest, never confirmed", which is the honest reading of both: `verified`
+        means this tool never CONFIRMED the write, not that it knows the write failed.
         """
         return {
             "device_path": self.device_path,
@@ -1691,7 +1692,7 @@ def _book_id_key(book: DeviceFile) -> str:
 
 def _device_book_ids(
     root: Path, device: Device, backend: DeviceBackend, books: list[DeviceFile], key: str
-) -> dict[str, str]:
+) -> tuple[dict[str, str], list[str]]:
     """`{device path: its EXTH 113 id}` for every book on the device, through a
     PERSISTENT index so `add` never re-reads a library it has already read.
 
@@ -1707,6 +1708,17 @@ def _device_book_ids(
     Best-effort, like every other cache in that directory: an unreadable or unwritable
     index costs one re-read next time, never a failed `add`, and never gets reported as
     if the DEVICE were the problem.
+
+    **A book whose read RAISED is never cached, and is counted.** Returning
+    `(ids, paths that could not be read)` rather than folding a failure into `""` is
+    load-bearing twice over. First, the index key is size + mtime and a device file
+    does not change, so caching `""` for a thrown read would serve that answer on
+    every future run — long after whatever caused it (a full host disk while
+    materialising over MTP, a path the OS refuses to open) was gone. Second, a book
+    that looks id-less looks ABSENT: `add` would then copy a source it already has,
+    under a name the device copy need not share, so a systemic read failure would
+    write the whole library a second time. The caller surfaces the count rather than
+    leaving it to be inferred from duplicates appearing.
     """
     index_path = backup_module.backup_root(root, key) / ".cache" / _BOOK_ID_INDEX_NAME
     index = _read_book_id_index(index_path)
@@ -1720,6 +1732,7 @@ def _device_book_ids(
         else:
             unknown.append(book)
 
+    unreadable: list[str] = []
     if unknown:
         if device.mode == "mass_storage":
             local_paths = {book.path: device.mount / book.path for book in unknown}
@@ -1727,35 +1740,73 @@ def _device_book_ids(
             cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
             local_paths = _materialize_for_scan(backend, unknown, cache_dir)
         for book in unknown:
-            ids[book.path] = _book_id_of(local_paths[book.path])
+            book_id = _book_id_of(local_paths[book.path])
+            if book_id is None:
+                unreadable.append(book.path)
+                ids[book.path] = ""  # unknown to THIS run; never written to the index
+            else:
+                ids[book.path] = book_id
 
-    if unknown or set(index) != {book.path for book in books}:
-        _write_book_id_index(
-            index_path, {book.path: (_book_id_key(book), ids[book.path]) for book in books}
-        )
-    return ids
+    cacheable = {
+        book.path: (_book_id_key(book), ids[book.path])
+        for book in books
+        if book.path not in unreadable
+    }
+    if unknown or set(index) != set(cacheable):
+        _write_book_id_index(index_path, cacheable)
+    return ids, unreadable
 
 
-def _book_id_of(path: Path) -> str:
-    """One book's EXTH 113 id, or `""` for anything that will not parse.
+def _read_exth(path: Path) -> dict[int, bytes] | None:
+    """`exth.read_records(path)`, or `None` when the call itself RAISED.
 
-    `exth.read_records` documents "unreadable or not MOBI -> no records", but it
-    reaches that verdict by walking `struct`-unpacked offsets that a truncated or
-    deliberately malformed file can still send off the end (`struct.error`,
-    `IndexError`, a `ValueError` from a bogus length, ...). That is tolerable when
-    ONE file is being read; here it runs over EVERY book on the device, in the one
-    command where aborting costs the most — the mandatory backup has already run, and
-    on a retry some books may already be on their way. One corrupt book on a Kindle is
-    a book with no id (so never mistaken for one already present), never a failed
-    `add`: the same per-item isolation this whole subsystem applies everywhere else.
+    Every command in this module reads EXTH records for EVERY book on the device (and
+    `add` for every source too), so one malformed file must never abort a whole run —
+    least of all after the mandatory backup has already gone through, which is when
+    `add`/`thumbnails` reach this.
 
-    `Exception`, not the usual `(RuntimeError, OSError)` pair, precisely because the
-    parse failures above are neither — and because the point here is that NOTHING one
-    book's bytes can do may stop the command.
+    **A malformed MOBI is NOT what this guards against**: `exth.read_records` already
+    returns `{}` for `struct.error`/`IndexError` (its own parse failures) and for the
+    `OSError` of a file it cannot open, so none of those can reach here. What it does
+    NOT absorb, and what this catches, is narrow and specific:
+
+    - `ValueError` — `Path.read_bytes()` opens the file, and `open()` raises this (not
+      `OSError`) for a path carrying an embedded NUL byte. Device paths come from a
+      listing this project did not author; over MTP they come out of a helper's JSON.
+    - `MemoryError` — `read_records` reads the WHOLE file to reach a header in its
+      first hundred bytes, so a pathologically large file can exhaust memory where a
+      header-sized read never would.
+    - `OSError` — already absorbed inside `read_records` today. Caught again here only
+      so this wrapper's contract does not silently depend on that staying true.
+
+    Deliberately NOT a bare `except Exception`: an `AttributeError`/`TypeError` from a
+    future refactor of `exth` is a bug in this project, and this module's own rule
+    (see `_run`) is that those escape to an honest `internal_error` rather than being
+    disguised as a book with no id.
     """
-    with contextlib.suppress(Exception):
-        return exth.record_text(exth.read_records(path), exth.TAG_UUID) or ""
-    return ""
+    try:
+        return exth.read_records(path)
+    except (OSError, ValueError, MemoryError):
+        return None
+
+
+def _records_or_empty(path: Path) -> dict[int, bytes]:
+    """`_read_exth`'s records with a failure flattened to "no records" — exactly what
+    `exth.read_records` itself answers for a file it cannot parse. For the callers
+    (`scan`, `thumbnails`, `add`'s own source reads) that report a book with no
+    readable metadata the same way either way, and so have nothing to do differently
+    when the read RAISED rather than came back empty."""
+    return _read_exth(path) or {}
+
+
+def _book_id_of(path: Path) -> str | None:
+    """`""` for a book that parsed and carries no EXTH 113 id; `None` when reading it
+    raised, which is a different thing and must not be cached as if it were the first
+    (see `_device_book_ids`)."""
+    records = _read_exth(path)
+    if records is None:
+        return None
+    return exth.record_text(records, exth.TAG_UUID) or ""
 
 
 def _read_book_id_index(index_path: Path) -> dict[str, tuple[str, str]]:
@@ -1790,9 +1841,10 @@ def _write_book_id_index(index_path: Path, index: dict[str, tuple[str, str]]) ->
         index_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
-def _previous_placements(root: Path, key: str) -> dict[str, list[dict]]:
-    """`{resolved source path: [placement record, ...]}`, read back out of this
-    device's own journal. Each record is `{device_path, size, sha256, verified}`.
+def _previous_placements(root: Path, key: str) -> dict[str, dict[str, dict]]:
+    """`{resolved source path: {device path: latest placement record}}`, read back out
+    of this device's own journal. Each record is `{device_path, size, sha256,
+    verified}`.
 
     This is what lets a re-run recognise a source that carries NO EXTH 113 id — an
     `.epub`, a `.pdf`, a MOBI nobody wrote an id into. It is PROVENANCE, not filename
@@ -1801,13 +1853,24 @@ def _previous_placements(root: Path, key: str) -> dict[str, list[dict]]:
     recognise books this tool placed; a book sideloaded by Calibre or by hand is
     invisible to it, which is a real limit rather than a regression.
 
+    **Only the LATEST record for a given (source, device path) survives.** The journal
+    is append-only and `journal_read` returns it oldest first, so a later entry
+    overwrites an earlier one here. Accumulating them instead would make the
+    overwrite waiver below permanent: once ANY unverified record existed for that
+    pair, the successful re-run that followed would add a `verified: true` record
+    without removing the old one, and the refusal at that path would stay waived
+    forever — so a user replacing that book with their own copy months later would
+    have it silently clobbered by a re-run of the same source. The newest record is
+    the only one that describes what this tool last did.
+
     `verified` defaults to TRUE for a record that lacks the key. Every record this
     code writes carries it explicitly (including `False` on the interrupt path, where
-    verification demonstrably never ran), so a record without one comes from an older
-    version of this command — and `True` is the safe default, because it is `False`
-    that waives a refusal to overwrite (`_provenance_verdict`).
+    this tool demonstrably never got to confirm the write), so a record without one
+    comes from an older version of this command — and `True` is the safe default,
+    because it is `False` that waives a refusal to overwrite
+    (`_provenance_verdict`).
     """
-    placements: dict[str, list[dict]] = {}
+    placements: dict[str, dict[str, dict]] = {}
     for entry in backup_module.journal_read(root, key):
         if entry.get("op") != "add":
             continue
@@ -1824,19 +1887,17 @@ def _previous_placements(root: Path, key: str) -> dict[str, list[dict]]:
             if isinstance(size, bool) or not isinstance(size, int):
                 continue
             digest = record.get("sha256")
-            placements.setdefault(source, []).append(
-                {
-                    "device_path": device_path,
-                    "size": size,
-                    "sha256": digest if isinstance(digest, str) else "",
-                    "verified": bool(record.get("verified", True)),
-                }
-            )
+            placements.setdefault(source, {})[device_path] = {
+                "device_path": device_path,
+                "size": size,
+                "sha256": digest if isinstance(digest, str) else "",
+                "verified": bool(record.get("verified", True)),
+            }
     return placements
 
 
 def _provenance_verdict(
-    placements: dict[str, list[dict]], source: _SourceBook, sizes: dict[str, int]
+    placements: dict[str, dict[str, dict]], source: _SourceBook, sizes: dict[str, int]
 ) -> tuple[str | None, set[str]]:
     """`(the path this source is already correctly at, the paths whose occupant is this
     tool's own unfinished attempt at these exact bytes)` — both `None`/empty unless the
@@ -1862,10 +1923,17 @@ def _provenance_verdict(
     deleting it by hand. Waiving that refusal is right, but "the journal mentions this
     path" is not enough authorisation on its own: a user who deleted our copy and put
     their OWN file there would have it silently overwritten on the next run. So the
-    waiver is restricted to records this run can see were never verified — a write this
-    tool knows it did not finish. A record that WAS verified describes a file that
-    landed correctly, so whatever is at that path now differs because something other
-    than this tool changed it, and that is exactly the case the refusal exists for.
+    waiver is restricted to records marked `verified: false`.
+
+    Read that flag precisely: it means **this tool never CONFIRMED the write**, not
+    that it knows the write failed. A run interrupted during the thumbnails stage, or
+    one whose verify-stage listing failed, records a perfectly-landed book as
+    unverified — and that is the honest reading, because the tool genuinely does not
+    know. The waiver is defined against exactly that ignorance: a placement this tool
+    never confirmed may be re-sent, while one it DID confirm describes a file that
+    landed correctly, so anything different at that path now was changed by something
+    other than this tool — precisely the case the refusal exists for. The residual
+    exposure is a book re-sent that did not need to be, which costs a copy, not data.
     """
     records = placements.get(source.key())
     if not records:
@@ -1873,7 +1941,7 @@ def _provenance_verdict(
     digest = _source_digest(source.path)
     if not digest:
         return None, set()
-    mine = [record for record in records if record["sha256"] == digest]
+    mine = [record for record in records.values() if record["sha256"] == digest]
     placed_at = next(
         (
             record["device_path"]
@@ -1913,14 +1981,20 @@ def _journal_add(root: Path, key: str, records: list[dict], snapshot_name: str) 
 
 
 def _source_digest(path: Path) -> str:
-    """The source's sha256 for the journal, or `""` when it cannot be read.
+    """The source's sha256, or `""` when it cannot be read.
 
-    Best-effort deliberately: this runs AFTER the bytes are already on the device, so
-    letting a failed hash escape would cost the provenance record for a book that is
-    demonstrably there — strictly worse than recording the placement without a digest.
-    Nothing reads this field back today (`_previous_placements` matches on path and
-    size); it is recorded because the copy has just read the bytes anyway, and a later
-    integrity check would otherwise have no baseline.
+    Two callers, and the suppressed `OSError` means something different — but equally
+    safe — in each:
+
+    - The copy loop, AFTER the bytes are already on the device. Letting a failed hash
+      escape there would cost the provenance record for a book that is demonstrably
+      on the device, which is strictly worse than recording the placement without a
+      digest. A digestless record then authorises nothing (below).
+    - `_provenance_verdict`, in the PLAN, where this is what the journal is checked
+      against. `""` there means no journal record can be matched at all, so the book
+      is neither skipped as already-present nor allowed to overwrite anything — it is
+      simply copied again, or refused if its path is taken. Failing to hash the source
+      therefore fails safe in both directions.
     """
     with contextlib.suppress(OSError):
         return backup_module.sha256_of(path)
@@ -1961,10 +2035,12 @@ def run_add(
     **What the journal does and does not authorise.** It never redirects a write: the
     target path is recomputed from scratch every run, and the journal can only suppress
     a refusal at that already-computed path. The one thing it waives is the
-    occupied-path refusal, and only for a placement recorded as UNVERIFIED — a write
-    this tool knows it did not finish — so re-running `add` is how a short or
-    interrupted write gets fixed, while a file the user put at that path themselves is
-    still refused.
+    occupied-path refusal, and only for a placement recorded as UNVERIFIED — one this
+    tool never CONFIRMED, which includes a run interrupted before the verify stage as
+    well as a write that demonstrably failed it. Re-running `add` is therefore how a
+    short or interrupted write gets fixed, while a file the user put at that path
+    themselves is still refused. Only the LATEST record for a (source, path) pair
+    counts, so a successful re-run revokes an earlier run's waiver.
 
     **Nothing is `done` until the device confirms it.** After the copy, the `verify`
     stage lists `documents/` once and compares each written file's size against the
@@ -2048,7 +2124,24 @@ def run_add(
             for entry in all_entries
             if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
         ]
-        device_ids = set(_device_book_ids(root, device, backend, device_books, key).values()) - {""}
+        ids_by_path, unreadable = _device_book_ids(root, device, backend, device_books, key)
+        device_ids = set(ids_by_path.values()) - {""}
+        if unreadable:
+            # A book whose EXTH could not be read looks ABSENT to the id check, so a
+            # source it already holds reads as new and gets copied a second time —
+            # under a name the device copy need not share, which is how a systemic
+            # read failure quietly duplicates a whole library. `book_id_missing` is
+            # the registered code for "this device book has no usable EXTH 113 id",
+            # which is exactly the state these are in; the message says WHY, and
+            # `result.data.device_books_unreadable` carries the count for an agent.
+            reporter.warning(
+                code="book_id_missing",
+                message=(
+                    f"{len(unreadable)} book(s) on the device could not be read for "
+                    "their EXTH 113 id and will look absent to this run (first: "
+                    f"{unreadable[0]})"
+                ),
+            )
         placements = _previous_placements(root, key)
 
         max_path = MAX_DEVICE_PATH.get(device.mode, MAX_DEVICE_PATH["mtp"])
@@ -2058,7 +2151,7 @@ def run_add(
         queued: list[_PlannedBook] = []
         claimed: dict[str, str] = {}  # casefolded device path -> the source that took it
         for source in sources:
-            records = exth.read_records(source.path)
+            records = _records_or_empty(source.path)
             book_id = exth.record_text(records, exth.TAG_UUID) or ""
             title = exth.record_text(records, exth.TAG_TITLE) or ""
             author = exth.record_text(records, exth.TAG_AUTHOR) or ""
@@ -2165,6 +2258,7 @@ def run_add(
                 operation_id=None,
                 free_space=free_space,
                 queued=queued,
+                device_books_unreadable=len(unreadable),
             )
 
         written: list[dict] = []
@@ -2258,13 +2352,22 @@ def run_add(
                 # `_fail`'s all-zero "nothing was attempted" result, which would be a
                 # lie about a run that demonstrably wrote to the device.
                 verify_error = str(error)
-            for book in copied:
+            # `record["verified"]` is set inside this loop, per book, the moment that
+            # book's own verdict is known — not in a second pass afterwards. It is
+            # what the NEXT run consults before overwriting anything
+            # (`_provenance_verdict`), and every statement between the write and the
+            # flag is a window in which an interrupt leaves a book that landed
+            # perfectly recorded as unconfirmed. The window cannot be closed (nothing
+            # can confirm a write before the device has been asked), but it should be
+            # as short as the code allows.
+            for record, book in zip(written, copied, strict=True):
                 if landed is None:
                     book.fail(
                         "engine_error",
                         DETAIL_VERIFY_FAILED,
                         f"the device could not be listed to confirm the write: {verify_error}",
                     )
+                    record["verified"] = False
                     continue
                 size = landed.get(book.device_path)
                 if size is None:
@@ -2282,12 +2385,6 @@ def run_add(
                     )
                 else:
                     book.succeed()
-
-            # What the NEXT run is allowed to overwrite without asking. Only a write
-            # this tool knows it did not finish may be replaced silently; a verified
-            # one that no longer matches was changed by something else, and that is
-            # the case the collision refusal exists for (`_provenance_verdict`).
-            for record, book in zip(written, copied, strict=True):
                 record["verified"] = book.status == "done"
         except BaseException:
             # `BaseException`, because the realistic case is `KeyboardInterrupt`:
@@ -2316,6 +2413,7 @@ def run_add(
             operation_id=operation_id,
             free_space=free_space,
             queued=queued,
+            device_books_unreadable=len(unreadable),
         )
 
     return _run(
@@ -2339,6 +2437,7 @@ def _add_result(
     operation_id: str | None,
     free_space: int,
     queued: list[_PlannedBook],
+    device_books_unreadable: int,
 ) -> dict:
     """Emit one `item` per planned book and build `body`'s return value.
 
@@ -2398,5 +2497,10 @@ def _add_result(
             "operation": operation_id,
             "free_space": free_space,
             "bytes_planned": sum(book.size for book in queued),
+            # How many device books this run could not read an id from — 0 normally.
+            # Non-zero means the "already on the device" check was blind for that
+            # many books, which is worth knowing BEFORE wondering why duplicates
+            # appeared. See `_device_book_ids`.
+            "device_books_unreadable": device_books_unreadable,
         },
     }
