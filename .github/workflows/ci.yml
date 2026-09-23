@@ -9,7 +9,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ["3.11", "3.12", "3.13"]
+        # 3.14 is not optional padding: it is the interpreter this project is
+        # actually developed and tested on (Homebrew dropped python@3.13 from the
+        # development machine, so the local .venv runs 3.14). Without it, "the tests
+        # pass" locally and "the tests pass" in CI were claims about two different
+        # interpreters.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
