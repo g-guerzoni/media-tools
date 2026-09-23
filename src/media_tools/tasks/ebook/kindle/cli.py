@@ -149,6 +149,40 @@ _MIN_NAME_BUDGET = 32
 # matched against a conservative shape and REJECTED (falling back to
 # `UNKNOWN_LANGUAGE`) rather than sanitized into a different-but-plausible folder name.
 _LANGUAGE_CODE = re.compile(r"[a-z]{2,3}")
+# `add`'s own per-book EXTH 113 index, next to the MTP header cache under
+# `_kindle/<serial>/.cache/` and invalidated the same way (device path + size +
+# mtime). It exists because `exth.read_records` needs a file's HEADER but reads the
+# whole file to reach it, so collecting the device's ids the naive way costs a full
+# pass over the library — off USB, or over MTP into the header cache — every time a
+# single book is added. Scanning a library is `scan`'s job, not `add`'s.
+_BOOK_ID_INDEX_NAME = "book-ids.json"
+
+# --- `detail`'s prefix vocabulary ---------------------------------------------------
+#
+# The `reason` registry is closed and this task adds nothing to it, so five genuinely
+# different causes share one `engine_error`. `detail` is what tells them apart — and
+# an agent must be able to BRANCH on it, not substring-match English prose, so every
+# `detail` this module produces is `"<term>: <human sentence>"` with the term drawn
+# from exactly this list. `_PlannedBook.fail`/`.skip` join the two halves, so the
+# shape cannot drift one call site at a time.
+DETAIL_EXISTS = "exists"
+DETAIL_SOURCE_MISSING = "source_missing"
+DETAIL_OUTPUT_COLLISION = "output_collision"
+DETAIL_OUT_OF_SPACE = "out_of_space"
+DETAIL_WRITE_REFUSED = "write_refused"
+DETAIL_SHORT_WRITE = "short_write"
+DETAIL_VERIFY_FAILED = "verify_failed"
+DETAIL_TERMS = frozenset(
+    {
+        DETAIL_EXISTS,
+        DETAIL_SOURCE_MISSING,
+        DETAIL_OUTPUT_COLLISION,
+        DETAIL_OUT_OF_SPACE,
+        DETAIL_WRITE_REFUSED,
+        DETAIL_SHORT_WRITE,
+        DETAIL_VERIFY_FAILED,
+    }
+)
 
 
 # --- argument wiring --------------------------------------------------------------
@@ -255,6 +289,12 @@ def register_subparsers(kindle_parser) -> None:
         default=None,
         help="Only add books whose target device path OR own title/author contains "
         "TEXT (case-insensitive) — the same rule `thumbnails --match` uses.",
+    )
+    add_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report which books would be copied, skipped or refused without taking "
+        "a backup or writing anything to the device.",
     )
 
 
@@ -1029,7 +1069,13 @@ def run_backup(
                 "ok": False,
                 "exit_code": EXIT_FAILED,
                 "counts": {"total": 1, "done": 0, "skipped": 0, "failed": 1, "pending": 0},
-                "failed": [{"id": 1, "input": f"kindle:{key}", "reason": "engine_error"}],
+                # `detail` is `None`, never absent: every `failed` entry this
+                # subsystem emits carries the key, so an agent reading one gets a
+                # missing VALUE rather than a missing KEY (the same rule the
+                # `--dry-run` `data` shapes follow).
+                "failed": [
+                    {"id": 1, "input": f"kindle:{key}", "reason": "engine_error", "detail": None}
+                ],
                 "pending": [],
                 "outputs": [],
                 "run_file": None,
@@ -1280,8 +1326,17 @@ def run_thumbnails(
                     warnings = ["device_rejected_thumbnail"]
                 elif status == "failed":
                     item_status, reason, warnings = "failed", "engine_error", []
+                    # `detail` is `None`, never absent — see `run_backup` above.
+                    # `thumbnails.install` collapses every genuine device/host fault
+                    # into one `"failed"` status, so there is nothing narrower to
+                    # say here; the key is present so one parser reads both commands.
                     failed.append(
-                        {"id": item_id, "input": book.device_path, "reason": "engine_error"}
+                        {
+                            "id": item_id,
+                            "input": book.device_path,
+                            "reason": "engine_error",
+                            "detail": None,
+                        }
                     )
                 else:  # "no_cover"
                     item_status, reason = "skipped", "no_cover"
@@ -1360,6 +1415,13 @@ class _SourceBook:
     path: Path
     language: str | None = None
 
+    def key(self) -> str:
+        """How this source is identified in the journal: its absolute path, resolved,
+        so the same file named once relatively and once absolutely is one source. A
+        path that no longer exists still resolves (`strict=False`), which matters
+        because a vanished source must still be recognisable in an old entry."""
+        return str(self.path.resolve())
+
 
 @dataclass
 class _PlannedBook:
@@ -1371,6 +1433,8 @@ class _PlannedBook:
     its bytes really landed (see `run_add`'s own docstring) — which is also why a book
     that reaches the end still `"pending"` would be a bug in this module rather than a
     real outcome, and is reported as `pending` rather than quietly recoloured.
+    (`--dry-run` is the one place `pending` IS a real outcome: there it means "this is
+    what a real run would copy".)
     """
 
     id: int
@@ -1384,19 +1448,20 @@ class _PlannedBook:
     size: int
     status: str = "pending"
     reason: str | None = None
-    # A free-text note carried alongside `reason`, because the closed registry has no
-    # code for "the device ran out of space" (nor for several other real causes) and
-    # inventing one is forbidden — so the cause rides on `result.failed[].detail` and
-    # `result.data.books[].detail` instead of being lost to a generic `engine_error`.
+    # `"<term>: <human sentence>"`, the term from `DETAIL_TERMS`. It exists because
+    # the closed registry has one `engine_error` covering five distinct causes, and an
+    # agent has to be able to branch on which one without substring-matching English.
+    # Built only through `fail()`/`skip()` below, never assigned directly, so the shape
+    # cannot drift one call site at a time.
     detail: str | None = None
     thumbnail: str | None = None
     warnings: list[str] = field(default_factory=list)
 
-    def fail(self, reason: str, detail: str) -> None:
-        self.status, self.reason, self.detail = "failed", reason, detail
+    def fail(self, reason: str, term: str, message: str) -> None:
+        self.status, self.reason, self.detail = "failed", reason, _detail(term, message)
 
-    def skip(self, reason: str, detail: str) -> None:
-        self.status, self.reason, self.detail = "skipped", reason, detail
+    def skip(self, reason: str, term: str, message: str) -> None:
+        self.status, self.reason, self.detail = "skipped", reason, _detail(term, message)
 
     def succeed(self) -> None:
         self.status, self.reason, self.detail = "done", None, None
@@ -1416,21 +1481,50 @@ class _PlannedBook:
             "thumbnail": self.thumbnail,
         }
 
+    def provenance(self, digest: str) -> dict:
+        """What the journal records about a book this run put on the device, so a
+        LATER run can recognise it without a filename comparison — see
+        `_previous_placements`. `size` is the SOURCE's size (what was sent), not what
+        landed, which is exactly what makes a short write fail the conjunction on the
+        next run and get copied again."""
+        return {
+            "device_path": self.device_path,
+            "source": self.source.key(),
+            "size": self.size,
+            "book_id": self.book_id or None,
+            "sha256": digest,
+        }
+
+
+def _detail(term: str, message: str) -> str:
+    """`"<term>: <message>"`, with the term checked against the closed-ish vocabulary
+    the same way `Reporter` checks a `reason` — a typo'd prefix is worse than no
+    prefix, because an agent branching on it would silently stop matching."""
+    if term not in DETAIL_TERMS:
+        raise KeyError(f"unknown detail term: {term!r}")
+    return f"{term}: {message}"
+
 
 def _is_language_code(value: str | None) -> bool:
-    """A plain two/three-letter code that is not one of the ISO 639-2 placeholders
-    (`und`/`mul`/`zxx`) — the SAME verdict `normalize._tag_language` reaches for a
-    book's embedded `<dc:language>`, reusing its own list rather than re-deciding
-    here what counts as a real language."""
+    """A plain two- or three-letter code that is not one of the ISO 639-2 placeholders
+    (`und`/`mul`/`zxx`).
+
+    The PLACEHOLDER LIST is shared with `normalize._tag_language`
+    (`IGNORED_LANGUAGE_TAGS`) so a library and a device never disagree about what is
+    not a language. The SHAPE rule is deliberately NOT shared: `normalize` requires
+    exactly two characters, because it is choosing the `<dc:language>` value it will
+    write back into a book, while this is choosing a folder name on a device and a
+    three-letter code a user typed (or a book carries) is a perfectly good folder.
+    """
     code = (value or "").strip().lower()
     return bool(_LANGUAGE_CODE.fullmatch(code)) and code not in IGNORED_LANGUAGE_TAGS
 
 
 def _validated_language_override(value: str | None) -> str | None:
     """`--lang`, or None. Unlike a language read off a book — which silently falls back
-    to `UNKNOWN_LANGUAGE` when it is not a plain two/three-letter code — a value the
-    USER typed is rejected outright, because silently shelving their books somewhere
-    else is worse than telling them the code was not understood."""
+    to `UNKNOWN_LANGUAGE` when it is not usable — a value the USER typed is rejected
+    outright, because silently shelving their books somewhere else is worse than
+    telling them the code was not understood."""
     if value is None:
         return None
     code = value.strip().lower()
@@ -1463,9 +1557,21 @@ def _device_path_for(name: str, language: str, *, max_path: int) -> str:
     `core.paths.truncate_name`, which preserves the extension and inserts a content
     hash rather than blindly slicing (two long names that share a prefix must not
     collapse onto one device path).
+
+    A prefix long enough to leave less than `_MIN_NAME_BUDGET` raises instead of
+    quietly overrunning the limit this function's whole contract is about. Unreachable
+    from `run_add`, whose language is two or three letters or `UNKNOWN_LANGUAGE` — but
+    this helper is exactly the kind of thing Task 8's `sync` will reuse with a
+    different directory, and a contract that fails loudly is the point of stating one.
     """
     directory = f"{DOCUMENTS_DIR}/{language}/"
-    budget = max(_MIN_NAME_BUDGET, max_path - len(directory))
+    budget = max_path - len(directory)
+    if budget < _MIN_NAME_BUDGET:
+        raise ValueError(
+            f"{directory!r} leaves {budget} characters of a {max_path}-character device "
+            f"path budget, under the {_MIN_NAME_BUDGET} a name needs; shorten the "
+            "directory rather than overrunning the device's own path limit"
+        )
     return f"{directory}{sanitize_device_name(name, max_path=budget)}"
 
 
@@ -1506,6 +1612,12 @@ def _sources_from_paths(paths: list[Path]) -> list[_SourceBook]:
 def _sources_from_batch(root: Path, name: str) -> list[_SourceBook]:
     """Every book an `ebook build` run placed, with the language it resolved for each.
 
+    Filtered by `ADDABLE_SUFFIXES`, exactly as a FOLDER given on the command line is:
+    a batch is a scan result, not a file the user pointed at, so an output in some
+    other format is skipped rather than turned into a usage error. This filter is also
+    load-bearing for `_device_path_for`'s budget arithmetic, which assumes a short,
+    known extension.
+
     An item whose recorded output has since been deleted is KEPT rather than filtered
     out here, so it is reported as its own `source_missing` item instead of quietly
     shrinking the plan — the same reason `ebook build` reports that case rather than
@@ -1524,6 +1636,8 @@ def _sources_from_batch(root: Path, name: str) -> list[_SourceBook]:
         data = item.get("data") if isinstance(item.get("data"), dict) else {}
         output = data.get("output")
         if not isinstance(output, str) or not output or output in seen:
+            continue
+        if Path(output).suffix.lower() not in ADDABLE_SUFFIXES:
             continue
         seen.add(output)
         language = data.get("language")
@@ -1560,37 +1674,200 @@ def _resolve_add_sources(args, root: Path) -> list[_SourceBook]:
     return sources
 
 
-def _device_inventory(
-    root: Path, device: Device, backend: DeviceBackend, all_entries: list[DeviceFile]
-) -> tuple[set[str], set[str]]:
-    """`(every book id already on the device, every device path casefolded)`.
+# --- what is already on the device, cheaply -------------------------------------------
 
-    Identity is EXTH 113 and nothing else — never a filename, which on a Kindle is
-    only ever whatever the file happened to be called when it was sideloaded. Reading
-    those records needs a local copy of each book, which mass storage has for free and
-    MTP does not, so the MTP branch goes through the same per-book header cache `scan`
-    already fills (`_materialize_for_scan`) rather than re-pulling the whole library.
 
-    The second set is what makes the FAT32 case-insensitive collision check possible:
-    a different book already sitting at the path this run would write to must not be
-    silently overwritten, however the two files happen to be named.
+def _book_id_key(book: DeviceFile) -> str:
+    return f"{book.size}|{book.mtime}"
+
+
+def _device_book_ids(
+    root: Path, device: Device, backend: DeviceBackend, books: list[DeviceFile], key: str
+) -> dict[str, str]:
+    """`{device path: its EXTH 113 id}` for every book on the device, through a
+    PERSISTENT index so `add` never re-reads a library it has already read.
+
+    `exth.read_records` needs a book's header but has to read the whole file to reach
+    it, so collecting these ids the obvious way costs a full pass over the library off
+    USB — and over MTP a full fetch of it into the header cache — every single time one
+    book is added. Scanning a library is `scan`'s job. The index
+    (`_BOOK_ID_INDEX_NAME`, beside the MTP header cache under
+    `_kindle/<serial>/.cache/`) is keyed by device path + size + mtime, exactly like
+    that cache, so an edited or replaced book is re-read and an unchanged one never is;
+    a path that has left the device drops out on the next write.
+
+    Best-effort, like every other cache in that directory: an unreadable or unwritable
+    index costs one re-read next time, never a failed `add`, and never gets reported as
+    if the DEVICE were the problem.
     """
-    books = [
-        entry for entry in all_entries if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
-    ]
-    if device.mode == "mass_storage":
-        records = {book.path: exth.read_records(device.mount / book.path) for book in books}
-    else:
-        key = backup_module.device_key(device)
-        cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
-        local_paths = _materialize_for_scan(backend, books, cache_dir)
-        records = {book.path: exth.read_records(local_paths[book.path]) for book in books}
-    ids = {
-        book_id
-        for book_id in (exth.record_text(record, exth.TAG_UUID) for record in records.values())
-        if book_id
+    index_path = backup_module.backup_root(root, key) / ".cache" / _BOOK_ID_INDEX_NAME
+    index = _read_book_id_index(index_path)
+
+    ids: dict[str, str] = {}
+    unknown: list[DeviceFile] = []
+    for book in books:
+        recorded = index.get(book.path)
+        if recorded is not None and recorded[0] == _book_id_key(book):
+            ids[book.path] = recorded[1]
+        else:
+            unknown.append(book)
+
+    if unknown:
+        if device.mode == "mass_storage":
+            records = {book.path: exth.read_records(device.mount / book.path) for book in unknown}
+        else:
+            cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
+            local_paths = _materialize_for_scan(backend, unknown, cache_dir)
+            records = {book.path: exth.read_records(local_paths[book.path]) for book in unknown}
+        for book in unknown:
+            ids[book.path] = exth.record_text(records[book.path], exth.TAG_UUID) or ""
+
+    if unknown or set(index) != {book.path for book in books}:
+        _write_book_id_index(
+            index_path, {book.path: (_book_id_key(book), ids[book.path]) for book in books}
+        )
+    return ids
+
+
+def _read_book_id_index(index_path: Path) -> dict[str, tuple[str, str]]:
+    """`{device path: (size|mtime key, book id)}`. Unlike `_read_cache_index` next
+    door, nothing read back from here ever drives a filesystem operation — it only
+    decides whether a book's header is re-read — so the validation is plain type
+    checking rather than `_is_safe_cache_key`'s traversal guard."""
+    try:
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    found: dict[str, tuple[str, str]] = {}
+    for path, entry in data.items():
+        if not isinstance(path, str) or not isinstance(entry, dict):
+            continue
+        entry_key, book_id = entry.get("key"), entry.get("book_id")
+        if isinstance(entry_key, str) and isinstance(book_id, str):
+            found[path] = (entry_key, book_id)
+    return found
+
+
+def _write_book_id_index(index_path: Path, index: dict[str, tuple[str, str]]) -> None:
+    """Best-effort, for the same reason `_write_cache_index` is: a torn or refused
+    write only means the next run re-reads some headers."""
+    payload = {
+        path: {"key": entry_key, "book_id": book_id} for path, (entry_key, book_id) in index.items()
     }
-    return ids, {entry.path.casefold() for entry in all_entries}
+    with contextlib.suppress(OSError):
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _previous_placements(root: Path, key: str) -> dict[str, list[tuple[str, int]]]:
+    """`{resolved source path: [(device path, size it was sent at), ...]}`, read back
+    out of this device's own journal.
+
+    This is what lets a re-run recognise a source that carries NO EXTH 113 id — an
+    `.epub`, a `.pdf`, a MOBI nobody wrote an id into. It is PROVENANCE, not filename
+    matching: it answers "did this tool put this exact file here, and is it still
+    there at the size it was sent", which is a different question from "do these two
+    files have similar names". It can only ever recognise books this tool placed; a
+    book sideloaded by Calibre or by hand is invisible to it, which is a real limit
+    rather than a regression.
+    """
+    placements: dict[str, list[tuple[str, int]]] = {}
+    for entry in backup_module.journal_read(root, key):
+        if entry.get("op") != "add":
+            continue
+        for record in entry.get("books") or []:
+            if not isinstance(record, dict):
+                continue
+            source, device_path, size = (
+                record.get("source"),
+                record.get("device_path"),
+                record.get("size"),
+            )
+            if not isinstance(source, str) or not isinstance(device_path, str):
+                continue
+            if isinstance(size, bool) or not isinstance(size, int):
+                continue
+            placements.setdefault(source, []).append((device_path, size))
+    return placements
+
+
+def _placed_by_us(
+    placements: dict[str, list[tuple[str, int]]], source: _SourceBook, sizes: dict[str, int]
+) -> str | None:
+    """The device path this tool already put `source` at, if the device still holds it
+    AT THE RECORDED SIZE — otherwise None.
+
+    The CONJUNCTION is the whole point. The journal alone is a memory of what was
+    done, and a user who has since deleted the book from the device would never get it
+    back; the listing alone is a filename comparison, which this subsystem does not
+    do. Together they answer a question neither can: is the file this tool placed
+    still there, unchanged. A book whose write was short (journalled at the size that
+    was SENT, present on the device at fewer bytes) fails this check and is copied
+    again, which is exactly right — see `_our_paths_for`, which is what stops that
+    retry from then being refused as a collision with its own failed attempt.
+    """
+    for device_path, size in placements.get(source.key(), ()):
+        if sizes.get(device_path) == size:
+            return device_path
+    return None
+
+
+def _our_paths_for(placements: dict[str, list[tuple[str, int]]], source: _SourceBook) -> set[str]:
+    """Every device path (casefolded) the journal says this tool put THIS source at,
+    whatever is there now.
+
+    A path in this set is not a collision when the same source is offered again: it
+    holds this tool's own earlier attempt at this exact file, so re-sending it is the
+    retry the verify stage exists to make possible, not a clobber of somebody else's
+    book. Without this, a short write could never be fixed by re-running `add` — the
+    size mismatch would correctly refuse to call it "already placed", and the occupied
+    path would then refuse to replace it, leaving the user with a truncated book and no
+    way forward but deleting it by hand.
+    """
+    return {device_path.casefold() for device_path, _size in placements.get(source.key(), ())}
+
+
+# --- the command ------------------------------------------------------------------------
+
+
+def _journal_add(root: Path, key: str, records: list[dict], snapshot_name: str) -> str | None:
+    """Record everything this run put on the device, or nothing if it put nothing.
+
+    `paths` is what Task 8's `restore --op ID` removes (books AND their thumbnails);
+    `books` is the per-book provenance `_previous_placements` reads back, which is what
+    lets a later run recognise an id-less source without ever comparing filenames.
+    """
+    if not records:
+        return None
+    paths = [record["device_path"] for record in records]
+    paths += [record["thumbnail"] for record in records if record.get("thumbnail")]
+    return backup_module.journal_append(
+        root,
+        key,
+        {
+            "op": "add",
+            "paths": paths,
+            "books": [{k: v for k, v in record.items() if k != "thumbnail"} for record in records],
+            "snapshot": snapshot_name,
+        },
+    )
+
+
+def _source_digest(path: Path) -> str:
+    """The source's sha256 for the journal, or `""` when it cannot be read.
+
+    Best-effort deliberately: this runs AFTER the bytes are already on the device, so
+    letting a failed hash escape would cost the provenance record for a book that is
+    demonstrably there — strictly worse than recording the placement without a digest.
+    Nothing reads this field back today (`_previous_placements` matches on path and
+    size); it is recorded because the copy has just read the bytes anyway, and a later
+    integrity check would otherwise have no baseline.
+    """
+    with contextlib.suppress(OSError):
+        return backup_module.sha256_of(path)
+    return ""
 
 
 def run_add(
@@ -1601,7 +1878,10 @@ def run_add(
 ) -> int:
     """Put books on the Kindle, in this order, every time: resolve the device, take
     the mandatory backup, plan, check free space, copy, install thumbnails, verify,
-    journal.
+    journal. `--dry-run` stops after the plan, takes NO backup and writes nothing to
+    the DEVICE — it still fills the host-side caches its read-only planning needs (the
+    EXTH id index, and over MTP the per-book header cache), exactly as
+    `thumbnails --dry-run` does.
 
     **The backup is a PRECONDITION, not a step.** A failure there aborts before a
     single byte is written and keeps exit 3 with `_mandatory_backup`'s all-zero counts
@@ -1610,28 +1890,38 @@ def run_add(
     while here nothing the user actually asked for was ever attempted. The two are not
     in conflict, and neither should be "fixed" to match the other.
 
-    **A book already on the device is matched by its EXTH 113 id, never by its
-    filename** (spec 8.8), and reported `skipped`/`exists`. A source with no id at all
-    (an `.epub`/`.pdf`, or a MOBI-family file nobody wrote an id into) therefore cannot
-    be recognised and is copied every time, with the `book_id_missing` warning saying
-    so rather than pretending the check succeeded.
-
-    **Per-book isolation, everywhere.** One book that fails never stops the rest: a
-    device that runs out of space fails the books that no longer fit (keeping whatever
-    already landed), a refused write fails that book alone, and a source that vanished
-    between planning and copying is `source_missing`. Two books that would land on the
-    same device path — or one that would land on a path a DIFFERENT device book already
-    occupies, compared case-insensitively as FAT32 itself compares — are
-    `output_collision` rather than a silent overwrite.
+    **Identity, in two layers, neither of them a filename.** A book carrying an EXTH
+    113 id is `skipped`/`exists` when the device already holds that id, wherever and
+    under whatever name (`_device_book_ids`, through a persistent index so `add` does
+    not re-read the library every run). A book with NO id — an `.epub`, a `.pdf`, a
+    MOBI nobody wrote one into — is recognised by PROVENANCE instead: this device's own
+    journal says this tool put this exact source at path P, AND the device still holds
+    P at the size it was sent (`_placed_by_us`). The conjunction is what makes that
+    safe; either half alone would be a memory or a name comparison.
 
     **Nothing is `done` until the device confirms it.** After the copy, the `verify`
     stage lists `documents/` once and compares each written file's size against the
     source's. A write the backend accepted that left nothing, or left the wrong number
     of bytes (the real MTP failure mode — there is no rename primitive there, per
     Ruling R12), is a `failed` item, not a done one. The short file is left where it
-    is rather than deleted: the journal below records it, so Task 8's `restore --op`
-    can undo it as part of the same operation, and this command never removes anything
-    from a device by itself.
+    is rather than deleted: the journal records it, so Task 8's `restore --op` can undo
+    it as part of the same operation, and this command never removes anything from a
+    device by itself.
+
+    **The journal is written even when the run does not finish.** Everything from the
+    first `write` to the journal call runs inside one guard: a Ctrl+C (which
+    `MassStorageBackend.write` re-raises after removing its own temp file) or any other
+    escape would otherwise leave books on the device with no record of how they got
+    there, while `_run` reported all-zero counts and `outputs: []`. On the way out the
+    journal is appended for whatever WAS written and the original exception continues
+    on its own path, so the pinned ordering still holds on the happy path.
+
+    **Per-book isolation otherwise.** A device that runs out of space fails only the
+    books that no longer fit (keeping what already landed), a refused write fails that
+    book alone, a source that vanished is `source_missing`, and two books that would
+    land on one device path — or one landing where a different book already sits,
+    compared case-insensitively as FAT32 compares — are `output_collision` rather than
+    a silent overwrite.
 
     Thumbnails ride along per book (`thumbnails.install`, reusing the source file we
     already have locally rather than fetching the book back off the device). A
@@ -1639,41 +1929,61 @@ def run_add(
     device either way — so its outcome is reported in `result.data.thumbnails`, with a
     `device_rejected_thumbnail` warning on the item when the device accepted the write
     and silently discarded it (Colorsoft and newer, by design).
+
+    Every failure carries a `detail` of the form `"<term>: <sentence>"`, the term from
+    `DETAIL_TERMS`, on the `item` event as well as in `result`. The registry has one
+    `engine_error` for five distinct causes and this task adds no codes to it, so the
+    term is what an agent branches on instead of the English half.
     """
+    dry_run = bool(args.dry_run)
     root = output_root(args.output_dir)
     language_override = _validated_language_override(args.lang)
     sources = _resolve_add_sources(args, root)
 
-    stages = ["detect", "backup", "plan", "copy", "thumbnails", "verify"]
+    stages = (
+        ["detect", "plan"]
+        if dry_run
+        else ["detect", "backup", "plan", "copy", "thumbnails", "verify"]
+    )
     options = {
         "kindle_command": "add",
         "batch": args.batch,
         "lang": language_override,
         "match": args.match,
-        "books": len(sources),
+        "dry_run": dry_run,
     }
 
     def body(reporter: Reporter, root: Path, device: Device, backend: DeviceBackend) -> dict:
         key = backup_module.device_key(device)
+        snap: backup_module.Snapshot | None = None
 
-        reporter.stage(stage="backup", index=2, count=len(stages))
-        failure, snap = _mandatory_backup(reporter, root, backend, key)
-        if failure is not None:
-            return failure
-        if snap is None:  # pragma: no cover - _mandatory_backup returns one or the other
-            # Raised explicitly rather than trusted silently (and not a bare `assert`,
-            # which `python -O` strips): every write below depends on a real snapshot
-            # existing, and a violated invariant should name itself instead of
-            # surfacing later as `None.path`.
-            raise RuntimeError(
-                "internal error: an add reached its write phase with no protecting "
-                "snapshot on record"
-            )
+        if not dry_run:
+            reporter.stage(stage="backup", index=2, count=len(stages))
+            failure, snap = _mandatory_backup(reporter, root, backend, key)
+            if failure is not None:
+                return failure
+            if snap is None:  # pragma: no cover - one or the other, never neither
+                # Raised explicitly (not a bare `assert`, which `python -O` strips):
+                # every write below depends on a real snapshot, and a violated
+                # invariant should name itself rather than surface as `None.path`.
+                raise RuntimeError(
+                    "internal error: an add reached its write phase with no protecting "
+                    "snapshot on record"
+                )
 
         # --- plan ---------------------------------------------------------------
-        reporter.stage(stage="plan", index=3, count=len(stages))
+        reporter.stage(stage="plan", index=len(stages) if dry_run else 3, count=len(stages))
         all_entries = backend.list_files()
-        device_ids, device_paths = _device_inventory(root, device, backend, all_entries)
+        device_sizes = {entry.path: entry.size for entry in all_entries}
+        occupied = {path.casefold() for path in device_sizes}
+        device_books = [
+            entry
+            for entry in all_entries
+            if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
+        ]
+        device_ids = set(_device_book_ids(root, device, backend, device_books, key).values()) - {""}
+        placements = _previous_placements(root, key)
+
         max_path = MAX_DEVICE_PATH.get(device.mode, MAX_DEVICE_PATH["mtp"])
         needle = args.match.lower() if args.match else None
 
@@ -1712,27 +2022,43 @@ def run_add(
             )
             planned.append(book)
             if source.path.is_file() and not book_id:
-                # Only for a book we could actually READ and that carried no id — a
-                # source that is no longer on the host has no records to be missing
-                # one, and saying otherwise would blame the wrong thing.
+                # Only for a book we could actually READ that carried no id — a source
+                # no longer on the host has no records to be missing one, and saying
+                # otherwise would blame the wrong thing.
                 book.warnings.append("book_id_missing")
 
+            placed_at = None if book_id else _placed_by_us(placements, source, device_sizes)
+            ours = set() if book_id else _our_paths_for(placements, source)
             if not source.path.is_file():
-                book.fail("source_missing", f"{source.path} is no longer on the host")
+                book.fail(
+                    "source_missing",
+                    DETAIL_SOURCE_MISSING,
+                    f"{source.path} is no longer on the host",
+                )
             elif book_id and book_id in device_ids:
-                book.skip("exists", "already on the device (matched by its EXTH 113 id)")
+                book.skip(
+                    "exists", DETAIL_EXISTS, "already on the device (matched by its EXTH 113 id)"
+                )
+            elif placed_at is not None:
+                book.skip(
+                    "exists",
+                    DETAIL_EXISTS,
+                    f"this tool already put this file at {placed_at} and the device still "
+                    "holds it at that size (it carries no EXTH 113 id to match on)",
+                )
             elif device_path.casefold() in claimed:
                 book.fail(
                     "output_collision",
-                    f"{claimed[device_path.casefold()]} in this same run already "
-                    f"resolves to {device_path}",
+                    DETAIL_OUTPUT_COLLISION,
+                    f"{claimed[device_path.casefold()]} in this same run already resolves "
+                    f"to {device_path}",
                 )
-            elif device_path.casefold() in device_paths:
+            elif device_path.casefold() in occupied and device_path.casefold() not in ours:
                 book.fail(
                     "output_collision",
-                    f"{device_path} is already occupied on the device by a file that "
-                    "is not this book (no matching EXTH 113 id); refusing to "
-                    "overwrite it",
+                    DETAIL_OUTPUT_COLLISION,
+                    f"{device_path} is already occupied on the device by a file that is "
+                    "not this book; refusing to overwrite it",
                 )
             else:
                 claimed[device_path.casefold()] = str(source.path)
@@ -1740,7 +2066,9 @@ def run_add(
 
         # Free space is checked against the RUNNING total, not once against the sum:
         # a device with room for some of the books should place those and fail only
-        # the ones that genuinely no longer fit.
+        # the ones that genuinely no longer fit. `free_space()` RAISES rather than
+        # answering 0 when it cannot tell (both backends), so "0 left" here always
+        # means a genuinely full device.
         free_space = backend.free_space()
         remaining = free_space
         to_copy: list[_PlannedBook] = []
@@ -1748,186 +2076,166 @@ def run_add(
             if book.size > remaining:
                 book.fail(
                     "engine_error",
-                    f"not enough free space on the device: {format_size(book.size)} "
-                    f"needed, {format_size(remaining)} left",
+                    DETAIL_OUT_OF_SPACE,
+                    f"not enough free space on the device: {format_size(book.size)} needed, "
+                    f"{format_size(remaining)} left",
                 )
                 continue
             remaining -= book.size
             to_copy.append(book)
 
-        # --- copy ---------------------------------------------------------------
-        reporter.stage(stage="copy", index=4, count=len(stages))
-        written: list[str] = []
-        copied: list[_PlannedBook] = []
-        for index, book in enumerate(to_copy, start=1):
-            try:
-                backend.write(book.source.path, book.device_path)
-            except (RuntimeError, OSError) as error:
-                # Per book, never fatal to the batch: a full disk, a yanked cable, a
-                # `DeviceWriteProtected`, an MTP `CalibreError` — whatever it was, the
-                # books after this one still deserve their turn.
-                book.fail("engine_error", f"the device refused the write: {error}")
-                continue
-            written.append(book.device_path)
-            copied.append(book)
-            reporter.progress(
-                stage="copy",
-                index=index,
-                count=len(to_copy),
-                path=book.device_path,
-                percent=100.0 * index / len(to_copy),
+        if dry_run:
+            # Whatever survived planning WOULD be copied; `pending` is the honest
+            # status for that, the same one `thumbnails --dry-run` uses for a book it
+            # would attempt but cannot predict the outcome of. Everything else already
+            # has a real verdict, because every check above is read-only.
+            return _add_result(
+                reporter,
+                planned,
+                thumbnail_statuses={},
+                snapshot=None,
+                operation_id=None,
+                free_space=free_space,
+                queued=queued,
             )
 
-        # --- thumbnails ---------------------------------------------------------
-        reporter.stage(stage="thumbnails", index=5, count=len(stages))
-
-        def on_thumbnail_progress(done: int, total: int) -> None:
-            reporter.progress(
-                stage="thumbnails",
-                index=done,
-                count=total,
-                path=f"kindle:{key}",
-                percent=(100.0 * done / total) if total else 100.0,
-            )
-
-        thumbnail_statuses = thumbnails.install(
-            backend,
-            [
-                thumbnails.Book(
-                    device_path=book.device_path,
-                    book_id=book.book_id,
-                    cdetype=book.cdetype,
-                    # The copy we just sent IS the book — never fetch it back off the
-                    # device to read its embedded cover (one MTP round trip per book
-                    # instead of two, and identical bytes either way).
-                    local_path=book.source.path,
-                )
-                for book in copied
-            ],
-            cache_dir=root / ".cache",
-            on_progress=on_thumbnail_progress,
-        )
-        for book in copied:
-            status = thumbnail_statuses.get(book.book_id or book.device_path, "no_cover")
-            if status == "installed":
-                book.thumbnail = (
-                    f"{thumbnails.THUMBNAIL_DIR}"
-                    f"{thumbnails.thumbnail_name(book.book_id, book.cdetype)}"
-                )
-                written.append(book.thumbnail)
-            elif status == "rejected":
-                book.warnings.append("device_rejected_thumbnail")
-            # "no_cover"/"failed" carry no registered warning code of their own; the
-            # book is on the device regardless, so the outcome is reported in
-            # `result.data.thumbnails` rather than invented into the closed registry.
-
-        # --- verify -------------------------------------------------------------
-        reporter.stage(stage="verify", index=6, count=len(stages))
-        landed: dict[str, int] | None = None
-        verify_error: str | None = None
+        written: list[dict] = []
         try:
-            landed = {entry.path: entry.size for entry in backend.list_files(DOCUMENTS_DIR)}
-        except (RuntimeError, OSError) as error:
-            # Caught here rather than left to `_run`: every book already has an
-            # outcome, and letting this escape would replace them all with
-            # `_fail`'s all-zero "nothing was attempted" result, which would be a
-            # lie about a run that demonstrably wrote to the device.
-            verify_error = str(error)
-        for book in copied:
-            if landed is None:
-                book.fail(
-                    "engine_error",
-                    f"the device could not be listed to confirm the write: {verify_error}",
+            # --- copy -----------------------------------------------------------
+            reporter.stage(stage="copy", index=4, count=len(stages))
+            copied: list[_PlannedBook] = []
+            for index, book in enumerate(to_copy, start=1):
+                try:
+                    backend.write(book.source.path, book.device_path)
+                except (RuntimeError, OSError) as error:
+                    # Per book, never fatal to the batch: a full disk, a yanked cable,
+                    # a `DeviceWriteProtected`, an MTP `CalibreError` — whatever it
+                    # was, the books after this one still deserve their turn. A
+                    # `KeyboardInterrupt` is NOT caught here: it is not one book's
+                    # problem, and the outer guard journals what already landed.
+                    book.fail(
+                        "engine_error",
+                        DETAIL_WRITE_REFUSED,
+                        f"the device refused the write: {error}",
+                    )
+                    continue
+                written.append(book.provenance(_source_digest(book.source.path)))
+                copied.append(book)
+                reporter.progress(
+                    stage="copy",
+                    index=index,
+                    count=len(to_copy),
+                    path=book.device_path,
+                    percent=100.0 * index / len(to_copy),
                 )
-                continue
-            size = landed.get(book.device_path)
-            if size is None:
-                book.fail(
-                    "engine_error",
-                    "the device accepted the write but the file is not on it afterwards",
-                )
-            elif size != book.size:
-                book.fail(
-                    "engine_error",
-                    f"the file on the device is {format_size(size)}, not the "
-                    f"{format_size(book.size)} that was sent",
-                )
-            else:
-                book.succeed()
 
-        # --- journal ------------------------------------------------------------
-        operation_id = None
-        if written:
-            # Everything this run actually put on the device — books AND their
-            # thumbnails, including a book the verify stage then failed, because it is
-            # on the device either way and an undo has to know about it.
-            operation_id = backup_module.journal_append(
-                root,
-                key,
-                {
-                    "op": "add",
-                    "paths": written,
-                    "books": [book.device_path for book in copied],
-                    "snapshot": snap.path.name,
-                },
+            # --- thumbnails -------------------------------------------------------
+            reporter.stage(stage="thumbnails", index=5, count=len(stages))
+
+            def on_thumbnail_progress(done: int, total: int) -> None:
+                reporter.progress(
+                    stage="thumbnails",
+                    index=done,
+                    count=total,
+                    path=f"kindle:{key}",
+                    percent=(100.0 * done / total) if total else 100.0,
+                )
+
+            thumbnail_statuses = thumbnails.install(
+                backend,
+                [
+                    thumbnails.Book(
+                        device_path=book.device_path,
+                        book_id=book.book_id,
+                        cdetype=book.cdetype,
+                        # The copy we just sent IS the book — never fetch it back off
+                        # the device to read its embedded cover (one MTP round trip per
+                        # book instead of two, and identical bytes either way).
+                        local_path=book.source.path,
+                    )
+                    for book in copied
+                ],
+                cache_dir=root / ".cache",
+                on_progress=on_thumbnail_progress,
             )
+            for record, book in zip(written, copied, strict=True):
+                status = thumbnail_statuses.get(book.book_id or book.device_path, "no_cover")
+                if status == "installed":
+                    book.thumbnail = (
+                        f"{thumbnails.THUMBNAIL_DIR}"
+                        f"{thumbnails.thumbnail_name(book.book_id, book.cdetype)}"
+                    )
+                    record["thumbnail"] = book.thumbnail
+                elif status == "rejected":
+                    book.warnings.append("device_rejected_thumbnail")
+                # "no_cover"/"failed" carry no registered warning code of their own;
+                # the book is on the device regardless, so the outcome is reported in
+                # `result.data.thumbnails` rather than invented into the registry.
 
-        counts = {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0}
-        failed: list[dict] = []
-        outputs: list[str] = []
-        # Every book above is settled by exactly one fail()/skip()/succeed() call, so
-        # this stays empty — it is built from the same source as `counts` rather than
-        # hardcoded to `[]`, so that a future path that DOES leave a book unsettled
-        # shows up as a `pending` entry instead of as a count with nothing behind it.
-        pending = [str(book.source.path) for book in planned if book.status == "pending"]
-        for book in planned:
-            counts["total"] += 1
-            counts[book.status] += 1
-            item_outputs = [book.device_path] if book.status == "done" else []
-            if book.status == "done":
-                outputs.append(book.device_path)
-            if book.status == "failed":
-                failed.append(
-                    {
-                        "id": book.id,
-                        "input": str(book.source.path),
-                        "reason": book.reason,
-                        "detail": book.detail,
-                    }
-                )
-            reporter.item(
-                id=book.id,
-                status=book.status,
-                input=str(book.source.path),
-                outputs=item_outputs,
-                bytes_in=book.size or None,
-                bytes_out=book.size if book.status == "done" else None,
-                reason=book.reason,
-                warnings=book.warnings,
-            )
+            # --- verify -----------------------------------------------------------
+            reporter.stage(stage="verify", index=6, count=len(stages))
+            landed: dict[str, int] | None = None
+            verify_error: str | None = None
+            try:
+                landed = {entry.path: entry.size for entry in backend.list_files(DOCUMENTS_DIR)}
+            except (RuntimeError, OSError) as error:
+                # Caught here rather than left to `_run`: every book already has an
+                # outcome, and letting this escape would replace them all with
+                # `_fail`'s all-zero "nothing was attempted" result, which would be a
+                # lie about a run that demonstrably wrote to the device.
+                verify_error = str(error)
+            for book in copied:
+                if landed is None:
+                    book.fail(
+                        "engine_error",
+                        DETAIL_VERIFY_FAILED,
+                        f"the device could not be listed to confirm the write: {verify_error}",
+                    )
+                    continue
+                size = landed.get(book.device_path)
+                if size is None:
+                    book.fail(
+                        "engine_error",
+                        DETAIL_VERIFY_FAILED,
+                        "the device accepted the write but the file is not on it afterwards",
+                    )
+                elif size != book.size:
+                    book.fail(
+                        "engine_error",
+                        DETAIL_SHORT_WRITE,
+                        f"the file on the device is {format_size(size)}, not the "
+                        f"{format_size(book.size)} that was sent",
+                    )
+                else:
+                    book.succeed()
+        except BaseException:
+            # `BaseException`, because the realistic case is `KeyboardInterrupt`:
+            # `MassStorageBackend.write` re-raises it after removing its own temp file,
+            # and without this the books already on the device would have no record of
+            # how they got there while `_run` reported all-zero counts. The journal is
+            # best-effort HERE only — a second failure while writing it must not
+            # replace the exception the user actually needs to see (and, for a
+            # `KeyboardInterrupt`, would cost `_run` its exit-130 mapping too).
+            with contextlib.suppress(Exception):
+                _journal_add(root, key, written, snap.path.name)
+            raise
 
-        ok = not failed
-        return {
-            "ok": ok,
-            "exit_code": EXIT_OK if ok else EXIT_FAILED,
-            "counts": counts,
-            "failed": failed,
-            "pending": pending,
-            "outputs": outputs,
-            "run_file": None,
-            "data": {
-                "books": [book.as_dict() for book in planned],
-                "thumbnails": thumbnail_statuses,
-                # The same shape `backup`/`status`/`thumbnails` report for a snapshot,
-                # never a second hand-built dict (see `_snapshot_summary`).
-                "snapshot": _snapshot_summary(snap.path, fallback=snap),
-                # What Task 8's `restore --op ID` undoes; `None` when this run put
-                # nothing on the device at all.
-                "operation": operation_id,
-                "free_space": free_space,
-                "bytes_planned": sum(book.size for book in queued),
-            },
-        }
+        # --- journal --------------------------------------------------------------
+        # Last on the happy path, exactly as the order of operations pins it. A
+        # failure writing it DOES escape here (unlike in the guard above): there is no
+        # other exception competing for the user's attention, and a run that wrote to
+        # the device without recording it is not a success.
+        operation_id = _journal_add(root, key, written, snap.path.name)
+
+        return _add_result(
+            reporter,
+            planned,
+            thumbnail_statuses=thumbnail_statuses,
+            snapshot=snap,
+            operation_id=operation_id,
+            free_space=free_space,
+            queued=queued,
+        )
 
     return _run(
         args,
@@ -1939,3 +2247,75 @@ def run_add(
         backend_factory=backend_factory or default_backend_factory,
         body=body,
     )
+
+
+def _add_result(
+    reporter: Reporter,
+    planned: list[_PlannedBook],
+    *,
+    thumbnail_statuses: dict[str, str],
+    snapshot: backup_module.Snapshot | None,
+    operation_id: str | None,
+    free_space: int,
+    queued: list[_PlannedBook],
+) -> dict:
+    """Emit one `item` per planned book and build `body`'s return value.
+
+    Shared by the real run and `--dry-run` so the two cannot report different shapes
+    for the same book: an agent parsing either gets the same keys, with a missing
+    VALUE (`snapshot: null`, `operation: null`, `thumbnails: {}`) where a dry run has
+    nothing to say rather than a missing key.
+    """
+    counts = {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0}
+    failed: list[dict] = []
+    outputs: list[str] = []
+    pending = [str(book.source.path) for book in planned if book.status == "pending"]
+    for book in planned:
+        counts["total"] += 1
+        counts[book.status] += 1
+        item_outputs = [book.device_path] if book.status == "done" else []
+        if book.status == "done":
+            outputs.append(book.device_path)
+        if book.status == "failed":
+            failed.append(
+                {
+                    "id": book.id,
+                    "input": str(book.source.path),
+                    "reason": book.reason,
+                    "detail": book.detail,
+                }
+            )
+        reporter.item(
+            id=book.id,
+            status=book.status,
+            input=str(book.source.path),
+            outputs=item_outputs,
+            bytes_in=book.size or None,
+            bytes_out=book.size if book.status == "done" else None,
+            reason=book.reason,
+            detail=book.detail,
+            warnings=book.warnings,
+        )
+
+    ok = not failed
+    return {
+        "ok": ok,
+        "exit_code": EXIT_OK if ok else EXIT_FAILED,
+        "counts": counts,
+        "failed": failed,
+        "pending": pending,
+        "outputs": outputs,
+        "run_file": None,
+        "data": {
+            "books": [book.as_dict() for book in planned],
+            "thumbnails": thumbnail_statuses,
+            # The same shape `backup`/`status`/`thumbnails` report for a snapshot,
+            # never a second hand-built dict (see `_snapshot_summary`).
+            "snapshot": _snapshot_summary(snapshot.path, fallback=snapshot) if snapshot else None,
+            # What Task 8's `restore --op ID` undoes; `None` when this run put nothing
+            # on the device at all.
+            "operation": operation_id,
+            "free_space": free_space,
+            "bytes_planned": sum(book.size for book in queued),
+        },
+    }

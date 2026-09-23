@@ -1048,7 +1048,9 @@ def test_backup_failure_maps_to_backup_failed_and_exits_1_not_3(fake_kindle, tmp
     # misreport a run that demonstrably did fail an item.
     assert result["counts"] == {"total": 1, "done": 0, "skipped": 0, "failed": 1, "pending": 0}
     assert result["failed"] == [
-        {"id": 1, "input": f"kindle:{kindle.serial}", "reason": "engine_error"}
+        # `detail` is present-but-null on every failed entry this subsystem
+        # emits, so one parser reads `backup`, `thumbnails` and `add` alike.
+        {"id": 1, "input": f"kindle:{kindle.serial}", "reason": "engine_error", "detail": None}
     ]
     assert any(e.get("code") == "backup_failed" for e in events if e["type"] == "error")
     item_events = [e for e in events if e["type"] == "item"]
@@ -1276,7 +1278,9 @@ def test_thumbnails_isolates_a_per_book_device_fault_and_still_installs_the_rest
     assert result["ok"] is False
     assert result["counts"]["failed"] == 1
     assert result["counts"]["done"] == 1
-    assert result["failed"] == [{"id": 3, "input": PT_PATH, "reason": "engine_error"}]
+    assert result["failed"] == [
+        {"id": 3, "input": PT_PATH, "reason": "engine_error", "detail": None}
+    ]
 
     item_events = {e["input"]: e for e in events if e["type"] == "item"}
     assert item_events[PT_PATH]["status"] == "failed"

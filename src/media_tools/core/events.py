@@ -136,8 +136,26 @@ class Reporter:
         self._say(f"  ({index}/{count}) {path} {percent:.0f}%")
 
     def item(
-        self, *, id, status, input, outputs, bytes_in, bytes_out=None, reason=None, warnings=None
+        self,
+        *,
+        id,
+        status,
+        input,
+        outputs,
+        bytes_in,
+        bytes_out=None,
+        reason=None,
+        detail=None,
+        warnings=None,
     ) -> None:
+        """One finished item. `detail` is free text that NARROWS `reason`, for the
+        cases where the closed registry has one code covering several distinct causes
+        (`ebook kindle add`'s `engine_error`: out of space, a short write, a refused
+        write, a failed verification). It is emitted on every `item`, `null` for every
+        task that has nothing to add, so an agent parsing this event always gets a
+        missing VALUE rather than a missing KEY — and a producer that uses it must
+        start it with a stable, documented prefix, because free English prose is
+        exactly what a machine-readable `reason` exists to avoid."""
         self._check(status, ITEM_STATUSES, "item status")
         self._check(reason, REASONS, "reason")
         for code in warnings or []:
@@ -151,10 +169,13 @@ class Reporter:
             bytes_in=bytes_in,
             bytes_out=bytes_out,
             reason=reason,
+            detail=detail,
             warnings=list(warnings or []),
         )
         size = f" {format_size(bytes_in)}→{format_size(bytes_out)}" if bytes_out else ""
-        note = f" ({reason})" if reason else ""
+        # `detail` when there is one: "engine_error" tells a human nothing, while
+        # "out_of_space: ..." tells them what to do about it.
+        note = f" ({detail or reason})" if (detail or reason) else ""
         self._say(f"  {_MARKS[status]} {redact(str(input))}{size}{note}")
 
     def warning(self, *, code, message) -> None:

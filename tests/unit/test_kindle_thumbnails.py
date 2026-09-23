@@ -256,6 +256,58 @@ def test_install_isolates_a_per_book_device_fault_and_still_reports_the_rest(tmp
     }
 
 
+def test_a_host_side_failure_outside_the_write_is_isolated_per_book_too(tmp_path, monkeypatch):
+    """`install()` promises no per-book fault escapes, but four statements used to sit
+    OUTSIDE any handler: locating ffmpeg, creating the scratch directory, stat-ing a
+    cached cover and writing an extracted one. A full host `/tmp` is enough to hit
+    them, and for `ebook kindle add` an escape there happens AFTER books are already
+    on the device but BEFORE the journal records them. Here the scratch directory
+    itself refuses to be created."""
+    monkeypatch.setattr(thumbnails, "_resize", _stub_resize)
+    cache_dir = tmp_path / "cache"
+    for book_id in ("GOODBOOK0001", "GOODBOOK0002"):
+        cache_path(cache_dir, book_id).parent.mkdir(parents=True, exist_ok=True)
+        cache_path(cache_dir, book_id).write_bytes(_FAKE_JPEG + b"9" * 2000)
+
+    real_temporary_directory = thumbnails.tempfile.TemporaryDirectory
+    calls = {"n": 0}
+
+    def flaky_temporary_directory(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(28, "No space left on device")
+        return real_temporary_directory(*args, **kwargs)
+
+    monkeypatch.setattr(thumbnails.tempfile, "TemporaryDirectory", flaky_temporary_directory)
+
+    books = [
+        thumbnails.Book(device_path="documents/en/A.azw3", book_id="GOODBOOK0001"),
+        thumbnails.Book(device_path="documents/en/B.azw3", book_id="GOODBOOK0002"),
+    ]
+    statuses = thumbnails.install(FakeBackend(), books, cache_dir=cache_dir)
+
+    assert statuses == {"GOODBOOK0001": "failed", "GOODBOOK0002": "installed"}
+
+
+def test_an_unlocatable_ffmpeg_fails_the_books_instead_of_escaping(tmp_path, monkeypatch):
+    """`ffmpeg_exe()` used to run once, before the loop and outside every handler, so
+    a broken imageio-ffmpeg install aborted the whole batch by raising out of
+    `install()`. It is now resolved inside the per-book guard."""
+
+    def no_ffmpeg() -> str:
+        raise RuntimeError("no ffmpeg anywhere")
+
+    monkeypatch.setattr(thumbnails, "ffmpeg_exe", no_ffmpeg)
+    cache_dir = tmp_path / "cache"
+    cache_path(cache_dir, "GOODBOOK0001").parent.mkdir(parents=True, exist_ok=True)
+    cache_path(cache_dir, "GOODBOOK0001").write_bytes(_FAKE_JPEG + b"9" * 2000)
+
+    book = thumbnails.Book(device_path="documents/en/A.azw3", book_id="GOODBOOK0001")
+    assert thumbnails.install(FakeBackend(), [book], cache_dir=cache_dir) == {
+        "GOODBOOK0001": "failed"
+    }
+
+
 # --- install: no EXTH 113 at all ---------------------------------------------------
 
 

@@ -437,6 +437,23 @@ def test_free_space_and_eject_each_send_their_own_op(device):
     assert [call[0]["op"] for call in runner.calls] == ["free", "eject"]
 
 
+@pytest.mark.parametrize("answer", [{}, {"free": None}, {"free": "lots"}, {"free": -1}])
+def test_free_space_raises_rather_than_answering_zero_when_the_helper_cannot_say(device, answer):
+    """The C1/I3 rule, applied to free space: a check that cannot be resolved into a
+    definite number must not answer as if it had checked. `0` is a real answer ("the
+    device is full") that `ebook kindle add` acts on by refusing to copy anything, so a
+    driver that said nothing must not be indistinguishable from a full Kindle."""
+    runner = FakeRunner(results({"op": "free", "ok": True, **answer}))
+    with pytest.raises(CalibreError) as error:
+        backend(device, runner).free_space()
+    assert "free space" in str(error.value)
+
+
+def test_free_space_still_reports_a_genuinely_full_device_as_zero(device):
+    runner = FakeRunner(results({"op": "free", "ok": True, "free": 0}))
+    assert backend(device, runner).free_space() == 0
+
+
 def test_exists_uses_the_cached_listing_when_there_is_one(device):
     runner = FakeRunner(results(listing(("documents/en/A Book.azw3", 1, 1.0))))
     device_backend = backend(device, runner)
@@ -1126,7 +1143,22 @@ def test_the_helper_makes_a_directory(helper, tree):
 def test_free_space_accepts_a_list_or_a_bare_integer(helper, tree):
     assert helper._op_free(StubDevice(tree, free=4096), {})["free"] == 4096
     assert helper._op_free(StubDevice(tree, free=[8192, 0, 0]), {})["free"] == 8192
-    assert helper._op_free(StubDevice(tree, free=[]), {})["free"] == 0
+    # A genuinely full device is a real, actionable answer and stays one.
+    assert helper._op_free(StubDevice(tree, free=0), {})["free"] == 0
+
+
+@pytest.mark.parametrize("unanswerable", [[], None, "lots", -1])
+def test_a_driver_that_cannot_report_free_space_fails_instead_of_answering_zero(
+    helper, tree, unanswerable
+):
+    """`0` means "this device is full", which a caller acts on by refusing to copy.
+    A driver that said nothing is not that, and collapsing the two makes
+    `ebook kindle add` tell a user with gigabytes free that their Kindle is full —
+    after its mandatory backup has already run. Same rule `exists` follows."""
+    result = helper._op_free(StubDevice(tree, free=unanswerable), {})
+    assert result["ok"] is False
+    assert result["code"] == "free_space_unknown"
+    assert "free" not in result
 
 
 def test_eject_is_a_no_op_because_mtp_has_nothing_to_eject(helper, tree):

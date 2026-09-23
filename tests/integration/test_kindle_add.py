@@ -27,6 +27,8 @@ from media_tools.tasks.ebook.covers import cache_path
 from media_tools.tasks.ebook.kindle import backup as backup_module
 from media_tools.tasks.ebook.kindle import cli as kindle_cli
 from media_tools.tasks.ebook.kindle import massstorage
+from media_tools.tasks.ebook.kindle.backend import DeviceFile, validate_writable_path
+from media_tools.tasks.ebook.kindle.detect import Device
 
 BLADE_ID = "BLADEITSELF00001"
 LIVRO_ID = "UMLIVRO000000001"
@@ -544,10 +546,13 @@ def test_a_device_with_too_little_space_fails_the_big_book_and_still_places_the_
     result = events[-1]
     assert result["ok"] is False
     assert result["counts"] == {"total": 2, "done": 1, "skipped": 0, "failed": 1, "pending": 0}
-    # The registry has no "out of space" reason, so the human-readable cause rides
-    # along on the result's own `failed` entry instead of being lost.
+    # The registry has no "out of space" reason, so the cause rides along on `detail`
+    # — behind a STABLE PREFIX, so an agent branches on a term instead of
+    # substring-matching English prose.
     failed = next(entry for entry in result["failed"] if entry["input"] == str(big))
-    assert "space" in failed["detail"].lower()
+    assert failed["detail"].startswith(f"{kindle_cli.DETAIL_OUT_OF_SPACE}: ")
+    # And the same detail is on the streaming surface, not only in the summary.
+    assert items[str(big)]["detail"] == failed["detail"]
 
 
 def test_a_thumbnail_the_device_discards_warns_but_never_fails_the_book(
@@ -951,3 +956,623 @@ def test_an_illegal_fat32_name_is_sanitised_and_the_whole_device_path_is_capped(
     assert name.endswith(".azw3")
     # The FULL device path, not just the name component, is what FAT32/MTP cap.
     assert len(f"documents/en/{name}") <= kindle_cli.MAX_DEVICE_PATH["mass_storage"]
+
+
+# --- `detail` is a machine-readable vocabulary, not prose ------------------------------
+
+
+def test_every_detail_this_command_produces_starts_with_a_vocabulary_term(
+    fake_kindle, tmp_path, capsys
+):
+    """One run that hits four different causes at once. The closed registry has a
+    single `engine_error` covering several of them, so the term before the colon is
+    what an agent branches on — and it must be one of a known, finite set."""
+    root = tmp_path / "media"
+    books = tmp_path / "books"
+    gone = books / "Vanished.azw3"
+    gone.parent.mkdir(parents=True, exist_ok=True)
+    first = _plant_source(
+        books, "Twin.azw3", book_id="TWINONE000000001", title="One", author="A", language="en"
+    )
+    second_dir = tmp_path / "other"
+    second = _plant_source(
+        second_dir, "Twin.azw3", book_id="TWINTWO000000001", title="Two", author="B", language="en"
+    )
+    big = _plant_source(
+        books,
+        "Huge.azw3",
+        book_id="HUGEBOOK00000001",
+        title="Huge",
+        author="C",
+        language="en",
+        padding=40_000,
+    )
+
+    args = _add_args(root, str(gone), str(first), str(second), str(big))
+    # `gone` must exist at argument-validation time and vanish before the plan reads
+    # it — the window `source_missing` is about.
+    gone.write_bytes(_mobi_bytes(book_id="GONEBOOK00000001", title="Gone", language="en"))
+
+    def finder():
+        gone.unlink()
+        return fake_kindle
+
+    exit_code = kindle_cli.run_add(
+        args,
+        device_finder=finder,
+        backend_factory=lambda d, *, cache_dir: _FixedFreeSpaceBackend(d.mount, free=5_000),
+    )
+    assert exit_code == EXIT_FAILED
+
+    events = _events(capsys)
+    items = {e["input"]: e for e in events if e["type"] == "item"}
+    terms = {
+        path: item["detail"].split(":", 1)[0]
+        for path, item in items.items()
+        if item["detail"] is not None
+    }
+    assert terms[str(gone)] == kindle_cli.DETAIL_SOURCE_MISSING
+    assert terms[str(second)] == kindle_cli.DETAIL_OUTPUT_COLLISION
+    assert terms[str(big)] == kindle_cli.DETAIL_OUT_OF_SPACE
+    assert set(terms.values()) <= kindle_cli.DETAIL_TERMS
+    # `first` was placed, so it has no detail at all — present as a key, null as a
+    # value, never absent.
+    assert items[str(first)]["detail"] is None
+
+
+def test_an_unknown_detail_term_is_refused_the_way_an_unknown_reason_is():
+    """The vocabulary is only useful if it cannot be typo'd into something an agent
+    silently stops matching — the same reason `Reporter` refuses an unknown `reason`."""
+    with pytest.raises(KeyError):
+        kindle_cli._detail("out-of-space", "close, but not the term")
+
+
+# --- provenance: an id-less book is recognised on a re-run -------------------------------
+
+
+def test_a_re_added_epub_is_skipped_by_provenance_not_refused_as_a_collision(
+    fake_kindle, tmp_path, capsys
+):
+    """An `.epub` carries no EXTH 113, so the id check cannot recognise it. The
+    journal says this tool put this exact file at this exact path, and the device
+    still holds it at the size it was sent — the CONJUNCTION, which is provenance, not
+    a filename comparison. Neither half alone would do: the journal alone would skip a
+    book the user has since deleted, and the listing alone is a name match."""
+    root = tmp_path / "media"
+    source = tmp_path / "books" / "Some Book.epub"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"PK\x03\x04" + b"epub bytes" * 40)
+
+    first = kindle_cli.run_add(
+        _add_args(root, str(source)),
+        device_finder=lambda: fake_kindle,
+        backend_factory=_mass_storage_factory,
+    )
+    assert first == EXIT_OK
+    landed = fake_kindle.mount / "documents" / kindle_cli.UNKNOWN_LANGUAGE / "Some Book.epub"
+    assert landed.is_file()
+    capsys.readouterr()
+
+    second = kindle_cli.run_add(
+        _add_args(root, str(source)),
+        device_finder=lambda: fake_kindle,
+        backend_factory=_mass_storage_factory,
+    )
+    assert second == EXIT_OK
+    item = next(e for e in _events(capsys) if e["type"] == "item")
+    assert item["status"] == "skipped"
+    assert item["reason"] == "exists"
+    assert item["detail"].startswith(f"{kindle_cli.DETAIL_EXISTS}: ")
+
+
+def test_provenance_does_not_skip_a_book_the_user_has_since_deleted(fake_kindle, tmp_path, capsys):
+    """The listing half of the conjunction. The journal still remembers the placement;
+    the device no longer has the file, so it is copied again."""
+    root = tmp_path / "media"
+    source = tmp_path / "books" / "Some Book.epub"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"PK\x03\x04" + b"epub bytes" * 40)
+
+    assert (
+        kindle_cli.run_add(
+            _add_args(root, str(source)),
+            device_finder=lambda: fake_kindle,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+    landed = fake_kindle.mount / "documents" / kindle_cli.UNKNOWN_LANGUAGE / "Some Book.epub"
+    landed.unlink()
+    capsys.readouterr()
+
+    assert (
+        kindle_cli.run_add(
+            _add_args(root, str(source)),
+            device_finder=lambda: fake_kindle,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+    item = next(e for e in _events(capsys) if e["type"] == "item")
+    assert item["status"] == "done"
+    assert landed.is_file()
+
+
+def test_a_short_write_is_copied_again_on_the_next_run_not_skipped(fake_kindle, tmp_path, capsys):
+    """The journal records the size that was SENT, so a book that landed short fails
+    the conjunction next time instead of being mistaken for a completed placement."""
+    root = tmp_path / "media"
+    source = tmp_path / "books" / "Some Book.epub"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"PK\x03\x04" + b"epub bytes" * 40)
+
+    assert (
+        kindle_cli.run_add(
+            _add_args(root, str(source)),
+            device_finder=lambda: fake_kindle,
+            backend_factory=lambda d, *, cache_dir: _ShortWriteBackend(d.mount),
+        )
+        == EXIT_FAILED
+    )
+    capsys.readouterr()
+
+    assert (
+        kindle_cli.run_add(
+            _add_args(root, str(source)),
+            device_finder=lambda: fake_kindle,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+    item = next(e for e in _events(capsys) if e["type"] == "item")
+    assert item["status"] == "done"
+    landed = fake_kindle.mount / "documents" / kindle_cli.UNKNOWN_LANGUAGE / "Some Book.epub"
+    assert landed.read_bytes() == source.read_bytes()
+
+
+# --- an interrupted run still records what it put on the device --------------------------
+
+
+class _InterruptingBackend:
+    """Writes the first book, then raises `KeyboardInterrupt` — exactly what
+    `MassStorageBackend.write` re-raises when a user hits Ctrl+C mid-copy."""
+
+    def __init__(self, mount: Path, *, after: int = 1) -> None:
+        self._inner = massstorage.MassStorageBackend(mount)
+        self._after = after
+        self.writes = 0
+
+    def list_files(self, prefix: str = ""):
+        return self._inner.list_files(prefix)
+
+    def read(self, path: str, dest: Path) -> None:
+        self._inner.read(path, dest)
+
+    def read_many(self, items) -> None:
+        self._inner.read_many(items)
+
+    def write(self, local: Path, path: str) -> None:
+        self.writes += 1
+        if self.writes > self._after:
+            raise KeyboardInterrupt
+        self._inner.write(local, path)
+
+    def remove(self, path: str) -> None:
+        self._inner.remove(path)
+
+    def exists(self, path: str) -> bool:
+        return self._inner.exists(path)
+
+    def free_space(self) -> int:
+        return self._inner.free_space()
+
+    def eject(self) -> None:
+        self._inner.eject()
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def test_an_interrupted_add_still_journals_the_books_it_already_placed(
+    fake_kindle, tmp_path, capsys
+):
+    """Ctrl+C between the first successful write and the journal line used to leave
+    books on the device with no record of how they got there, while the run reported
+    all-zero counts and `outputs: []` — nothing for a later `restore --op` to undo."""
+    root = tmp_path / "media"
+    books = tmp_path / "books"
+    first = _plant_source(
+        books, "First.azw3", book_id="FIRSTBOOK0000001", title="First", author="A", language="en"
+    )
+    second = _plant_source(
+        books, "Second.azw3", book_id="SECONDBOOK000001", title="Second", author="B", language="en"
+    )
+
+    exit_code = kindle_cli.run_add(
+        _add_args(root, str(first), str(second)),
+        device_finder=lambda: fake_kindle,
+        backend_factory=lambda d, *, cache_dir: _InterruptingBackend(d.mount, after=1),
+    )
+    assert exit_code == 130
+
+    events = _events(capsys)
+    assert any(e["type"] == "error" and e["code"] == "interrupted" for e in events)
+    assert events[-1]["type"] == "result"
+
+    # The first book really is on the device...
+    assert (fake_kindle.mount / "documents" / "en" / "First.azw3").is_file()
+    assert not (fake_kindle.mount / "documents" / "en" / "Second.azw3").exists()
+    # ...and the journal says so, which is the whole point.
+    entries = backup_module.journal_read(root, fake_kindle.serial)
+    assert len(entries) == 1
+    assert entries[0]["paths"] == ["documents/en/First.azw3"]
+    assert entries[0]["books"][0]["source"] == str(first.resolve())
+    assert entries[0]["books"][0]["size"] == first.stat().st_size
+    assert len(entries[0]["books"][0]["sha256"]) == 64
+
+
+# --- --dry-run ------------------------------------------------------------------------------
+
+
+def test_dry_run_reports_a_plan_takes_no_backup_and_writes_nothing(fake_kindle, tmp_path, capsys):
+    root = tmp_path / "media"
+    books = tmp_path / "books"
+    new_book = _plant_source(
+        books, "New Book.azw3", book_id="NEWBOOK000000001", title="New", author="A", language="en"
+    )
+    # A second source that the device already holds, so the plan has both verdicts.
+    (fake_kindle.mount / "documents" / "en" / "Already There.azw3").write_bytes(
+        _mobi_bytes(book_id="OLDBOOK000000001", title="Old", author="B", language="en")
+    )
+    known = _plant_source(
+        books, "Known.azw3", book_id="OLDBOOK000000001", title="Old", author="B", language="en"
+    )
+
+    exit_code = kindle_cli.run_add(
+        _add_args(root, str(new_book), str(known), "--dry-run"),
+        device_finder=lambda: fake_kindle,
+        backend_factory=_mass_storage_factory,
+    )
+    assert exit_code == EXIT_OK
+
+    events = _events(capsys)
+    assert [e["stage"] for e in events if e["type"] == "stage"] == ["detect", "plan"]
+    items = {e["input"]: e for e in events if e["type"] == "item"}
+    assert items[str(new_book)]["status"] == "pending"
+    assert items[str(known)]["status"] == "skipped"
+    assert items[str(known)]["reason"] == "exists"
+
+    result = events[-1]
+    assert result["pending"] == [str(new_book)]
+    # The same keys a real run reports, with a missing VALUE where a dry run has
+    # nothing to say — never a missing key.
+    assert result["data"]["snapshot"] is None
+    assert result["data"]["operation"] is None
+    assert result["data"]["thumbnails"] == {}
+
+    # Nothing was written to the DEVICE, and no backup was taken. (Host-side
+    # planning caches under `_kindle/<serial>/.cache/` are still filled, exactly as
+    # `thumbnails --dry-run` fills its own — they are reads, not writes.)
+    assert not (fake_kindle.mount / "documents" / "en" / "New Book.azw3").exists()
+    assert not (root / "_kindle" / fake_kindle.serial / "backups").exists()
+    assert backup_module.journal_read(root, fake_kindle.serial) == []
+
+
+# --- MTP: no mount, a tighter path budget, and one index instead of a rescan ---------------
+
+
+class _FakeMtpBackend:
+    """Enough of `DeviceBackend` for `add` over MTP, backed by an in-memory
+    `{path: bytes}` map. Records every `read_many` call so a test can prove `add` does
+    NOT re-fetch the whole library to collect EXTH ids on a second run."""
+
+    def __init__(self, files: dict[str, bytes] | None = None, *, free: int = 10_000_000) -> None:
+        self.files = dict(files or {})
+        self._free = free
+        self.read_many_calls: list[list[str]] = []
+
+    def list_files(self, prefix: str = ""):
+        entries = [
+            DeviceFile(path=path, size=len(data), mtime=1_700_000_000.0)
+            for path, data in sorted(self.files.items())
+        ]
+        if not prefix:
+            return entries
+        head = prefix.strip("/")
+        return [e for e in entries if e.path == head or e.path.startswith(f"{head}/")]
+
+    def read(self, path: str, dest: Path) -> None:
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        Path(dest).write_bytes(self.files[path])
+
+    def read_many(self, items) -> None:
+        self.read_many_calls.append([path for path, _dest in items])
+        for path, dest in items:
+            self.read(path, dest)
+
+    def write(self, local: Path, path: str) -> None:
+        validate_writable_path(path)
+        self.files[path] = Path(local).read_bytes()
+
+    def remove(self, path: str) -> None:
+        del self.files[path]
+
+    def exists(self, path: str) -> bool:
+        return path in self.files
+
+    def free_space(self) -> int:
+        return self._free
+
+    def eject(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _mtp_device(serial: str = "MTPTESTSERIAL01", mode: str = "mtp") -> Device:
+    return Device(serial=serial, product_id=0x9981, mode=mode, mount=None)
+
+
+def test_add_over_mtp_places_books_without_a_mount(tmp_path, capsys, ffmpeg_path):
+    """MTP has no mounted filesystem at all, so every device read goes through the
+    backend — including reading the existing books' EXTH ids, which needs a local copy
+    of each one first."""
+    root = tmp_path / "media"
+    on_device = _mobi_bytes(book_id="ONDEVICE00000001", title="On Device", language="en")
+    backend = _FakeMtpBackend({"documents/en/Already.azw3": on_device})
+    device = _mtp_device()
+
+    source = _plant_source(
+        tmp_path / "books",
+        "Brand New.azw3",
+        book_id="BRANDNEW00000001",
+        title="Brand New",
+        author="A",
+        language="en",
+    )
+    _plant_cover(root, "BRANDNEW00000001", ffmpeg_path)
+
+    exit_code = kindle_cli.run_add(
+        _add_args(root, str(source)),
+        device_finder=lambda: device,
+        backend_factory=lambda d, *, cache_dir: backend,
+    )
+    assert exit_code == EXIT_OK
+    assert backend.files["documents/en/Brand New.azw3"] == source.read_bytes()
+    assert "system/thumbnails/thumbnail_BRANDNEW00000001_EBOK_portrait.jpg" in backend.files
+    assert _events(capsys)[-1]["counts"]["done"] == 1
+
+
+def test_add_over_mtp_skips_a_book_already_there_by_its_id(tmp_path, capsys):
+    root = tmp_path / "media"
+    backend = _FakeMtpBackend(
+        {
+            "documents/en/Named Nothing Like It.azw3": _mobi_bytes(
+                book_id="SAMEBOOK00000001", title="Same", language="en"
+            )
+        }
+    )
+    source = _plant_source(
+        tmp_path / "books",
+        "Some Book.azw3",
+        book_id="SAMEBOOK00000001",
+        title="Same",
+        author="A",
+        language="en",
+    )
+    exit_code = kindle_cli.run_add(
+        _add_args(root, str(source)),
+        device_finder=lambda: _mtp_device(),
+        backend_factory=lambda d, *, cache_dir: backend,
+    )
+    assert exit_code == EXIT_OK
+    item = next(e for e in _events(capsys) if e["type"] == "item")
+    assert item["status"] == "skipped"
+    assert item["reason"] == "exists"
+    assert "documents/en/Some Book.azw3" not in backend.files
+
+
+def test_add_over_mtp_reads_each_device_book_once_not_once_per_run(tmp_path, capsys, ffmpeg_path):
+    """`exth.read_records` needs a book's header but reads the WHOLE file to reach it,
+    so collecting the device's ids the naive way re-fetches the entire library over MTP
+    every time one book is added. A persistent index makes the second run fetch only
+    what is genuinely new to it."""
+    root = tmp_path / "media"
+    backend = _FakeMtpBackend(
+        {
+            "documents/en/One.azw3": _mobi_bytes(book_id="DEVICEONE0000001", language="en"),
+            "documents/en/Two.azw3": _mobi_bytes(book_id="DEVICETWO0000001", language="en"),
+        }
+    )
+    device = _mtp_device()
+    first_source = _plant_source(
+        tmp_path / "books",
+        "A.azw3",
+        book_id="AAAA000000000001",
+        title="A",
+        author="A",
+        language="en",
+    )
+    second_source = _plant_source(
+        tmp_path / "books",
+        "B.azw3",
+        book_id="BBBB000000000001",
+        title="B",
+        author="B",
+        language="en",
+    )
+
+    assert (
+        kindle_cli.run_add(
+            _add_args(root, str(first_source)),
+            device_finder=lambda: device,
+            backend_factory=lambda d, *, cache_dir: backend,
+        )
+        == EXIT_OK
+    )
+    # The LAST fetch of a run is always the id-index one: the plan stage runs after
+    # the mandatory backup (which does its own fetching), and nothing after the plan
+    # reads books off the device. Run 1 knew nothing, so it read both.
+    assert backend.read_many_calls[-1] == ["documents/en/One.azw3", "documents/en/Two.azw3"]
+    capsys.readouterr()
+
+    assert (
+        kindle_cli.run_add(
+            _add_args(root, str(second_source)),
+            device_finder=lambda: device,
+            backend_factory=lambda d, *, cache_dir: backend,
+        )
+        == EXIT_OK
+    )
+    # Run 2 re-read ONLY the book run 1 added — never the two it already indexed.
+    assert backend.read_many_calls[-1] == ["documents/en/A.azw3"]
+
+
+def test_the_whole_device_path_is_capped_at_230_over_mtp_not_250(tmp_path):
+    """FAT32 allows 250; MTP is tighter. The budget is per BACKEND, not a single
+    constant, and `add` is the command that joins a directory onto a name and so is
+    the one that has to honour it."""
+    root = tmp_path / "media"
+    long_stem = "B" * 230
+    source = _plant_source(
+        tmp_path / "books",
+        f"{long_stem}.azw3",
+        book_id="LONGMTPBOOK00001",
+        title="Long",
+        author="A",
+        language="en",
+    )
+    backend = _FakeMtpBackend()
+    assert (
+        kindle_cli.run_add(
+            _add_args(root, str(source)),
+            device_finder=lambda: _mtp_device(),
+            backend_factory=lambda d, *, cache_dir: backend,
+        )
+        == EXIT_OK
+    )
+    landed = [path for path in backend.files if path.startswith("documents/en/B")]
+    assert len(landed) == 1
+    assert len(landed[0]) <= kindle_cli.MAX_DEVICE_PATH["mtp"]
+    assert kindle_cli.MAX_DEVICE_PATH["mtp"] < len(f"documents/en/{long_stem}.azw3")
+
+
+def test_an_unrecognised_device_mode_falls_back_to_the_stricter_budget(tmp_path):
+    """A third backend nobody has written yet must not silently get mass storage's
+    looser limit: an unknown mode takes the tightest one this project knows about."""
+    root = tmp_path / "media"
+    long_stem = "C" * 230
+    source = _plant_source(
+        tmp_path / "books",
+        f"{long_stem}.azw3",
+        book_id="UNKNOWNMODE00001",
+        title="Long",
+        author="A",
+        language="en",
+    )
+    backend = _FakeMtpBackend()
+    assert (
+        kindle_cli.run_add(
+            _add_args(root, str(source)),
+            device_finder=lambda: _mtp_device(mode="something-new"),
+            backend_factory=lambda d, *, cache_dir: backend,
+        )
+        == EXIT_OK
+    )
+    landed = [path for path in backend.files if path.startswith("documents/en/C")]
+    assert len(landed[0]) <= kindle_cli.MAX_DEVICE_PATH["mtp"]
+
+
+# --- selection and naming contracts -----------------------------------------------------------
+
+
+def test_match_that_hits_nothing_reports_no_items_and_writes_nothing(fake_kindle, tmp_path, capsys):
+    root = tmp_path / "media"
+    source = _plant_source(
+        tmp_path / "books",
+        "The Blade Itself.azw3",
+        book_id=BLADE_ID,
+        title=BLADE_TITLE,
+        author=BLADE_AUTHOR,
+        language="en",
+    )
+    exit_code = kindle_cli.run_add(
+        _add_args(root, str(source), "--match", "nothing here matches this"),
+        device_finder=lambda: fake_kindle,
+        backend_factory=_mass_storage_factory,
+    )
+    # Nothing matched is not a failure — it is a run with no items, the same way a
+    # `--match` that selects nothing behaves for `thumbnails`.
+    assert exit_code == EXIT_OK
+
+    events = _events(capsys)
+    assert [e for e in events if e["type"] == "item"] == []
+    result = events[-1]
+    assert result["counts"] == {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0}
+    assert result["data"]["books"] == []
+    assert not (fake_kindle.mount / "documents" / "en" / "The Blade Itself.azw3").exists()
+    # A run that put nothing on the device journals nothing to undo.
+    assert result["data"]["operation"] is None
+    assert backup_module.journal_read(root, fake_kindle.serial) == []
+
+
+def test_a_directory_prefix_too_long_for_the_budget_raises_instead_of_overrunning():
+    """Unreachable from `run_add`, whose language is two or three letters or
+    `UNKNOWN_LANGUAGE` — but this helper is exactly what Task 8's `sync` will reuse
+    with a different directory, and a contract that fails loudly is the point of
+    stating one."""
+    with pytest.raises(ValueError) as error:
+        kindle_cli._device_path_for("Book.azw3", "x" * 240, max_path=250)
+    assert "budget" in str(error.value)
+
+
+def test_a_batch_output_in_a_format_no_kindle_reads_is_skipped_not_copied(
+    fake_kindle, tmp_path, capsys
+):
+    """A batch is a scan result, not a file the user pointed at, so an output in some
+    other format is filtered out the way a folder scan filters — and never turned into
+    a usage error."""
+    root = tmp_path / "media"
+    keeper = _plant_source(
+        tmp_path / "books",
+        "Keeper.azw3",
+        book_id="KEEPER0000000001",
+        title="Keeper",
+        author="A",
+        language="en",
+    )
+    odd = tmp_path / "books" / "Notes.txt"
+    odd.write_text("not a book", encoding="utf-8")
+    batch_dir = root / "library"
+    batch_dir.mkdir(parents=True)
+    (batch_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "v": 1,
+                "items": [
+                    {"id": 1, "status": "done", "data": {"language": "en", "output": str(odd)}},
+                    {
+                        "id": 2,
+                        "status": "done",
+                        "data": {"language": "en", "output": str(keeper)},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        kindle_cli.run_add(
+            _add_args(root, "--batch", "library"),
+            device_finder=lambda: fake_kindle,
+            backend_factory=_mass_storage_factory,
+        )
+        == EXIT_OK
+    )
+    inputs = [e["input"] for e in _events(capsys) if e["type"] == "item"]
+    assert inputs == [str(keeper)]
+    assert not (fake_kindle.mount / "documents" / "en" / "Notes.txt").exists()

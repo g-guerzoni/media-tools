@@ -549,7 +549,7 @@ def _finish(
             digest, hash_from = recorded, "previous"
             carried += 1
         else:
-            digest, hash_from = _sha256(item.target), "computed"
+            digest, hash_from = sha256_of(item.target), "computed"
             if recorded is not None and digest != recorded:
                 # This is the whole point of `verify_hashes`. A reused file is usually a
                 # HARD LINK to the previous snapshot's inode, so recomputing its digest
@@ -714,7 +714,7 @@ def _hash_agrees(stored: Path, entry: dict) -> bool:
     recorded = entry.get("sha256")
     if not isinstance(recorded, str) or len(recorded) != 64:
         return True
-    return _sha256(stored) == recorded
+    return sha256_of(stored) == recorded
 
 
 def _expand(directory: Path, index: dict[str, dict], only: list[str]) -> tuple[set[str], list[str]]:
@@ -867,7 +867,11 @@ def _free_snapshot_name(backups: Path) -> str:
     return name
 
 
-def _sha256(path: Path) -> str:
+def sha256_of(path: Path) -> str:
+    """The sha256 of a file, read in chunks. Public because `ebook kindle add` needs
+    the SAME hash this module records in a manifest when it writes a book's
+    provenance into the journal next door — two chunked sha256 implementations in one
+    package is one too many."""
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for block in iter(lambda: handle.read(_HASH_CHUNK), b""):

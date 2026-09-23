@@ -534,10 +534,30 @@ def _op_mkdir(device, op: dict) -> dict:
 
 
 def _op_free(device, op: dict) -> dict:
+    """Bytes free on the device's main storage.
+
+    An answer this helper cannot turn into a real number is reported as a FAILURE,
+    never as `0`. `0` is a definite, actionable answer ("the device is full"); a
+    driver that said nothing is not that, and collapsing the two makes a caller that
+    refuses to copy a book it believes will not fit (`ebook kindle add`) tell the user
+    their Kindle is full when it may have gigabytes free. This is the same rule
+    `exists` already follows — a check that cannot be resolved into a definite yes/no
+    must raise rather than answer as if it had checked.
+    """
     free = device.free_space()
     if isinstance(free, (list, tuple)):
-        free = free[0] if free else 0
-    return {"op": "free", "ok": True, "free": int(free or 0)}
+        free = free[0] if free else None
+    if isinstance(free, bool) or not isinstance(free, (int, float)) or free < 0:
+        return {
+            "op": "free",
+            "ok": False,
+            "code": "free_space_unknown",
+            "error": (
+                "the MTP driver did not report how much space is free on this device "
+                f"(it answered {free!r}). A device that cannot say is not a full one."
+            ),
+        }
+    return {"op": "free", "ok": True, "free": int(free)}
 
 
 def _op_eject(device, op: dict) -> dict:

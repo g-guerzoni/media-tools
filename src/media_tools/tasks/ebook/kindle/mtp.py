@@ -442,7 +442,23 @@ class MtpBackend:
         return any(entry.path == path for entry in files)
 
     def free_space(self) -> int:
-        return int(self._one({"op": "free"}).get("free") or 0)
+        """Bytes free on the device's main storage.
+
+        A result carrying no usable number RAISES rather than answering `0` — the
+        same C1/I3 rule `exists` follows above, and `backend.DeviceBackend`'s own:
+        something that cannot be resolved into a definite answer must not answer as
+        if it had checked. `0` means "this device is full", which a caller acts on;
+        a driver that could not say is not that, and collapsing the two makes
+        `ebook kindle add` refuse to copy anything onto a Kindle with gigabytes free
+        — after its mandatory backup has already run.
+        """
+        free = self._one({"op": "free"}).get("free")
+        if isinstance(free, bool) or not isinstance(free, int) or free < 0:
+            raise CalibreError(
+                "the MTP helper did not report this device's free space (it answered "
+                f"{free!r}), so whether a book will fit cannot be answered"
+            )
+        return free
 
     def eject(self) -> None:
         # MTP has nothing to eject; the helper closes the session and the op exists

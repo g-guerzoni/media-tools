@@ -115,13 +115,16 @@ def install(
     for it.
 
     **Every one of those outcomes is a clean, non-exceptional answer about ONE
-    book — none of them can abort the batch.** A genuine device fault mid-write
-    (a full disk, a yanked cable, `DeviceWriteProtected`, an MTP `CalibreError`) is
-    a different thing: it is caught PER BOOK and reported `"failed"`, distinct from
+    book — none of them can abort the batch.** A genuine fault (a full disk on the
+    DEVICE or on the HOST, a yanked cable, `DeviceWriteProtected`, an MTP
+    `CalibreError`, an ffmpeg that cannot be located) is a different thing: it is
+    caught PER BOOK by `_install_guarded` and reported `"failed"`, distinct from
     `"rejected"` (a complete, trustworthy check that genuinely found nothing) and
     from `"no_cover"` (nothing was even attempted) — never left to propagate out of
-    this function, which would abort every book still queued and discard every
-    already-reported result for the books that came before it.
+    this function, which would abort every book still queued, discard every
+    already-reported result for the books that came before it, and (for `ebook
+    kindle add`) escape before its caller could journal what it had already written
+    to the device.
 
     `on_progress(done, total)` fires once per book, after that book is fully
     resolved. Each book's own scratch files (a fetched copy of it, an extracted
@@ -129,19 +132,43 @@ def install(
     library-sized run never holds more than one book's worth of temporary data on
     disk at a time.
     """
-    ffmpeg_bin = ffmpeg or ffmpeg_exe()
     cache_dir = Path(cache_dir)
     total = len(books)
     statuses: dict[str, str] = {}
     for done, book in enumerate(books, start=1):
         key = book.book_id or book.device_path
-        with tempfile.TemporaryDirectory(prefix="kindle-thumbnails-") as scratch:
-            statuses[key] = _install_one(
-                backend, book, cache_dir=cache_dir, ffmpeg=ffmpeg_bin, scratch_dir=Path(scratch)
-            )
+        statuses[key] = _install_guarded(backend, book, cache_dir=cache_dir, ffmpeg=ffmpeg)
         if on_progress:
             on_progress(done, total)
     return statuses
+
+
+def _install_guarded(backend: DeviceBackend, book: Book, *, cache_dir: Path, ffmpeg: str | None):
+    """`_install_one` with EVERY statement that can raise inside ONE guard.
+
+    Locating ffmpeg and creating the scratch directory used to sit in `install()`'s
+    own loop body, OUTSIDE any handler, and so did the `stat()` behind `_is_usable`
+    and the `write_bytes` that saves an extracted cover. Each of those can raise on
+    a perfectly ordinary host — a full `/tmp` is enough — and a raise from any of
+    them escaped `install()` entirely, which this function's caller cannot afford
+    twice over: it aborts every book still queued AND, for `ebook kindle add`,
+    escapes before the caller has journalled the books it has already put on the
+    device. `install()`'s docstring promises no per-book fault escapes; this is
+    what makes that true rather than nearly true.
+
+    `ImportError` is caught alongside the usual `(RuntimeError, OSError)` pair for
+    one specific reason: `core.ffmpeg.ffmpeg_exe`'s last resort is
+    `import imageio_ffmpeg`, so a broken install of that package raises a third
+    family here and nowhere else in this module.
+    """
+    try:
+        ffmpeg_bin = ffmpeg or ffmpeg_exe()
+        with tempfile.TemporaryDirectory(prefix="kindle-thumbnails-") as scratch:
+            return _install_one(
+                backend, book, cache_dir=cache_dir, ffmpeg=ffmpeg_bin, scratch_dir=Path(scratch)
+            )
+    except (RuntimeError, OSError, ImportError):
+        return "failed"
 
 
 def _install_one(
