@@ -267,12 +267,23 @@ def _openrouter_check(op_item: str | None = None, *, env=None, runner=None) -> C
     return Check("openrouter-key", "warn", "not configured", hint=hint)
 
 
-# -- the Kindle section: warnings only, never a failure ------------------------------
+# -- the Kindle section: never a failure, and never a warn with no action ------------
 #
 # `media-tools ebook kindle ...` is the only thing on this list that needs a Kindle, and
-# only its MTP half needs Calibre's device driver. Both checks therefore answer "warn"
-# for every unhappy path, including the entirely ordinary one where no Kindle is
-# plugged in.
+# only its MTP half needs Calibre's device driver. Neither check may ever report
+# "missing" — that is the status that moves `doctor`'s exit code.
+#
+# Neither may report "warn" for a state with nothing to DO about it either, and that is
+# a separate rule worth stating on its own. The session-start hook runs `doctor
+# --quiet`, which prints every non-"ok" row; every other warn in that report is an
+# actionable environment defect, so "no Kindle plugged in" sitting there permanently
+# would train everyone reading it to skim the warn level — hiding the rows that really
+# do block a task. So: no Kindle connected is "ok". A Kindle that IS connected and
+# needs something (an MTP one with no Calibre, or one held by another program) is
+# "warn", because there is then something to do.
+#
+# The MTP driver probe is GATED on an MTP device actually being found, which is what
+# keeps a `calibre-debug` subprocess off the session-start path for everyone else.
 
 #: What the probe below prints on success. Checked for in the probe's OUTPUT rather
 #: than trusting its exit code: `calibre-debug` exits 0 for plenty of invocations that
@@ -303,7 +314,7 @@ _KINDLE_DEVICE_HINT = (
 _KINDLE_MODE_LABELS = {"mass_storage": "mass storage", "mtp": "MTP"}
 
 
-def _kindle_mtp_driver_check() -> Check:
+def _kindle_mtp_driver_check(device: kindle_detect.Device | None) -> Check:
     """Whether Calibre's own MTP driver imports inside Calibre's interpreter.
 
     `tasks.ebook.kindle.mtp` can never import that driver from this process — it only
@@ -311,7 +322,22 @@ def _kindle_mtp_driver_check() -> Check:
     `calibre-debug` to import it and say so. The probe imports and prints; it never
     constructs a driver, scans the USB bus or opens anything, so running it costs
     nothing and cannot disturb a device that is mid-transfer.
+
+    **It only runs when an MTP Kindle is actually connected.** Nothing else on this
+    machine needs the driver — a mass-storage Kindle does not, and neither does a
+    machine with no Kindle at all — so probing regardless would spend a subprocess at
+    every session start to produce a warn nobody can act on. `device` is what
+    `_kindle_device_check` already found; `None` (or a mass-storage device) reports
+    "ok, not needed", with a detail that says the probe was skipped rather than
+    claiming a driver was verified.
     """
+    if device is None or device.mode != "mtp":
+        return Check(
+            "kindle-mtp-driver",
+            "ok",
+            "not probed: no MTP Kindle connected",
+            hint=_MTP_DRIVER_HINT,
+        )
     exe = calibre.find_tool("calibre-debug")
     if exe is None:
         return Check("kindle-mtp-driver", "warn", "calibre-debug not found", hint=_MTP_DRIVER_HINT)
@@ -340,8 +366,19 @@ def _kindle_mtp_driver_check() -> Check:
     )
 
 
-def _kindle_device_check() -> Check:
-    """Whether a Kindle is connected, and in which of the two modes.
+def _kindle_device_check() -> tuple[Check, kindle_detect.Device | None]:
+    """`(the check, the device it found or None)`. Whether a Kindle is connected, and
+    in which of the two modes.
+
+    The device comes back as well as the check because `_kindle_mtp_driver_check` is
+    gated on it — detection runs exactly once per `doctor` run, and the driver probe
+    only when there is something that needs the driver.
+
+    **No Kindle connected is `"ok"`, not `"warn"`.** There is nothing to do about it
+    unless the user is trying to drive `ebook kindle`, and a warn with no action
+    attached is noise in a report whose other warns all have one. The hint still says
+    what to do if a Kindle WAS expected. A Kindle another program holds IS a warn:
+    that one has an action.
 
     Never raises and never reports `"missing"`. Detection shells out to `ioreg` on
     macOS and reads `/sys` on Linux, so the failure modes are real; a broad catch is
@@ -353,27 +390,36 @@ def _kindle_device_check() -> Check:
     try:
         device = kindle_detect.find_device()
     except kindle_detect.DeviceNotFound:
-        return Check("kindle-device", "warn", "no Kindle connected", hint=_KINDLE_DEVICE_HINT)
+        return Check("kindle-device", "ok", "no Kindle connected", hint=_KINDLE_DEVICE_HINT), None
     except kindle_detect.DeviceBusy:
-        return Check(
-            "kindle-device",
-            "warn",
-            "a Kindle is connected but another program holds it",
-            hint="close Calibre (or whatever else has the device) and try again",
+        return (
+            Check(
+                "kindle-device",
+                "warn",
+                "a Kindle is connected but another program holds it",
+                hint="close Calibre (or whatever else has the device) and try again",
+            ),
+            None,
         )
     except Exception as error:  # noqa: BLE001 - a health check must never die reporting
-        return Check(
-            "kindle-device",
-            "warn",
-            f"could not tell whether a Kindle is connected ({error})",
-            hint=_KINDLE_DEVICE_HINT,
+        return (
+            Check(
+                "kindle-device",
+                "warn",
+                f"could not tell whether a Kindle is connected ({error})",
+                hint=_KINDLE_DEVICE_HINT,
+            ),
+            None,
         )
     label = _KINDLE_MODE_LABELS.get(device.mode, device.mode)
-    return Check(
-        "kindle-device",
-        "ok",
-        f"connected ({label})",
-        hint="`media-tools ebook kindle status` reports it in full",
+    return (
+        Check(
+            "kindle-device",
+            "ok",
+            f"connected ({label})",
+            hint="`media-tools ebook kindle status` reports it in full",
+        ),
+        device,
     )
 
 
@@ -467,6 +513,7 @@ def check_all(
 ) -> list[Check]:
     root = output_root(output_dir)
     package_checks = {name: _package_check(name) for name in PACKAGES}
+    kindle_device_check, kindle_device = _kindle_device_check()
 
     checks = [
         _python_check(),
@@ -476,8 +523,9 @@ def check_all(
         _deno_check(),
         _calibre_check(),
         _openrouter_check(op_item),
-        _kindle_mtp_driver_check(),
-        _kindle_device_check(),
+        # Detection first, because the driver probe is gated on what it found.
+        kindle_device_check,
+        _kindle_mtp_driver_check(kindle_device),
         _output_root_check(root),
     ]
     if check_updates:

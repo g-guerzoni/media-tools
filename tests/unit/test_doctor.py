@@ -404,48 +404,79 @@ def test_calibre_check_uses_find_tool_not_just_shutil_which(tmp_path, monkeypatc
     assert check.status == "ok"
 
 
-# -- Task 9: the Kindle section. Warnings, never failures --------------------------
+# -- Task 9: the Kindle section ----------------------------------------------------
 #
-# A machine with no Kindle attached is not a broken machine, and `compress`/`convert`/
-# `split`/`download`/`ebook build` never touch one — so neither of these two checks may
-# ever report "missing", which is the only status that moves `doctor`'s exit code.
+# Two rules, and the second is not implied by the first. (1) Neither check may ever
+# report "missing" — that is the only status that moves `doctor`'s exit code, and a
+# machine with no Kindle attached is not a broken machine. (2) Neither may report
+# "warn" for a state with nothing to DO about it: the session-start hook runs `doctor
+# --quiet`, which prints every non-"ok" row, and a permanent warn nobody can act on
+# trains everyone to skim the level that carries the real blockers.
+#
+# Nothing in this section may spawn a real `calibre-debug` or scan the real USB
+# bus/`/Volumes`: those are the two probes the whole gate below exists to avoid, and a
+# test that runs them anyway is exactly the hardware dependency `-m "not device"`
+# promises is absent.
+
+NO_KINDLE = "nothing attached"
 
 
-def test_doctor_reports_a_kindle_section(tmp_path):
-    payload = json.loads(_cli("doctor", "--json", "-o", str(tmp_path)).stdout)
-    names = {check["name"] for check in payload["checks"]}
-    assert {"kindle-mtp-driver", "kindle-device"} <= names
+def _no_kindle():
+    raise kindle_detect.DeviceNotFound(NO_KINDLE)
 
 
-def test_kindle_checks_are_warnings_never_failures(tmp_path):
-    payload = json.loads(_cli("doctor", "--json", "-o", str(tmp_path)).stdout)
-    for check in payload["checks"]:
-        if check["name"].startswith("kindle-"):
-            assert check["status"] in {"ok", "warn"}
+def _mtp_kindle():
+    return kindle_detect.Device(serial=None, product_id=0x9981, mode="mtp", mount=None)
+
+
+def _patch_kindle(monkeypatch, *, finder=_no_kindle, calibre_debug=None):
+    """Both Kindle probes replaced: detection, and `calibre-debug`'s location. With
+    `calibre_debug=None` the driver check finds no tool, so nothing is ever spawned
+    even if the gate below it were to break."""
+    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", finder)
+    monkeypatch.setattr(doctor_task.calibre, "find_tool", lambda name: calibre_debug)
+
+
+def _kindle_checks(tmp_path) -> dict:
+    checks = doctor_task.check_all(check_updates=False, output_dir=tmp_path)
+    return {c.name: c for c in checks if c.name.startswith("kindle-")}
+
+
+def test_doctor_reports_a_kindle_section(tmp_path, monkeypatch):
+    _patch_kindle(monkeypatch)
+    assert set(_kindle_checks(tmp_path)) == {"kindle-mtp-driver", "kindle-device"}
+
+
+def test_kindle_checks_are_never_failures(tmp_path, monkeypatch):
+    for finder in (_no_kindle, _mtp_kindle):
+        _patch_kindle(monkeypatch, finder=finder)
+        for check in _kindle_checks(tmp_path).values():
+            assert check.status in {"ok", "warn"}
 
 
 def test_kindle_checks_never_move_the_exit_code(tmp_path, monkeypatch):
-    # The whole point of "warnings, never failures": whatever these two answer, the
-    # exit code is decided by the checks that really do block a task.
-    def no_kindle():
-        raise kindle_detect.DeviceNotFound("nothing attached")
-
-    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", no_kindle)
-    monkeypatch.setattr(doctor_task.calibre, "find_tool", lambda name: None)
+    # Whatever these two answer, the exit code is decided by the checks that really do
+    # block a task. The unhappiest reachable combination: no device, no Calibre.
+    _patch_kindle(monkeypatch)
     checks = doctor_task.check_all(check_updates=False, output_dir=tmp_path)
-    kindle_checks = [c for c in checks if c.name.startswith("kindle-")]
-    assert len(kindle_checks) == 2
-    assert all(c.status == "warn" for c in kindle_checks)
     assert doctor_task._exit_code(checks) == EXIT_OK_CODE
 
 
-def test_kindle_device_check_warns_when_nothing_is_connected(monkeypatch):
-    def no_kindle():
-        raise kindle_detect.DeviceNotFound("nothing attached")
+def test_a_machine_with_no_kindle_and_no_calibre_gets_no_kindle_warning(tmp_path, monkeypatch):
+    # The rule that "warnings, never failures" did NOT already give us. `doctor
+    # --quiet` prints every non-"ok" row at every session start; neither of these two
+    # belongs there when there is nothing to act on.
+    _patch_kindle(monkeypatch)
+    assert [c.status for c in _kindle_checks(tmp_path).values()] == ["ok", "ok"]
 
-    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", no_kindle)
-    check = doctor_task._kindle_device_check()
-    assert check.status == "warn"
+
+def test_kindle_device_check_is_ok_when_nothing_is_connected(monkeypatch):
+    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", _no_kindle)
+    check, device = doctor_task._kindle_device_check()
+    assert check.status == "ok"
+    assert "no Kindle connected" in check.detail
+    assert device is None
+    # The hint survives the demotion: it is what a user who EXPECTED a device needs.
     assert "kindle" in (check.hint or "").lower()
 
 
@@ -457,29 +488,32 @@ def test_kindle_device_check_reports_the_mode_when_one_is_connected(monkeypatch,
         mount=tmp_path,
     )
     monkeypatch.setattr(doctor_task.kindle_detect, "find_device", lambda: device)
-    check = doctor_task._kindle_device_check()
+    check, found = doctor_task._kindle_device_check()
     assert check.status == "ok"
     assert "mass storage" in check.detail.lower()
+    assert found is device
     # A serial identifies one physical device and nothing here needs it: `ebook kindle
     # status` is where a user asks for that, deliberately and one command at a time.
     assert "SERIAL-THAT-MUST-NOT-BE-PRINTED" not in check.detail + (check.hint or "")
 
 
 def test_kindle_device_check_reports_mtp_mode(monkeypatch):
-    device = kindle_detect.Device(serial=None, product_id=0x9981, mode="mtp", mount=None)
-    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", lambda: device)
-    check = doctor_task._kindle_device_check()
+    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", _mtp_kindle)
+    check, device = doctor_task._kindle_device_check()
     assert check.status == "ok"
     assert "mtp" in check.detail.lower()
+    assert device is not None and device.mode == "mtp"
 
 
 def test_kindle_device_check_warns_when_the_device_is_held(monkeypatch):
+    # A warn WITH an action attached, which is the difference from "no Kindle".
     def busy():
         raise kindle_detect.DeviceBusy("Calibre has it")
 
     monkeypatch.setattr(doctor_task.kindle_detect, "find_device", busy)
-    check = doctor_task._kindle_device_check()
+    check, device = doctor_task._kindle_device_check()
     assert check.status == "warn"
+    assert device is None
 
 
 def test_kindle_device_check_never_raises(monkeypatch):
@@ -489,13 +523,34 @@ def test_kindle_device_check_never_raises(monkeypatch):
         raise ValueError("ioreg said something unparseable")
 
     monkeypatch.setattr(doctor_task.kindle_detect, "find_device", boom)
-    check = doctor_task._kindle_device_check()
+    check, device = doctor_task._kindle_device_check()
     assert check.status == "warn"
+    assert device is None
+
+
+# -- the driver probe, and the gate that keeps it off the session-start path -------
+
+
+def test_kindle_mtp_driver_check_is_skipped_without_an_mtp_device(monkeypatch, tmp_path):
+    # The gate: no subprocess at all, and no warn, for the two cases that do not need
+    # the driver. `find_tool` is made to explode rather than return None, so a broken
+    # gate fails loudly instead of quietly looking like the "not found" branch.
+    def boom(name):
+        raise AssertionError("the driver probe must not be reached without an MTP device")
+
+    monkeypatch.setattr(doctor_task.calibre, "find_tool", boom)
+    mass_storage = kindle_detect.Device(
+        serial=None, product_id=0x0004, mode="mass_storage", mount=tmp_path
+    )
+    for device in (None, mass_storage):
+        check = doctor_task._kindle_mtp_driver_check(device)
+        assert check.status == "ok"
+        assert "not probed" in check.detail
 
 
 def test_kindle_mtp_driver_check_warns_when_calibre_debug_is_absent(monkeypatch):
     monkeypatch.setattr(doctor_task.calibre, "find_tool", lambda name: None)
-    check = doctor_task._kindle_mtp_driver_check()
+    check = doctor_task._kindle_mtp_driver_check(_mtp_kindle())
     assert check.status == "warn"
     assert check.hint
 
@@ -511,7 +566,7 @@ def test_kindle_mtp_driver_check_is_ok_when_the_probe_prints_its_marker(monkeypa
         )
 
     monkeypatch.setattr(doctor_task.subprocess, "run", fake_run)
-    check = doctor_task._kindle_mtp_driver_check()
+    check = doctor_task._kindle_mtp_driver_check(_mtp_kindle())
     assert check.status == "ok"
 
 
@@ -524,7 +579,7 @@ def test_kindle_mtp_driver_check_warns_when_the_import_fails(monkeypatch):
         )
 
     monkeypatch.setattr(doctor_task.subprocess, "run", fake_run)
-    check = doctor_task._kindle_mtp_driver_check()
+    check = doctor_task._kindle_mtp_driver_check(_mtp_kindle())
     assert check.status == "warn"
 
 
@@ -535,7 +590,7 @@ def test_kindle_mtp_driver_check_warns_when_the_probe_cannot_run(monkeypatch):
         raise OSError("no such file")
 
     monkeypatch.setattr(doctor_task.subprocess, "run", fake_run)
-    check = doctor_task._kindle_mtp_driver_check()
+    check = doctor_task._kindle_mtp_driver_check(_mtp_kindle())
     assert check.status == "warn"
 
 
@@ -548,4 +603,4 @@ def test_kindle_mtp_driver_probe_marker_never_matches_by_accident(monkeypatch):
         "run",
         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
     )
-    assert doctor_task._kindle_mtp_driver_check().status == "warn"
+    assert doctor_task._kindle_mtp_driver_check(_mtp_kindle()).status == "warn"
