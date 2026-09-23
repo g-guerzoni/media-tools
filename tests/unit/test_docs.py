@@ -23,8 +23,13 @@ def test_docs_document_the_list_file_shapes():
 
 
 def test_docs_have_no_local_or_personal_paths():
-    for doc in DOCS:
+    """Widest of the three, on purpose. The formats-marker and list-file-shape tests
+    above are about README.md/CLAUDE.md specifically, but `docs/*.md` — and
+    `kindle-first-run.md` above all — is meant to be FOLLOWED verbatim on a machine
+    with a real device attached, which is exactly the session where a real path gets
+    pasted in while checking whether a step worked."""
+    for doc in DOCS + sorted(Path("docs").glob("*.md")):
         text = doc.read_text(encoding="utf-8")
-        assert "/Users/" not in text
-        assert "/home/" not in text
-        assert "~/Downloads" not in text
+        assert "/Users/" not in text, doc
+        assert "/home/" not in text, doc
+        assert "~/Downloads" not in text, doc
