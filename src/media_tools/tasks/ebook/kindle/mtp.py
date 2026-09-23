@@ -9,7 +9,7 @@ may import the helper: it is a standalone script for a different interpreter.
 
 **Batching is the performance contract, not an optimisation.** Every helper
 invocation re-opens and re-scans the device, so one invocation per file is unusable
-on a real library. `run_ops` is the entry point that matters; the eight
+on a real library. `run_ops` is the entry point that matters; the
 `DeviceBackend` methods are thin single-op wrappers over it, and a bulk caller
 (backup, add, sync) is expected to build its own ops list and call `run_ops` once.
 `list_files` additionally caches the whole device listing for this backend's
@@ -307,7 +307,7 @@ class MtpBackend:
         the device, so splitting a library's worth of work into one invocation per
         file is not a slower version of this — it is unusable.
 
-        **The caller must check each result's `ok` field.** Unlike the eight
+        **The caller must check each result's `ok` field.** Unlike the
         `DeviceBackend` methods, which raise, this hands back raw per-op results: an
         exception here means the whole invocation failed, and a batch that ran fine
         can still contain individual failures. A result that is not `ok` carries
@@ -369,6 +369,29 @@ class MtpBackend:
 
     def read(self, path: str, dest: Path) -> None:
         self._one({"op": "get", "path": path, "local": str(Path(dest).resolve())})
+
+    def read_many(self, items: list[tuple[str, Path]]) -> None:
+        """`read` for a whole batch, in ONE helper invocation — see
+        `backend.DeviceBackend` for the contract, and `run_ops` for why the batching
+        is the point rather than an optimisation: a per-file invocation re-opens and
+        re-scans the device every time, which a real library cannot afford.
+
+        `run_ops` hands back raw per-op results, so the failure mapping the other
+        protocol methods get from `_one` is applied here by hand: the FIRST failed op
+        raises what `read` would have raised for it, and whatever already transferred
+        stays on disk.
+        """
+        ops = [
+            {"op": "get", "path": path, "local": str(Path(dest).resolve())} for path, dest in items
+        ]
+        if not ops:
+            return
+        results = self.run_ops(ops)
+        for op, result in zip(ops, results, strict=True):
+            if not isinstance(result, dict):
+                raise CalibreError(f"the MTP helper returned a malformed result: {result!r}")
+            if not result.get("ok"):
+                raise _error_for(result, op)
 
     def write(self, local: Path, path: str) -> None:
         self._one({"op": "put", "path": path, "local": str(Path(local).resolve())})

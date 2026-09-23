@@ -55,6 +55,16 @@ class DeviceBackend(Protocol):
       cannot drift apart.
     - **`read(path, dest)`** and **`remove(path)`** raise `FileNotFoundError` when
       `path` is not on the device.
+    - **`read_many(items)`** is `read` for a whole batch: every `(device path, local
+      destination)` pair in ONE round trip where the backend has one (mass storage
+      loops; MTP sends a single `run_ops` batch, because per-file `calibre-debug`
+      spawns are unusable on a real library). It is observably equivalent to calling
+      `read` for each pair in the order given, with two guarantees `read` alone does
+      not make: **each destination's parent directory is created**, and an empty list
+      touches the device not at all. It raises what `read` would raise for the first
+      pair that fails — `FileNotFoundError` for an absent path — and leaves whatever
+      already transferred in place, so a caller that needs all-or-nothing stages into
+      a directory it can discard.
     - **`exists(path)`** answers for FILES only: a directory is not "there".
     - **`write(local, path)`** creates any missing parent directories.
     - **`free_space()`** is bytes free on the device's main storage.
@@ -63,6 +73,7 @@ class DeviceBackend(Protocol):
 
     def list_files(self, prefix: str = "") -> list[DeviceFile]: ...
     def read(self, path: str, dest: Path) -> None: ...
+    def read_many(self, items: list[tuple[str, Path]]) -> None: ...
     def write(self, local: Path, path: str) -> None: ...
     def remove(self, path: str) -> None: ...
     def exists(self, path: str) -> bool: ...

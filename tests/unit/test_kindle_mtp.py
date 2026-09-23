@@ -511,7 +511,7 @@ def test_exists_answers_for_files_only_on_both_backends(fake_kindle, device):
 
 
 def test_the_mtp_backend_matches_the_mass_storage_backends_shape(device):
-    """The Protocol is not runtime-checkable, so pin the eight method names and their
+    """The Protocol is not runtime-checkable, so pin the nine method names and their
     signatures here."""
     import inspect
 
@@ -525,6 +525,7 @@ def test_the_mtp_backend_matches_the_mass_storage_backends_shape(device):
         "free_space",
         "list_files",
         "read",
+        "read_many",
         "remove",
         "write",
     ]

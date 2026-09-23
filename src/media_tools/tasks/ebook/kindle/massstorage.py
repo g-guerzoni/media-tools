@@ -87,6 +87,16 @@ class MassStorageBackend:
     def read(self, path: str, dest: Path) -> None:
         shutil.copyfile(self.mount / path, dest)
 
+    def read_many(self, items: list[tuple[str, Path]]) -> None:
+        """`read` for a whole batch — see `backend.DeviceBackend`. A mounted disk has
+        no round trip to save, so this is the loop the MTP backend cannot afford; what
+        it adds over calling `read` directly is the contract's parent-directory
+        guarantee, which MTP's helper already makes and mass storage did not."""
+        for path, dest in items:
+            dest = Path(dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            self.read(path, dest)
+
     def write(self, local: Path, path: str) -> None:
         target = self.mount / path
         target.parent.mkdir(parents=True, exist_ok=True)
