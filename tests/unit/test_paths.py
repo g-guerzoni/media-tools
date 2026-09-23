@@ -89,13 +89,28 @@ def test_batch_hash_ignores_key_order():
 
 def test_batch_hash_canonical_serialization():
     # Pins canonical serialisation; change only deliberately.
+    #
+    # batch_hash() resolves every input path (see core/paths.py), so the fixture must
+    # resolve to itself identically on every supported platform or the golden digest
+    # below is really pinning platform-specific filesystem behaviour, not the
+    # serialisation. `/tmp` is exactly that trap: it's a symlink to `/private/tmp` on
+    # macOS but a real directory on Linux, so `/tmp/in` used to resolve differently per
+    # OS and silently produced a different "golden" digest on each (this broke CI's
+    # Ubuntu jobs while passing locally on macOS). `/opt` is not a symlink on either
+    # platform, so `/opt/media-tools-test/in` resolves to itself everywhere.
+    fixture_input = Path("/opt/media-tools-test/in")
+    assert fixture_input.resolve() == fixture_input, (
+        "golden digest below assumes this path resolves to itself unchanged; if a "
+        "platform resolves it differently, pick a different fixture path instead of "
+        "just re-pinning the digest"
+    )
     digest = batch_hash(
         task="compress",
         options={"crf": 28},
         selection={"recursive": False},
-        inputs=[Path("/tmp/in")],
+        inputs=[fixture_input],
     )
-    assert digest == "c9351634"
+    assert digest == "24872005"
 
 
 def test_mirror_output_keeps_subfolders(tmp_path):
