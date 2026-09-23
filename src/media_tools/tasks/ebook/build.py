@@ -282,11 +282,18 @@ def _apply_list_overrides(
         )
 
 
-def register_subparsers(ebook_parser) -> None:
+def register_subparsers(ebook_parser):
+    """Wire `build`'s six stage-based subcommands onto `ebook_parser`, and return the
+    `_SubParsersAction` argparse created (`ebook_parser.add_subparsers(...)`'s own
+    return value) so a caller that needs to add MORE subcommands to the same parser —
+    `tasks/ebook/__init__.py`, for `kindle` — can do so through `.add_parser()`, fully
+    public API, instead of reaching for a second `add_subparsers()` call (argparse
+    refuses more than one per parser) or introspecting `ebook_parser`'s internals."""
     subparsers = ebook_parser.add_subparsers(dest="ebook_command", required=True)
     for command, (_, help_text) in SUBCOMMANDS.items():
         sub = subparsers.add_parser(command, help=help_text, description=help_text)
         add_pipeline_flags(sub)
+    return subparsers
 
 
 def run(args) -> int:

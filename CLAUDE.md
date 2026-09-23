@@ -127,15 +127,17 @@ begins) rather than real work.
 
 **Two contract details that are easy to get wrong:**
 
-1. **`result` is the last line only for a run that actually started.** A run that
-   fails validation before `run_items`/`_download_all` begins — an unrecognized flag, no
-   input given, no input matched, an unsupported input format, a missing dependency, an
-   unknown subcommand — emits a **bare `error` and nothing else**: no `start`, no
-   `result`, process exits (2 or 3). Do not block waiting for a `result` line after an
-   `error` that was not preceded by a `start`. Once `start` has been printed, `result`
-   is guaranteed to follow — including on a failed item, a batch conflict, or Ctrl+C
-   (`exit_code` 130) — so you can always parse the last stdout line as the outcome of a
-   run that got that far.
+1. **`result` is always the last line, whether or not `start` ever printed.** A run
+   that fails validation before `run_items`/`_download_all` begins — an unrecognized
+   flag, no input given, no input matched, an unsupported input format, a missing
+   dependency, an unknown subcommand — raises `UsageError`, which `cli.main` turns into
+   an `error` immediately followed by a matching `result` (built with
+   `core.runner.empty_result`, the same "never owned a batch" shape a batch conflict or
+   a pre-batch Ctrl+C already used) — there is no `start` in between, since the run
+   never got that far, but `result` still comes last. Once `start` HAS been printed,
+   `result` is guaranteed to follow too — including on a failed item, a batch conflict,
+   or Ctrl+C (`exit_code` 130) — so you can always parse the last stdout line as the
+   outcome of any run, whether or not it got as far as `start`.
 2. **`error` also always prints to stderr as text**, even under `--json` and even under
    `--quiet` — it is the one message `Reporter` never silences. If you only read stdout
    you still get the structured version; this just means stderr is not "clean" the way

@@ -37,6 +37,23 @@ def test_missing_input_exits_2_with_json_error(tmp_path):
     assert any(e["type"] == "error" and e["code"] == "usage" for e in events)
 
 
+def test_a_usage_error_from_a_task_still_emits_a_matching_result(tmp_path):
+    """`UsageError` fires before a task's own `start` (no input given, here), but the
+    plan's global contract is that `result` is the LAST line of every run, including on
+    failure, with no carve-out for "the run never started" — `main`'s `except
+    UsageError` clause used to emit only `error`, leaving that contract false since the
+    first plan."""
+    result = _run(["compress", "--json", "-o", str(tmp_path / "out")])
+    assert result.returncode == 2
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert any(e["type"] == "error" for e in events)
+    result_events = [e for e in events if e["type"] == "result"]
+    assert len(result_events) == 1
+    assert result_events[0]["ok"] is False
+    assert result_events[0]["exit_code"] == 2
+    assert result_events[0]["run_file"] is None
+
+
 def test_empty_folder_exits_2_with_no_input_matched(tmp_path):
     (tmp_path / "in").mkdir()
     result = _run(["compress", str(tmp_path / "in"), "--json", "-o", str(tmp_path / "out")])
