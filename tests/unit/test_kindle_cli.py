@@ -22,7 +22,7 @@ from media_tools.core.events import EXIT_DEPENDENCY, EXIT_FAILED, EXIT_INTERRUPT
 from media_tools.core.paths import temp_path
 from media_tools.tasks.ebook.covers import cache_path
 from media_tools.tasks.ebook.kindle import cli as kindle_cli
-from media_tools.tasks.ebook.kindle import massstorage
+from media_tools.tasks.ebook.kindle import massstorage, mtp
 from media_tools.tasks.ebook.kindle.backend import DeviceFile, DeviceWriteProtected
 from media_tools.tasks.ebook.kindle.detect import Device, DeviceBusy, DeviceNotFound
 
@@ -1595,8 +1595,17 @@ class _RecordingEjectBackend:
 
 
 class _FailingEjectBackend(_RecordingEjectBackend):
+    """An eject that fails for a reason that is NOT the volume being busy — a missing
+    `diskutil`/`udisksctl`/`sync` is what `massstorage` raises a bare `RuntimeError`
+    for."""
+
     def eject(self) -> None:
-        raise RuntimeError("diskutil eject disk9 failed: Resource busy")
+        raise RuntimeError("diskutil failed: No such file or directory")
+
+
+class _BusyEjectBackend(_RecordingEjectBackend):
+    def eject(self) -> None:
+        raise DeviceBusy("diskutil eject disk9 failed: Resource busy")
 
 
 def test_eject_is_registered_as_a_kindle_subcommand():
@@ -1687,10 +1696,28 @@ def test_eject_reports_a_failed_eject_as_an_error_and_still_ends_in_a_result(
     events = _events(capsys)
     assert events[-1]["type"] == "result"
     assert events[-1]["ok"] is False
-    # The closed registry has no code for "the volume is still busy", so a plain
-    # RuntimeError out of the platform eject lands on `dependency_missing` — the
-    # device itself is untouched either way. Documented in CLAUDE.md.
+    # `dependency_missing` means "install something", which is the honest reading of a
+    # missing platform binary — and only of that. A busy volume is the test below.
     assert [e["code"] for e in events if e["type"] == "error"] == ["dependency_missing"]
+
+
+def test_eject_reports_a_busy_volume_as_device_busy_not_a_missing_dependency(
+    fake_kindle, tmp_path, capsys
+):
+    # Telling a user to install something because a window is open on their Kindle
+    # sends them after the wrong problem. `massstorage` raises `DeviceBusy` after the
+    # retry, and `_error_code_for` tests for it before anything broader.
+    backend = _BusyEjectBackend(fake_kindle.mount)
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "eject", "--json", "-o", str(tmp_path / "media")]
+    )
+    exit_code = kindle_cli.run_eject(
+        args, device_finder=lambda: fake_kindle, backend_factory=lambda d, *, cache_dir: backend
+    )
+    assert exit_code == EXIT_DEPENDENCY
+    events = _events(capsys)
+    assert [e["code"] for e in events if e["type"] == "error"] == ["device_busy"]
+    assert events[-1]["type"] == "result"
 
 
 def test_eject_maps_a_vanished_device_to_device_not_found(fake_kindle, tmp_path, capsys):
@@ -1709,16 +1736,24 @@ def test_eject_maps_a_vanished_device_to_device_not_found(fake_kindle, tmp_path,
     assert [e["code"] for e in events if e["type"] == "error"] == ["device_not_found"]
 
 
-def test_eject_over_mtp_reports_the_mtp_backend(tmp_path, capsys):
-    class _FakeMtpEject(_FakeMtpBackend):
-        def __init__(self):
-            super().__init__({})
-            self.ejects = 0
+def test_eject_over_mtp_sends_the_eject_op_and_labels_the_real_backend(tmp_path, capsys):
+    """The REAL `MtpBackend`, with only its `calibre-debug` invocation faked — so this
+    pins both halves of the MTP path: that one `eject` op is sent, and that
+    `data.device.backend` reports the `"mtp"` literal `_BACKEND_LABELS` maps that class
+    to (a renamed class must not silently change the JSON)."""
+    sent: list[list[dict]] = []
 
-        def eject(self) -> None:
-            self.ejects += 1
+    def fake_runner(ops):
+        sent.append([dict(op) for op in ops])
+        return {
+            "v": 1,
+            "device": {"serial": "MTPTESTSERIAL01", "checked": True},
+            "results": [{"op": "eject", "ok": True}],
+        }
 
-    backend = _FakeMtpEject()
+    backend = mtp.MtpBackend(
+        _mtp_device(), runner=fake_runner, cache_dir=tmp_path / "cache", gui_check=lambda: False
+    )
     args = build_parser().parse_args(
         ["ebook", "kindle", "eject", "--json", "-o", str(tmp_path / "media")]
     )
@@ -1728,9 +1763,27 @@ def test_eject_over_mtp_reports_the_mtp_backend(tmp_path, capsys):
         backend_factory=lambda d, *, cache_dir: backend,
     )
     assert exit_code == EXIT_OK
-    assert backend.ejects == 1
+    assert [op["op"] for ops in sent for op in ops] == ["eject"]
     result = _events(capsys)[-1]
     assert result["data"]["device"]["mode"] == "mtp"
-    # A backend this module does not recognise reports "unknown" rather than leaking a
-    # Python class name into the JSON contract.
-    assert result["data"]["device"]["backend"] == "unknown"
+    assert result["data"]["device"]["backend"] == "mtp"
+
+
+def test_eject_labels_an_unrecognised_backend_unknown(fake_kindle, tmp_path, capsys):
+    """A backend class absent from `_BACKEND_LABELS` (a test double here, a third
+    backend one day) degrades to `"unknown"` rather than leaking a Python class name
+    into the JSON contract, or crashing."""
+    backend = _RecordingEjectBackend(fake_kindle.mount)
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "eject", "--json", "-o", str(tmp_path / "media")]
+    )
+    assert (
+        kindle_cli.run_eject(
+            args,
+            device_finder=lambda: fake_kindle,
+            backend_factory=lambda d, *, cache_dir: backend,
+        )
+        == EXIT_OK
+    )
+    assert backend.ejects == 1
+    assert _events(capsys)[-1]["data"]["device"]["backend"] == "unknown"

@@ -358,8 +358,31 @@ def test_eject_raises_when_still_busy_after_the_retry(fake_kindle, monkeypatch):
     monkeypatch.setattr(massstorage.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(massstorage.subprocess, "run", fake_run)
 
-    with pytest.raises(RuntimeError):
+    # `DeviceBusy`, not a bare RuntimeError: `cli._error_code_for` tests for it before
+    # anything broader, so `ebook kindle eject` reports `device_busy` rather than
+    # `dependency_missing` — which would tell the user to install something because a
+    # window is open on their Kindle. It remains a RuntimeError subclass, so a caller
+    # that only cares that this failed is unaffected.
+    with pytest.raises(massstorage.DeviceBusy):
         massstorage.MassStorageBackend(fake_kindle.mount).eject()
+
+
+def test_an_eject_that_fails_for_any_other_reason_is_not_reported_as_busy(fake_kindle, monkeypatch):
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["diskutil", "info"]:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=plistlib.dumps({"ParentWholeDisk": "disk9"}), stderr=b""
+            )
+        if argv[:2] == ["diskutil", "eject"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="Unable to eject")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(massstorage.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(massstorage.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError) as caught:
+        massstorage.MassStorageBackend(fake_kindle.mount).eject()
+    assert not isinstance(caught.value, massstorage.DeviceBusy)
 
 
 def test_eject_uses_udisksctl_unmount_then_power_off_on_linux(fake_kindle, monkeypatch):

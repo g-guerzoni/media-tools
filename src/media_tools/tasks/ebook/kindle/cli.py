@@ -4262,12 +4262,14 @@ def run_eject(
     for.
 
     **A failed eject is reported through the same mapping every other command uses**
-    (`_error_code_for`, via `_run`). Worth reading precisely: a missing `diskutil` or
-    `udisksctl` surfaces as `dependency_missing`, and so does a volume that is still
-    busy after the retry — both reach `_run` as a plain `RuntimeError` from
-    `massstorage`, which the closed registry has no narrower code for. The device is
-    untouched either way; the fix for a busy volume is to close whatever is reading it
-    and run `eject` again.
+    (`_error_code_for`, via `_run`), and the two failures it actually has are told
+    apart there. A volume still busy after the retry is `device_busy`: `massstorage`
+    raises `DeviceBusy` for exactly that case, and the fix is to close whatever is
+    reading the volume and run `eject` again. Anything else — a missing `diskutil`,
+    `udisksctl` or `sync` binary — is `dependency_missing`, which is what that code
+    means. Both exit 3, and the device is untouched either way. (A `sync` that runs
+    and returns non-zero is not a failure here at all: its return code is deliberately
+    not checked, since it says nothing actionable.)
     """
     stages = ["detect", "eject"]
 

@@ -43,7 +43,7 @@ from media_tools.tasks.ebook.kindle.backend import (
     prefix_targets_a_forbidden_system_child,
     validate_writable_path,
 )
-from media_tools.tasks.ebook.kindle.detect import DeviceNotFound
+from media_tools.tasks.ebook.kindle.detect import DeviceBusy, DeviceNotFound
 
 # The four constants and two functions above USED to be defined here, with `mtp.py`
 # importing them from this module so the two backends' listings could not drift
@@ -215,6 +215,10 @@ class MassStorageBackend:
         return shutil.disk_usage(self.mount).free
 
     def eject(self) -> None:
+        # `sync` flushes what the HOST still owes the device; it writes no new content.
+        # Its return code is deliberately not checked (a `sync` that runs and reports
+        # non-zero tells us nothing actionable), but a `sync` binary that is missing
+        # outright still raises out of `_run`, like any other tool this file shells to.
         _run(["sync"])
         if platform.system() == "Darwin":
             _eject_macos(self.mount)
@@ -241,12 +245,31 @@ def _run(argv: list[str], *, text: bool = True, timeout: int = 30) -> subprocess
         raise RuntimeError(f"{argv[0]} failed: {error}") from error
 
 
+def _busy(result: subprocess.CompletedProcess) -> bool:
+    return result.returncode != 0 and "busy" in (result.stderr or "").lower()
+
+
 def _run_with_retry(argv: list[str]) -> None:
+    """Run it, retry once if the volume reports itself busy, and raise the exception
+    that says WHICH kind of failure it was.
+
+    `DeviceBusy` for a volume still in use after the retry, and only then: that is a
+    `RuntimeError` subclass, so a caller that only cares that this failed is unchanged,
+    while `cli._error_code_for` — which tests `DeviceBusy` before anything broader —
+    can report `device_busy` instead of `dependency_missing`. The difference is not
+    cosmetic: `dependency_missing` means "install something", and telling a user to
+    install something because a Finder window is open on their Kindle sends them after
+    the wrong problem entirely.
+    """
     result = _run(argv)
-    if result.returncode != 0 and "busy" in (result.stderr or "").lower():
+    if _busy(result):
         result = _run(argv)
-    if result.returncode != 0:
-        raise RuntimeError(f"{' '.join(argv)} failed: {(result.stderr or '').strip()}")
+    if result.returncode == 0:
+        return
+    message = f"{' '.join(argv)} failed: {(result.stderr or '').strip()}"
+    if _busy(result):
+        raise DeviceBusy(message)
+    raise RuntimeError(message)
 
 
 def _parent_disk_macos(mount: Path) -> str:
