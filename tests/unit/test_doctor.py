@@ -14,7 +14,9 @@ import sys
 
 import pytest
 
+from media_tools.core.events import EXIT_OK as EXIT_OK_CODE
 from media_tools.tasks import doctor as doctor_task
+from media_tools.tasks.ebook.kindle import detect as kindle_detect
 
 
 def _cli(*args, env=None):
@@ -385,3 +387,150 @@ def test_calibre_check_uses_find_tool_not_just_shutil_which(tmp_path, monkeypatc
 
     check = doctor_task._calibre_check()
     assert check.status == "ok"
+
+
+# -- Task 9: the Kindle section. Warnings, never failures --------------------------
+#
+# A machine with no Kindle attached is not a broken machine, and `compress`/`convert`/
+# `split`/`download`/`ebook build` never touch one — so neither of these two checks may
+# ever report "missing", which is the only status that moves `doctor`'s exit code.
+
+
+def test_doctor_reports_a_kindle_section(tmp_path):
+    payload = json.loads(_cli("doctor", "--json", "-o", str(tmp_path)).stdout)
+    names = {check["name"] for check in payload["checks"]}
+    assert {"kindle-mtp-driver", "kindle-device"} <= names
+
+
+def test_kindle_checks_are_warnings_never_failures(tmp_path):
+    payload = json.loads(_cli("doctor", "--json", "-o", str(tmp_path)).stdout)
+    for check in payload["checks"]:
+        if check["name"].startswith("kindle-"):
+            assert check["status"] in {"ok", "warn"}
+
+
+def test_kindle_checks_never_move_the_exit_code(tmp_path, monkeypatch):
+    # The whole point of "warnings, never failures": whatever these two answer, the
+    # exit code is decided by the checks that really do block a task.
+    def no_kindle():
+        raise kindle_detect.DeviceNotFound("nothing attached")
+
+    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", no_kindle)
+    monkeypatch.setattr(doctor_task.calibre, "find_tool", lambda name: None)
+    checks = doctor_task.check_all(check_updates=False, output_dir=tmp_path)
+    kindle_checks = [c for c in checks if c.name.startswith("kindle-")]
+    assert len(kindle_checks) == 2
+    assert all(c.status == "warn" for c in kindle_checks)
+    assert doctor_task._exit_code(checks) == EXIT_OK_CODE
+
+
+def test_kindle_device_check_warns_when_nothing_is_connected(monkeypatch):
+    def no_kindle():
+        raise kindle_detect.DeviceNotFound("nothing attached")
+
+    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", no_kindle)
+    check = doctor_task._kindle_device_check()
+    assert check.status == "warn"
+    assert "kindle" in (check.hint or "").lower()
+
+
+def test_kindle_device_check_reports_the_mode_when_one_is_connected(monkeypatch, tmp_path):
+    device = kindle_detect.Device(
+        serial="SERIAL-THAT-MUST-NOT-BE-PRINTED",
+        product_id=0x0004,
+        mode="mass_storage",
+        mount=tmp_path,
+    )
+    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", lambda: device)
+    check = doctor_task._kindle_device_check()
+    assert check.status == "ok"
+    assert "mass storage" in check.detail.lower()
+    # A serial identifies one physical device and nothing here needs it: `ebook kindle
+    # status` is where a user asks for that, deliberately and one command at a time.
+    assert "SERIAL-THAT-MUST-NOT-BE-PRINTED" not in check.detail + (check.hint or "")
+
+
+def test_kindle_device_check_reports_mtp_mode(monkeypatch):
+    device = kindle_detect.Device(serial=None, product_id=0x9981, mode="mtp", mount=None)
+    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", lambda: device)
+    check = doctor_task._kindle_device_check()
+    assert check.status == "ok"
+    assert "mtp" in check.detail.lower()
+
+
+def test_kindle_device_check_warns_when_the_device_is_held(monkeypatch):
+    def busy():
+        raise kindle_detect.DeviceBusy("Calibre has it")
+
+    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", busy)
+    check = doctor_task._kindle_device_check()
+    assert check.status == "warn"
+
+
+def test_kindle_device_check_never_raises(monkeypatch):
+    # Detection shells out to `ioreg`/reads /sys. Whatever goes wrong there, `doctor`
+    # answers "could not tell" rather than dying halfway through its own report.
+    def boom():
+        raise ValueError("ioreg said something unparseable")
+
+    monkeypatch.setattr(doctor_task.kindle_detect, "find_device", boom)
+    check = doctor_task._kindle_device_check()
+    assert check.status == "warn"
+
+
+def test_kindle_mtp_driver_check_warns_when_calibre_debug_is_absent(monkeypatch):
+    monkeypatch.setattr(doctor_task.calibre, "find_tool", lambda name: None)
+    check = doctor_task._kindle_mtp_driver_check()
+    assert check.status == "warn"
+    assert check.hint
+
+
+def test_kindle_mtp_driver_check_is_ok_when_the_probe_prints_its_marker(monkeypatch):
+    monkeypatch.setattr(doctor_task.calibre, "find_tool", lambda name: "/fake/calibre-debug")
+
+    def fake_run(argv, **kwargs):
+        assert argv[0] == "/fake/calibre-debug"
+        assert doctor_task._MTP_PROBE_MARKER in argv[-1]
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=f"chatter\n{doctor_task._MTP_PROBE_MARKER}\n", stderr=""
+        )
+
+    monkeypatch.setattr(doctor_task.subprocess, "run", fake_run)
+    check = doctor_task._kindle_mtp_driver_check()
+    assert check.status == "ok"
+
+
+def test_kindle_mtp_driver_check_warns_when_the_import_fails(monkeypatch):
+    monkeypatch.setattr(doctor_task.calibre, "find_tool", lambda name: "/fake/calibre-debug")
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr="ModuleNotFoundError: calibre.devices.mtp.driver"
+        )
+
+    monkeypatch.setattr(doctor_task.subprocess, "run", fake_run)
+    check = doctor_task._kindle_mtp_driver_check()
+    assert check.status == "warn"
+
+
+def test_kindle_mtp_driver_check_warns_when_the_probe_cannot_run(monkeypatch):
+    monkeypatch.setattr(doctor_task.calibre, "find_tool", lambda name: "/fake/calibre-debug")
+
+    def fake_run(argv, **kwargs):
+        raise OSError("no such file")
+
+    monkeypatch.setattr(doctor_task.subprocess, "run", fake_run)
+    check = doctor_task._kindle_mtp_driver_check()
+    assert check.status == "warn"
+
+
+def test_kindle_mtp_driver_probe_marker_never_matches_by_accident(monkeypatch):
+    # Exit 0 alone is not enough: `calibre-debug` exits 0 for plenty of things that
+    # never imported the driver, so the marker the probe prints is the real signal.
+    monkeypatch.setattr(doctor_task.calibre, "find_tool", lambda name: "/fake/calibre-debug")
+    monkeypatch.setattr(
+        doctor_task.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
+    )
+    assert doctor_task._kindle_mtp_driver_check().status == "warn"

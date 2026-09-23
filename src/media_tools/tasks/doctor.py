@@ -12,6 +12,13 @@ Calibre and the OpenRouter key are both WARNINGS, never failures: `compress`,
 `convert` (for non-ebook formats), `split`, `download`, `formats` and `status` need
 neither. Each check's message says which command actually needs it.
 
+The same rule covers the two Kindle checks (`kindle-mtp-driver`, `kindle-device`), and
+covers them absolutely: a machine with no Kindle attached is not a broken machine, and
+nothing outside `media-tools ebook kindle ...` ever touches one. Neither check may
+report `"missing"` — that status is what moves `doctor`'s own exit code to 3, which
+would turn "no Kindle plugged in right now" into a failed environment check at every
+session start.
+
 `doctor` must never print a secret: the OpenRouter key check goes through
 `integrations.openrouter.key_present` (RULING RB2) — the same lookup `ebook build`
 itself uses (a literal `OPENROUTER_API_KEY`, an `op://vault/item/field` reference, or
@@ -37,6 +44,7 @@ from media_tools.core.events import EXIT_DEPENDENCY, EXIT_OK, EXIT_USAGE
 from media_tools.core.ffmpeg import ffmpeg_exe
 from media_tools.core.paths import output_root
 from media_tools.integrations import calibre, openrouter
+from media_tools.tasks.ebook.kindle import detect as kindle_detect
 
 NAME = "doctor"
 HELP = "Check the environment: ffmpeg, Calibre, Deno, output root, and more."
@@ -257,6 +265,116 @@ def _openrouter_check(op_item: str | None = None, *, env=None, runner=None) -> C
     return Check("openrouter-key", "warn", "not configured", hint=hint)
 
 
+# -- the Kindle section: warnings only, never a failure ------------------------------
+#
+# `media-tools ebook kindle ...` is the only thing on this list that needs a Kindle, and
+# only its MTP half needs Calibre's device driver. Both checks therefore answer "warn"
+# for every unhappy path, including the entirely ordinary one where no Kindle is
+# plugged in.
+
+#: What the probe below prints on success. Checked for in the probe's OUTPUT rather
+#: than trusting its exit code: `calibre-debug` exits 0 for plenty of invocations that
+#: never reached the driver, and a silent success is exactly the answer this check
+#: must not give.
+_MTP_PROBE_MARKER = "media-tools-mtp-driver-ok"
+#: Imports only — nothing here scans, opens or otherwise touches a device, so this is
+#: safe to run at session start with a Kindle attached and mid-transfer.
+_MTP_PROBE = (
+    "from calibre.devices.mtp.driver import MTP_DEVICE; "
+    "from calibre.devices.scanner import DeviceScanner; "
+    f"print({_MTP_PROBE_MARKER!r})"
+)
+_MTP_PROBE_TIMEOUT_S = 30.0
+_MTP_DRIVER_HINT = (
+    "needed only by `media-tools ebook kindle ...` against a 2024-or-later Kindle "
+    "(or a Scribe), which speaks MTP and has no disk to mount: install Calibre "
+    "(brew install --cask calibre). A mass-storage Kindle needs none of this"
+)
+_KINDLE_DEVICE_HINT = (
+    "only `media-tools ebook kindle ...` needs one; connect a Kindle over USB and "
+    "unlock it. A 2024-or-later model (or a Scribe) shows no disk — that is expected, "
+    "it speaks MTP"
+)
+#: Stable, human-readable labels for `detect.Device.mode`. Deliberately not
+#: `device.mode` itself: that is a JSON literal in `ebook kindle status`'s payload, and
+#: this line is prose a person reads.
+_KINDLE_MODE_LABELS = {"mass_storage": "mass storage", "mtp": "MTP"}
+
+
+def _kindle_mtp_driver_check() -> Check:
+    """Whether Calibre's own MTP driver imports inside Calibre's interpreter.
+
+    `tasks.ebook.kindle.mtp` can never import that driver from this process — it only
+    loads under Calibre's own Python — so the only honest check is to ask
+    `calibre-debug` to import it and say so. The probe imports and prints; it never
+    constructs a driver, scans the USB bus or opens anything, so running it costs
+    nothing and cannot disturb a device that is mid-transfer.
+    """
+    exe = calibre.find_tool("calibre-debug")
+    if exe is None:
+        return Check("kindle-mtp-driver", "warn", "calibre-debug not found", hint=_MTP_DRIVER_HINT)
+    try:
+        proc = subprocess.run(
+            [exe, "-c", _MTP_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=_MTP_PROBE_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return Check(
+            "kindle-mtp-driver",
+            "warn",
+            f"found at {exe} but it did not run ({error})",
+            hint=_MTP_DRIVER_HINT,
+        )
+    if _MTP_PROBE_MARKER in (proc.stdout or ""):
+        return Check("kindle-mtp-driver", "ok", "calibre.devices.mtp.driver imports")
+    tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1]
+    return Check(
+        "kindle-mtp-driver",
+        "warn",
+        f"calibre.devices.mtp.driver did not import{f' ({tail})' if tail else ''}",
+        hint=_MTP_DRIVER_HINT,
+    )
+
+
+def _kindle_device_check() -> Check:
+    """Whether a Kindle is connected, and in which of the two modes.
+
+    Never raises and never reports `"missing"`. Detection shells out to `ioreg` on
+    macOS and reads `/sys` on Linux, so the failure modes are real; a broad catch is
+    deliberate, because a health check that dies halfway through its own report is
+    worse than one that says it could not tell. No serial is ever printed: it
+    identifies one physical device, and nothing here needs it — `ebook kindle status`
+    is where a user asks for that, deliberately and one command at a time.
+    """
+    try:
+        device = kindle_detect.find_device()
+    except kindle_detect.DeviceNotFound:
+        return Check("kindle-device", "warn", "no Kindle connected", hint=_KINDLE_DEVICE_HINT)
+    except kindle_detect.DeviceBusy:
+        return Check(
+            "kindle-device",
+            "warn",
+            "a Kindle is connected but another program holds it",
+            hint="close Calibre (or whatever else has the device) and try again",
+        )
+    except Exception as error:  # noqa: BLE001 - a health check must never die reporting
+        return Check(
+            "kindle-device",
+            "warn",
+            f"could not tell whether a Kindle is connected ({error})",
+            hint=_KINDLE_DEVICE_HINT,
+        )
+    label = _KINDLE_MODE_LABELS.get(device.mode, device.mode)
+    return Check(
+        "kindle-device",
+        "ok",
+        f"connected ({label})",
+        hint="`media-tools ebook kindle status` reports it in full",
+    )
+
+
 def _output_root_check(root: Path) -> Check:
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -356,6 +474,8 @@ def check_all(
         _deno_check(),
         _calibre_check(),
         _openrouter_check(op_item),
+        _kindle_mtp_driver_check(),
+        _kindle_device_check(),
         _output_root_check(root),
     ]
     if check_updates:
