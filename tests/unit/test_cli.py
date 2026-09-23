@@ -137,6 +137,27 @@ def test_keyboard_interrupt_in_a_task_exits_130(monkeypatch):
     assert main(["compress", "x"]) == 130
 
 
+def test_keyboard_interrupt_also_emits_an_error_and_a_result(monkeypatch, capsys):
+    # C2: this outer handler is the last resort for a task whose own code let a
+    # KeyboardInterrupt escape uncaught — it must still leave a --json caller with
+    # an `error` AND a matching `result` (exit 130), not a bare process exit with
+    # nothing usable on stdout.
+    def boom(args):
+        raise KeyboardInterrupt
+
+    compress_task = next(t for t in TASKS if t.NAME == "compress")
+    monkeypatch.setattr(compress_task, "run", boom)
+    code = main(["compress", "x", "--json"])
+    assert code == 130
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    (error,) = [e for e in events if e["type"] == "error"]
+    assert error["code"] == "interrupted"
+    (result,) = [e for e in events if e["type"] == "result"]
+    assert result["exit_code"] == 130
+    assert result["ok"] is False
+
+
 # -- C3: an unanticipated exception must not escape as a bare traceback --------------
 
 
@@ -164,6 +185,11 @@ def test_unexpected_exception_emits_an_internal_error_json_event(monkeypatch, ca
     assert "RuntimeError" in error["message"]
     assert "kaboom" in error["message"]
     assert error["hint"]
+    # C2: this generic handler must also emit a `result`, so a --json caller does
+    # not have to special-case "the stream ended after an error with no result".
+    (result,) = [e for e in events if e["type"] == "result"]
+    assert result["exit_code"] == EXIT_FAILED
+    assert result["ok"] is False
 
 
 # -- C2: a corrupt or non-object run.json must fail cleanly, not crash ---------------

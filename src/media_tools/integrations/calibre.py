@@ -216,6 +216,37 @@ def convert(
         raise CalibreError(tail or f"ebook-convert exited {proc.returncode}")
 
 
+def update_metadata(
+    path: Path,
+    *,
+    title: str,
+    author: str | None,
+    language: str | None,
+    cache_dir: Path,
+    timeout: int = 120,
+) -> None:
+    """Rewrite a book's embedded title/author/language in place via `ebook-meta`
+    (RB20). `library.reconcile` renames a file whose stable book id matches an
+    already-converted copy instead of reconverting it, on the (until now false)
+    assumption that renaming alone is enough — but the file's *embedded* metadata
+    still carries whatever title/author/language it was converted with under its
+    OLD name. Calling this on the renamed file is what makes the rename honest:
+    the file genuinely matches the plan afterward, instead of merely sitting at
+    the right path with stale metadata that `_verify_output` (rightly) rejects."""
+    tool = EBOOK_META.locate()
+    if tool is None:
+        raise CalibreError(f"ebook-meta not found. {_INSTALL_HINT}")
+    argv = [tool, str(path), f"--title={title}"]
+    if author:
+        argv.append(f"--authors={author}")
+    if language:
+        argv.append(f"--language={language}")
+    proc = _run(argv, cache_dir=cache_dir, timeout=timeout)
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-10:])
+        raise CalibreError(tail or f"ebook-meta exited {proc.returncode}")
+
+
 def extract_cover(src: Path, dest: Path, *, cache_dir: Path, timeout: int = 120) -> bool:
     tool = EBOOK_META.locate()
     if tool is None:

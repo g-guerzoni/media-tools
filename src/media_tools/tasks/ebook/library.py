@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from media_tools.core.paths import truncate_name
@@ -114,6 +114,11 @@ class ReconcileReport:
     renamed: int
     missing: list[Path]
     leftover: list[Path]
+    # The specific sources reconcile renamed into place (as opposed to `renamed`,
+    # the plain count `result.data` reports) — a caller needs these to know exactly
+    # which files now carry stale embedded metadata under their new name and must
+    # have it rewritten (RB20/C1).
+    renamed_sources: list[Path] = field(default_factory=list)
 
 
 def _read_book_id(path: Path) -> str | None:
@@ -126,6 +131,7 @@ def reconcile(
     book_ids: dict[Path, str],
     *,
     dry_run: bool,
+    force: bool = False,
     id_reader: Callable[[Path], str | None] | None = None,
 ) -> ReconcileReport:
     """Make the batch directory match `planned`, without reconverting anything
@@ -139,9 +145,18 @@ def reconcile(
     file is never claimed for two different targets: once it has been kept or
     renamed, it is off the table for every later planned entry. Anything still
     left over once every planned target is settled — a book that fell out of the
-    plan entirely — moves to `_leftover/`, never something this call just placed.
-    `dry_run` moves and creates nothing, but the report (including `leftover`)
-    still reflects what a real run would do.
+    plan entirely — moves to `_leftover/`, mirroring its path relative to the
+    batch directory (I3: flattening to `_leftover/<name>` silently destroys one of
+    two same-named files from different language folders) — never something this
+    call just placed. `dry_run` moves and creates nothing, but the report
+    (including `leftover`) still reflects what a real run would do.
+
+    `force=True` (minor finding) skips the book-id twin lookup entirely: `--force`
+    means "redo items whose output exists", and a book `reconcile` can find under
+    an old name is exactly such an item — silently renaming it into place instead
+    would defeat `--force` for that one book. Its old file is then simply left
+    unclaimed and swept to `_leftover/` like any other file the plan doesn't want,
+    while the source gets a genuine reconversion.
     """
     id_reader = id_reader or _read_book_id
     existing = [
@@ -153,13 +168,15 @@ def reconcile(
         and path.name != LOCK_FILENAME
     ]
     by_id: dict[str, Path] = {}
-    for path in existing:
-        found = id_reader(path)
-        if found and found not in by_id:
-            by_id[found] = path
+    if not force:
+        for path in existing:
+            found = id_reader(path)
+            if found and found not in by_id:
+                by_id[found] = path
 
     kept = renamed = 0
     missing: list[Path] = []
+    renamed_sources: list[Path] = []
     claimed_targets: set[Path] = set()
     claimed_twins: set[Path] = set()
     for source, target in planned.items():
@@ -172,11 +189,12 @@ def reconcile(
             kept += 1
             claimed_targets.add(target)
             continue
-        twin = by_id.get(book_ids.get(source, ""))
+        twin = None if force else by_id.get(book_ids.get(source, ""))
         if twin is not None and twin not in claimed_twins:
             # The book is already converted, only its name changed: rename, never
             # reconvert.
             renamed += 1
+            renamed_sources.append(source)
             claimed_targets.add(target)
             claimed_twins.add(twin)
             if not dry_run:
@@ -190,8 +208,16 @@ def reconcile(
         path for path in existing if path not in claimed_twins and path not in planned_targets
     ]
     if leftover and not dry_run:
-        destination = batch_dir / LEFTOVER_DIR
-        destination.mkdir(parents=True, exist_ok=True)
+        destination_root = batch_dir / LEFTOVER_DIR
         for path in leftover:
-            path.replace(destination / path.name)
-    return ReconcileReport(kept=kept, renamed=renamed, missing=missing, leftover=leftover)
+            relative = path.relative_to(batch_dir)
+            destination = destination_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            path.replace(destination)
+    return ReconcileReport(
+        kept=kept,
+        renamed=renamed,
+        missing=missing,
+        leftover=leftover,
+        renamed_sources=renamed_sources,
+    )

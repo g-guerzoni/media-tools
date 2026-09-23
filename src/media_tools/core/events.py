@@ -68,6 +68,7 @@ WARNING_CODES = frozenset(
         "device_rejected_thumbnail",
         "hash_from_previous",
         "name_collision_suffixed",
+        "leftover_book",
     }
 )
 

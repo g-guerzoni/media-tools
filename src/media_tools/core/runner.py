@@ -129,7 +129,12 @@ def write_summary_json(summary_json: Path | None, result: dict) -> None:
     Shared by `run_items` and `download`'s own loop so the two never drift apart."""
     if summary_json is None:
         return
-    payload = {"v": 1, "type": "result", **result, "run_file": str(result["run_file"])}
+    # `result["run_file"]` is already `None` (not the string `"None"`) whenever a run
+    # never owned a batch — e.g. `ebook build --dry-run` now honouring
+    # --summary-json (M2) — matching how `Reporter.result` itself already handles it
+    # on stdout.
+    run_file = str(result["run_file"]) if result["run_file"] else None
+    payload = {"v": 1, "type": "result", **result, "run_file": run_file}
     Path(summary_json).parent.mkdir(parents=True, exist_ok=True)
     Path(summary_json).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"

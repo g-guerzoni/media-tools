@@ -257,33 +257,17 @@ def _gather_sources(
     return [s.path for s in sources], {}
 
 
-def _apply_language_fallback(
-    verdicts: dict[Path, normalize_stage.Verdict],
-    facts_by_path: dict[Path, metadata_stage.BookFacts],
-) -> None:
-    """Spec 8.2's offline chain is "title heuristic, then the embedded language
-    field, else unknown" — but `normalize.heuristic()` (and the LLM path's own
-    fallback) only ever calls `language.detect(title, author)`, which is
-    deliberately conservative and returns None for most short/ambiguous titles
-    (see its own module docstring). Filling in the embedded language here, once,
-    for every verdict that still has none, is what actually gets a title like
-    "Dom Casmurro" (no stopword the detector can key on) shelved under `pt/`
-    instead of `_review/unknown-language/`."""
-    for path, verdict in list(verdicts.items()):
-        if verdict.language:
-            continue
-        facts = facts_by_path.get(path)
-        if facts is None or not facts.meta_language:
-            continue
-        code = facts.meta_language.strip().lower()
-        if len(code) == 2 and code.isalpha():
-            verdicts[path] = replace(verdict, language=code)
-
-
 def _apply_list_overrides(
     verdicts: dict[Path, normalize_stage.Verdict],
     overrides: dict[Path, tuple[str | None, str | None, str | None]],
 ) -> None:
+    """RB22: the language precedence chain's top step (`--list` override > LLM >
+    embedded tag > title heuristic > unknown) — the rest of the chain now lives
+    entirely inside `normalize.heuristic()`/`_verdict_from()`; there is no longer a
+    separate `_apply_language_fallback` pass here (an embedded tag used to only be
+    consulted here, as a fallback AFTER the title heuristic already ran and could
+    have already produced a wrong, confident guess — see `normalize.heuristic`'s
+    own docstring for why that ordering was the actual bug)."""
     for path, (title, author, language) in overrides.items():
         base = verdicts.get(path)
         if base is None:
@@ -293,6 +277,7 @@ def _apply_list_overrides(
             title=title if title else base.title,
             author=author if author else base.author,
             language=language if language else base.language,
+            language_origin="list" if language else base.language_origin,
             source="list",
         )
 
@@ -415,6 +400,15 @@ def _stage_index(name: str) -> int:
     return STAGE_ORDER.index(name)
 
 
+def _announce_stage(reporter: Reporter, stage_name: str, stages: list[str]) -> None:
+    """Emit `stage` for `stage_name` only when it is actually one of THIS run's
+    declared stages (`start`'s own `stages` list) — a subcommand that stops before
+    a given stage never announces it, even though some of that stage's cheap work
+    (e.g. `dedup.group`'s exact pass) still runs unconditionally further down."""
+    if stage_name in stages:
+        reporter.stage(stage=stage_name, index=stages.index(stage_name) + 1, count=len(stages))
+
+
 def _build_plan(
     paths: list[Path],
     overrides: dict[Path, tuple[str | None, str | None, str | None]],
@@ -426,20 +420,54 @@ def _build_plan(
     api_key: str | None,
     cache_dir: Path,
     prefer: tuple[str, ...],
+    reporter: Reporter,
+    stages: list[str],
 ) -> _Plan:
+    # I5: each stage is announced as it actually begins (metadata/normalize/dedup/
+    # covers all happen in here, one after another) instead of all eight firing
+    # upfront before any work starts — and `on_progress`, which `read_all`/
+    # `classify`/`resolve` already accept, is now actually wired to
+    # `Reporter.progress` so the metadata-read phase (the ~113s-of-silence case on
+    # a real 3,590-book library) reports something between the "metadata" and
+    # "normalize" stage events.
+    _announce_stage(reporter, "scan", stages)  # sources were already expanded by
+    # `_gather_sources` before `_run_pipeline` even emitted `start` — see its docstring.
+
     dropped: dict[Path, str] = {}
 
     def on_error(path: Path, message: str) -> None:
         dropped[path] = message
 
+    _announce_stage(reporter, "metadata", stages)
+
+    def _metadata_progress(done: int, total: int, path: Path) -> None:
+        reporter.progress(
+            stage="metadata", index=done, count=total, path=path, percent=100 * done / total
+        )
+
     facts = metadata_stage.read_all(
-        paths, cache_dir=(None if dry_run else cache_dir), workers=8, on_error=on_error
+        paths,
+        cache_dir=(None if dry_run else cache_dir),
+        workers=8,
+        on_error=on_error,
+        on_progress=_metadata_progress,
     )
     facts_by_path = {f.path: f for f in facts}
 
+    _announce_stage(reporter, "normalize", stages)
     if llm_enabled:
+
+        def _normalize_progress(done: int, total: int) -> None:
+            reporter.progress(
+                stage="normalize", index=done, count=total, path="batch", percent=100 * done / total
+            )
+
         verdicts, normalize_stats = normalize_stage.classify(
-            facts, model=args.model, api_key=api_key, cache_dir=(None if dry_run else cache_dir)
+            facts,
+            model=args.model,
+            api_key=api_key,
+            cache_dir=(None if dry_run else cache_dir),
+            on_progress=_normalize_progress,
         )
     else:
         verdicts = {f.path: normalize_stage.heuristic(f) for f in facts}
@@ -451,10 +479,10 @@ def _build_plan(
             "errors": 0,
         }
 
-    _apply_language_fallback(verdicts, facts_by_path)
     _apply_list_overrides(verdicts, overrides)
 
     formats = {f.path: f.fmt for f in facts}
+    _announce_stage(reporter, "dedup", stages)
     groups = dedup_stage.group(verdicts, preference=prefer, formats=formats)
     dedup_stats = {"llm_calls": 0, "buckets": 0, "merges": 0, "errors": 0, "blocked_merges": 0}
     if llm_enabled and _stage_index(stop_after) >= _stage_index("dedup"):
@@ -465,6 +493,7 @@ def _build_plan(
     cover_results: dict[Path, covers_stage.CoverResult] = {}
     book_ids: dict[Path, str] = {}
     if _stage_index(stop_after) >= _stage_index("covers"):
+        _announce_stage(reporter, "covers", stages)
         for group in groups:
             book_ids[group.winner] = opf.book_id(group.winner)
         if dry_run:
@@ -483,11 +512,18 @@ def _build_plan(
                 )
                 for group in groups
             }
+
+            def _covers_progress(done: int, total: int, phase: str) -> None:
+                reporter.progress(
+                    stage="covers", index=done, count=total, path=phase, percent=100 * done / total
+                )
+
             cover_results = covers_stage.resolve(
                 books,
                 cache_dir=cache_dir,
                 fetch=(not args.no_cover_fetch),
                 workers=(args.workers or 4),
+                on_progress=_covers_progress,
             )
 
     return _Plan(
@@ -531,6 +567,7 @@ def _item_data(
         "author": verdict.author,
         "language": verdict.language,
         "origin": verdict.source,
+        "language_origin": verdict.language_origin,
         "duplicates": [str(p) for p in sorted(group.members, key=str) if p != group.winner],
         "cover_source": cover.source if cover else None,
         "output": str(output) if output else None,
@@ -554,14 +591,17 @@ def _run_pipeline(
     dry_run = args.dry_run
     stages = list(STAGE_ORDER[: _stage_index(stop_after) + 1])
 
-    # `start` (and the stage announcements) are emitted BEFORE the expensive planning
-    # phase below — metadata reads across the whole library, the LLM normalize/dedup
-    # passes, cover resolution — rather than after it. For a library of any size that
-    # phase is minutes of work plus network calls: the single most likely place a
-    # person presses Ctrl+C, and until `start` reaches stdout a --json caller has
-    # nothing to make sense of. `items` is the raw source count; the true post-dedup
-    # item count is only known once planning finishes and is what `result.counts`
-    # reports.
+    # `start` is emitted BEFORE the expensive planning phase below — metadata reads
+    # across the whole library, the LLM normalize/dedup passes, cover resolution —
+    # rather than after it. For a library of any size that phase is minutes of work
+    # plus network calls: the single most likely place a person presses Ctrl+C, and
+    # until `start` reaches stdout a --json caller has nothing to make sense of.
+    # `items` is the raw source count; the true post-dedup item count is only known
+    # once planning finishes and is what `result.counts` reports. Unlike before
+    # (I5), the `stage` events themselves are NOT all announced here up front —
+    # `_build_plan` emits each one as that stage's work actually begins, and wires
+    # real progress events (metadata/normalize/covers) in between them; "convert"/
+    # "verify"/"organize" are announced further down, the same way.
     reporter.start(
         tool=NAME,
         batch=batch_dir.name,
@@ -570,8 +610,6 @@ def _run_pipeline(
         items=len(paths),
         options=options,
     )
-    for index, stage_name in enumerate(stages, start=1):
-        reporter.stage(stage=stage_name, index=index, count=len(stages))
 
     try:
         plan = _build_plan(
@@ -584,6 +622,8 @@ def _run_pipeline(
             api_key=api_key,
             cache_dir=cache_dir,
             prefer=prefer,
+            reporter=reporter,
+            stages=stages,
         )
     except KeyboardInterrupt:
         # No batch was ever opened yet (planning runs before RunState.open()), so
@@ -600,6 +640,7 @@ def _run_pipeline(
             batch_dir=batch_dir,
             options=options,
             stop_after=stop_after,
+            args=args,
         )
 
     try:
@@ -638,6 +679,9 @@ def _run_pipeline(
         for group in sorted(plan.groups, key=lambda g: str(g.winner)):
             state.add_item(str(group.winner))
 
+        convert_plan = None  # initialized here so a KeyboardInterrupt during the
+        # dropped-items loop below (before this is otherwise assigned) can still
+        # report placement-free `result.data` instead of raising NameError.
         try:
             item_id = 0
             for path in sorted(plan.dropped, key=str):
@@ -663,18 +707,34 @@ def _run_pipeline(
                 exit_code = EXIT_FAILED
                 if args.stop_on_error:
                     state.finish("failed")
-                    return _finish_and_report(state, batch_dir, reporter, exit_code, plan, args)
+                    return _finish_and_report(
+                        state, batch_dir, reporter, exit_code, plan, args, convert_plan=None
+                    )
 
-            convert_plan = None
             convert_errors: dict[Path, str] = {}
             if reaches_convert:
+                _announce_stage(reporter, "convert", stages)
                 convert_plan = _plan_and_reconcile(
                     plan, batch_dir=batch_dir, to=args.to, force=args.force
                 )
+                _report_leftovers(convert_plan["leftover"], batch_dir=batch_dir, reporter=reporter)
                 workers = args.workers or min(4, os.cpu_count() or 1)
                 convert_errors = _convert_missing_books(
                     plan, convert_plan, cache_dir=cache_dir, to=args.to, workers=workers
                 )
+                # RB20/C1: a file `reconcile()` renamed into place still carries
+                # whatever title/author/language it was converted with under its OLD
+                # name — rewrite it to match the plan so the rename is honest and
+                # `_verify_output` (below, in the "organize" phase) isn't comparing
+                # the new target's embedded metadata against a title Calibre never
+                # actually wrote there.
+                convert_errors.update(
+                    _rewrite_renamed_metadata(plan, convert_plan, cache_dir=cache_dir)
+                )
+
+            if reaches_organize:
+                _announce_stage(reporter, "verify", stages)
+                _announce_stage(reporter, "organize", stages)
 
             for group in sorted(plan.groups, key=lambda g: str(g.winner)):
                 item_id += 1
@@ -730,22 +790,66 @@ def _run_pipeline(
             state.finish("interrupted")
             reporter.error(code="interrupted", message="interrupted by user")
             result = build_result(state, batch_dir, EXIT_INTERRUPTED)
-            result["data"] = {"llm": _llm_summary(plan)}
+            result["data"] = _result_data(plan, convert_plan)
             reporter.result(**result)
             write_summary_json(args.summary_json, result)
             return EXIT_INTERRUPTED
 
         state.finish("done" if exit_code == EXIT_OK else "failed")
 
-    return _finish_and_report(state, batch_dir, reporter, exit_code, plan, args)
+    return _finish_and_report(state, batch_dir, reporter, exit_code, plan, args, convert_plan)
 
 
-def _finish_and_report(state, batch_dir, reporter, exit_code, plan, args) -> int:
+def _result_data(plan: _Plan, convert_plan: dict | None) -> dict:
+    """The final `result` event's (and `--summary-json`'s) `data` payload: the LLM
+    cost summary every run has had since Task 12, plus (I4 — new) `placement`'s
+    kept/renamed/leftover counts whenever this run actually reached the convert
+    stage. Those three were computed by `reconcile()` all along but never surfaced
+    anywhere a caller could see them."""
+    data: dict = {"llm": _llm_summary(plan)}
+    if convert_plan is not None:
+        data["placement"] = {
+            "kept": convert_plan["kept"],
+            "renamed": convert_plan["renamed"],
+            "leftover": len(convert_plan["leftover"]),
+        }
+    return data
+
+
+def _finish_and_report(state, batch_dir, reporter, exit_code, plan, args, convert_plan=None) -> int:
     result = build_result(state, batch_dir, exit_code)
-    result["data"] = {"llm": _llm_summary(plan)}
+    result["data"] = _result_data(plan, convert_plan)
     reporter.result(**result)
     write_summary_json(args.summary_json, result)
     return exit_code
+
+
+# A leftover is reported by name up to this many files; past it, one summarising
+# warning is emitted instead of flooding the stream with one line per file (I4).
+_LEFTOVER_WARNING_NAMED_LIMIT = 5
+
+
+def _report_leftovers(leftover: list[Path], *, batch_dir: Path, reporter: Reporter) -> None:
+    """I4: `reconcile()` already computes exactly which files matched nothing in
+    this plan and swept them to `_leftover/` — silently, before this fix: no item,
+    no warning, no `run.json` entry named them. This does not add an `item` (a
+    leftover was never part of the plan to begin with, so it has no book id, no
+    verdict, nothing an `item` event's shape expects) but it does make the move
+    visible as a `warning`, by name when there are only a few."""
+    if not leftover:
+        return
+    if len(leftover) <= _LEFTOVER_WARNING_NAMED_LIMIT:
+        for path in sorted(leftover, key=str):
+            try:
+                relative = path.relative_to(batch_dir)
+            except ValueError:
+                relative = path
+            reporter.warning(code="leftover_book", message=f"moved to _leftover/: {relative}")
+    else:
+        reporter.warning(
+            code="leftover_book",
+            message=f"{len(leftover)} files matched nothing in this plan; moved to _leftover/",
+        )
 
 
 def _plan_and_reconcile(plan: _Plan, *, batch_dir: Path, to: str, force: bool):
@@ -759,7 +863,7 @@ def _plan_and_reconcile(plan: _Plan, *, batch_dir: Path, to: str, force: bool):
             if target.exists():
                 target.unlink()
     book_ids = {source: plan.book_ids[source] for source in planned}
-    report = library.reconcile(batch_dir, planned, book_ids, dry_run=False)
+    report = library.reconcile(batch_dir, planned, book_ids, dry_run=False, force=force)
     return {
         "planned": planned,
         "collisions": collisions,
@@ -767,7 +871,34 @@ def _plan_and_reconcile(plan: _Plan, *, batch_dir: Path, to: str, force: bool):
         "kept": report.kept,
         "renamed": report.renamed,
         "leftover": report.leftover,
+        "renamed_sources": set(report.renamed_sources),
     }
+
+
+def _rewrite_renamed_metadata(plan: _Plan, convert_plan, *, cache_dir: Path) -> dict[Path, str]:
+    """RB20/C1: a file `reconcile()` renamed into place is, by construction, still
+    carrying the title/author/language it was converted with under its OLD name —
+    that is exactly what makes the rename free instead of a reconversion, but it
+    also means the file does not yet genuinely match the plan. Rewrite it here so
+    it does. Returns `{source: error message}` for any rewrite that failed, in the
+    same shape `_convert_missing_books` already returns, so both merge into one
+    `convert_errors` dict and `_finalize_group` needs no separate failure path for
+    "renamed" vs "converted"."""
+    errors: dict[Path, str] = {}
+    for source in convert_plan["renamed_sources"]:
+        verdict = plan.verdicts[source]
+        target = convert_plan["planned"][source]
+        try:
+            calibre.update_metadata(
+                target,
+                title=verdict.title,
+                author=verdict.author,
+                language=verdict.language,
+                cache_dir=cache_dir,
+            )
+        except calibre.CalibreError as error:
+            errors[source] = str(error)
+    return errors
 
 
 def _verify_output(target: Path, verdict: normalize_stage.Verdict, cache_dir: Path):
@@ -784,10 +915,11 @@ def _verify_output(target: Path, verdict: normalize_stage.Verdict, cache_dir: Pa
         records = exth.read_records(target)
         if not exth.record_text(records, exth.TAG_UUID):
             warnings.append("book_id_missing")
-        if not (
-            exth.record_text(records, exth.TAG_COVER_OFFSET)
-            and exth.record_text(records, exth.TAG_THUMB_OFFSET)
-        ):
+        # M5: 201/202 are binary offset records, not text — decoding them as UTF-8
+        # only to test presence (the old code) is the wrong tool for the job and
+        # can occasionally "succeed" on garbage; a plain key check is what presence
+        # actually means here.
+        if records.get(exth.TAG_COVER_OFFSET) is None or records.get(exth.TAG_THUMB_OFFSET) is None:
             warnings.append("cover_not_embedded")
     return True, warnings
 
@@ -812,21 +944,30 @@ def _finalize_group(
     target = convert_plan["planned"][group.winner]
     warnings = ["name_collision_suffixed"] if group.winner in convert_plan["collisions"] else []
 
+    # C1: `convert_errors` now holds BOTH a real conversion failure (a book that
+    # needed `ebook-convert`) and a failed metadata rewrite on a renamed book (see
+    # `_rewrite_renamed_metadata`) — checking it before branching on `missing`
+    # means a renamed-but-not-yet-honest book can fail here too, instead of the old
+    # code's unconditional "skipped/exists" for anything reconcile didn't have to
+    # convert, which is exactly what made a renamed book's stale embedded title
+    # report `failed` forever once `_verify_output` below actually checked it.
+    error = convert_errors.get(group.winner)
+    if error is not None:
+        data = _item_data(group, plan, reaches_covers=reaches_covers, output=None)
+        data["error"] = error
+        return {
+            "status": "failed",
+            "reason": "engine_error",
+            "warnings": warnings,
+            "data": data,
+            "output": None,
+        }
+
     if group.winner not in convert_plan["missing"]:
-        # Already there (kept) or renamed into place by reconcile(): nothing to convert.
+        # Already there (kept), or renamed into place by reconcile() and its
+        # metadata rewritten to match (see above): nothing left to convert.
         status, reason = "skipped", "exists"
     else:
-        error = convert_errors.get(group.winner)
-        if error is not None:
-            data = _item_data(group, plan, reaches_covers=reaches_covers, output=None)
-            data["error"] = error
-            return {
-                "status": "failed",
-                "reason": "engine_error",
-                "warnings": warnings,
-                "data": data,
-                "output": None,
-            }
         status, reason = "done", None
 
     if reaches_organize and target.exists():
@@ -927,7 +1068,18 @@ def _convert_missing_books(
         futures = {pool.submit(_run, group): group.winner for group in jobs}
         for future in as_completed(futures):
             source = futures[future]
-            error = future.result()
+            try:
+                error = future.result()
+            except Exception as exc:
+                # C2: `_convert_one` already turns a `calibre.CalibreError` into a
+                # returned message, but an OSError from `mkdir`/`write_opf`/
+                # `mkstemp`/`fsync_replace` (a full disk, a read-only mount) is not
+                # a CalibreError and used to propagate straight out of this
+                # `future.result()`, past every caller's own handling, into
+                # `cli.main`'s generic handler — killing the whole batch instead of
+                # failing just this one book. Record it exactly like a CalibreError
+                # would be.
+                error = str(exc)
             if error is not None:
                 errors[source] = error
     return errors
@@ -940,13 +1092,35 @@ def _report_dry_run(
     batch_dir: Path,
     options: dict,
     stop_after: str,
+    args,
 ) -> int:
-    """Report the plan as `item`/`result` events. `start` and the stage announcements
-    were already emitted by the caller before planning began (see `_run_pipeline`),
-    so this only ever adds `item`s and the final `result` — nothing here writes
-    anything to disk."""
+    """Report the plan as `item`/`result` events. `start` and every stage
+    announcement reached so far were already emitted from inside `_build_plan`
+    (see `_run_pipeline`), so this only ever adds `item`s and the final `result` —
+    nothing here writes anything to disk.
+
+    M2: the preview target for each book comes from `library.plan_placement` —
+    the SAME function the real run uses via `_plan_and_reconcile` — not from
+    calling `library.target_path` once per book in isolation. A lone `target_path`
+    call cannot see any other book's target, so it can never produce the
+    ` (2)`/` (3)` collision suffix `plan_placement` computes across the whole
+    batch at once; a dry run using it was previewing a plan the real run would
+    never actually produce."""
     total = len(plan.groups) + len(plan.dropped)
     reaches_convert = _stage_index(stop_after) >= _stage_index("convert")
+
+    planned: dict[Path, Path] = {}
+    collisions: dict[Path, str] = {}
+    if reaches_convert:
+        entries = {
+            group.winner: (
+                plan.verdicts[group.winner],
+                options["to"],
+                plan.book_ids.get(group.winner, ""),
+            )
+            for group in plan.groups
+        }
+        planned, collisions = library.plan_placement(batch_dir, entries)
 
     exit_code = EXIT_OK
     failed = []
@@ -966,13 +1140,9 @@ def _report_dry_run(
 
     for group in sorted(plan.groups, key=lambda g: str(g.winner)):
         item_id += 1
-        target = None
-        reason = None
-        if reaches_convert:
-            verdict = plan.verdicts[group.winner]
-            target = library.target_path(batch_dir, verdict, options["to"])
-            if target.exists():
-                reason = "exists"
+        target = planned.get(group.winner) if reaches_convert else None
+        reason = "exists" if target and target.exists() else None
+        warnings = ["name_collision_suffixed"] if group.winner in collisions else []
         reporter.item(
             id=item_id,
             status="skipped",
@@ -980,9 +1150,10 @@ def _report_dry_run(
             outputs=[target] if target else [],
             bytes_in=None,
             reason=reason,
+            warnings=warnings,
         )
 
-    reporter.result(
+    result = dict(
         ok=exit_code == EXIT_OK,
         exit_code=exit_code,
         counts={
@@ -999,4 +1170,9 @@ def _report_dry_run(
         run_file=None,
         data={"llm": _llm_summary(plan)},
     )
+    reporter.result(**result)
+    # M2: every other exit path honours --summary-json; a dry run used to be the
+    # one silent exception, even though it reaches a normal end just like a real
+    # run does (nothing about --dry-run makes the final result any less final).
+    write_summary_json(args.summary_json, result)
     return exit_code

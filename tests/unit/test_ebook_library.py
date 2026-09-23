@@ -142,6 +142,7 @@ def test_reconcile_renames_a_book_whose_title_changed(tmp_path):
     )
     assert new.is_file() and not old.exists()
     assert report.renamed == 1 and report.missing == []
+    assert report.renamed_sources == [source]
 
 
 def test_reconcile_moves_files_that_left_the_list(tmp_path):
@@ -149,8 +150,26 @@ def test_reconcile_moves_files_that_left_the_list(tmp_path):
     stale.parent.mkdir(parents=True)
     stale.write_bytes(b"x")
     report = library.reconcile(tmp_path, {}, {}, dry_run=False, id_reader=lambda p: None)
-    assert (tmp_path / "_leftover" / "Gone.azw3").is_file()
+    # I3: leftover mirrors the file's path relative to the batch, not flattened.
+    assert (tmp_path / "_leftover" / "en" / "Gone.azw3").is_file()
     assert report.leftover == [stale]
+
+
+def test_leftover_mirrors_the_relative_path_instead_of_flattening(tmp_path):
+    # I3: flattening to `_leftover/<name>` silently destroyed one of two same-named
+    # files from different language folders (`en/Title.azw3` vs `pt/Title.azw3`).
+    en = tmp_path / "en" / "Title.azw3"
+    en.parent.mkdir(parents=True)
+    en.write_bytes(b"EN CONTENT")
+    pt = tmp_path / "pt" / "Title.azw3"
+    pt.parent.mkdir(parents=True)
+    pt.write_bytes(b"PT CONTENT")
+
+    report = library.reconcile(tmp_path, {}, {}, dry_run=False, id_reader=lambda p: None)
+
+    assert (tmp_path / "_leftover" / "en" / "Title.azw3").read_bytes() == b"EN CONTENT"
+    assert (tmp_path / "_leftover" / "pt" / "Title.azw3").read_bytes() == b"PT CONTENT"
+    assert set(report.leftover) == {en, pt}
 
 
 def test_dry_run_moves_nothing(tmp_path):
@@ -182,8 +201,8 @@ def test_reconcile_does_not_move_a_book_it_just_renamed_into_leftover(tmp_path):
     )
 
     assert new.is_file()
-    assert not (tmp_path / "_leftover" / "Cidade de Deus.azw3").exists()
-    assert (tmp_path / "_leftover" / "Gone.azw3").is_file()
+    assert not (tmp_path / "_leftover" / "pt" / "Cidade de Deus.azw3").exists()
+    assert (tmp_path / "_leftover" / "en" / "Gone.azw3").is_file()
     assert report.leftover == [stale]
 
 
@@ -247,3 +266,31 @@ def test_reconcile_does_not_disturb_the_batch_lock(tmp_path):
         RunState.open(tmp_path, task="ebook", options={}, inputs=[])
 
     state.finish("done")
+
+
+def test_force_skips_the_twin_lookup_and_reconverts_instead_of_renaming(tmp_path):
+    # Minor finding: `--force` must skip the book-id twin lookup entirely, not just
+    # the already-at-target check — otherwise a book reconcile can find under an
+    # old name is silently renamed for free, defeating "redo items whose output
+    # exists" for exactly the book `--force` was meant to redo.
+    old = tmp_path / "pt" / "Cidade de Deus.azw3"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"old book")
+    source = Path("/books/cidade.epub")
+    new = tmp_path / "pt" / "Cidade de Deus - Paulo Lins.azw3"
+
+    report = library.reconcile(
+        tmp_path,
+        {source: new},
+        {source: "id-1"},
+        dry_run=False,
+        force=True,
+        id_reader=lambda path: "id-1" if path == old else None,
+    )
+
+    assert report.renamed == 0
+    assert report.renamed_sources == []
+    assert report.missing == [source]
+    assert not new.exists()
+    # the old file was never renamed or reused — it becomes a leftover, not lost.
+    assert (tmp_path / library.LEFTOVER_DIR / "pt" / "Cidade de Deus.azw3").is_file()

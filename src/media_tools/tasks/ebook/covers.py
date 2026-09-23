@@ -51,18 +51,24 @@ def resolve(
     """`books` maps each source path to `(title, author, book_id)` — title/author
     for the online lookup, book_id to name the cache file. Extraction is local and
     cheap, so it runs one book at a time; fetching is a slow network call, so only
-    that phase runs through a `ThreadPoolExecutor`."""
+    that phase runs through a `ThreadPoolExecutor`.
+
+    `on_progress(done, total, phase)` fires once per book, with `phase` either
+    `"extract"` or `"fetch"` and `done`/`total` counted separately per phase — NOT
+    combined into one running total against `len(books)`. Extraction always covers
+    every book, but the fetch phase only ever covers `pending` (whatever extraction
+    could not resolve locally); a single combined counter would walk past 100% the
+    moment any pending book entered the fetch phase (minor finding)."""
     extract = extract or calibre.extract_cover
     fetch_cover = fetch_cover or calibre.fetch_cover
     cache_dir = Path(cache_dir)
     (cache_dir / "covers").mkdir(parents=True, exist_ok=True)
 
-    total = len(books)
+    extract_total = len(books)
     results: dict[Path, CoverResult] = {}
     pending: list[Path] = []
 
-    done = 0
-    for source, (_title, _author, book_id) in books.items():
+    for done, (source, (_title, _author, book_id)) in enumerate(books.items(), start=1):
         dest = _cache_path(cache_dir, book_id)
         try:
             found = _is_cached(dest) or extract(source, dest, cache_dir=cache_dir)
@@ -75,9 +81,8 @@ def resolve(
                 results[source] = CoverResult(path=dest, source="embedded")
             else:
                 pending.append(source)
-        done += 1
         if on_progress:
-            on_progress(done, total)
+            on_progress(done, extract_total, "extract")
 
     if not fetch:
         for source in pending:
@@ -92,6 +97,8 @@ def resolve(
         return CoverResult(path=None, source="none")
 
     if pending:
+        fetch_total = len(pending)
+        fetch_done = 0
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             futures = {pool.submit(_fetch_one, source): source for source in pending}
             for future in as_completed(futures):
@@ -102,8 +109,8 @@ def resolve(
                     # Same isolation as the extraction phase: one flaky fetch must
                     # not discard every other book's already-resolved cover.
                     results[source] = CoverResult(path=None, source="none")
-                done += 1
+                fetch_done += 1
                 if on_progress:
-                    on_progress(done, total)
+                    on_progress(fetch_done, fetch_total, "fetch")
 
     return results
