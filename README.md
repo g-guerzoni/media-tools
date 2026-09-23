@@ -353,8 +353,9 @@ Snapshots live under the output root:
 ```
 
 `<serial>` is your Kindle's own serial number — or, if it doesn't report one, a short
-`unknown-`-prefixed name derived from whichever of the volume name, the model or the
-USB product id is available, so two serial-less devices never share a folder.
+`unknown-`-prefixed name derived from the first of these that's available: the volume
+name, the model name the device reports over USB, then its mode and USB product id —
+so two serial-less devices never share a folder.
 `media-tools ebook kindle status` tells you which one yours got.
 
 Each snapshot holds a `manifest.json` and a `files/` tree mirroring the device's own

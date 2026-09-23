@@ -154,8 +154,8 @@ the snapshot just written. It lands under
 
 with a `manifest.json` and a `files/` tree mirroring the device's own paths.
 `<serial>` is the device's own serial when it reports one — and `unknown-<8 hex>` when
-it does not, hashed from the first of the mount name, the model hint or
-`"<mode>:<product id>"` that is available. **Check which you got
+it does not, hashed from the first of the mount name, the `model_hint` the device
+reports over USB, or `"<mode>:<product id>"` that is available. **Check which you got
 before going looking for a serial-named folder**; `status` above reported the serial,
 and a `null` there means the directory is the `unknown-` one.
 

@@ -30,6 +30,17 @@ class DeviceBusy(RuntimeError):
 
 @dataclass(frozen=True)
 class Device:
+    """One connected Kindle, as detection found it.
+
+    `model_hint` is the name the DEVICE reports over USB ("Kindle", "Kindle Scribe",
+    ...), not a lookup in a model table — this module deliberately has none, because
+    firmware has moved the mass-storage/MTP line before. It is `None` when the device
+    reports no product name, and for a device resolved with `identify=False`. Nothing
+    branches on it: it is reported in `ebook kindle status` for a human, and it is the
+    second rung of `backup.device_key`'s fallback chain, which is the only rung that
+    can tell two serial-less MTP Kindles apart (they have no mount to be named after).
+    """
+
     serial: str | None
     product_id: int | None
     mode: str  # "mass_storage" | "mtp"
@@ -61,6 +72,7 @@ def _list_usb_macos() -> list[dict]:
                     "vendor_id": vendor,
                     "product_id": entry.get("idProduct"),
                     "serial": entry.get("USB Serial Number"),
+                    "product": entry.get("USB Product Name"),
                 }
             )
     return found
@@ -82,12 +94,13 @@ def _list_usb_linux() -> list[dict]:
             except OSError:
                 return None
 
-        product = read("idProduct")
+        product_id = read("idProduct")
         found.append(
             {
                 "vendor_id": vendor,
-                "product_id": int(product, 16) if product else None,
+                "product_id": int(product_id, 16) if product_id else None,
                 "serial": read("serial"),
+                "product": read("product"),
             }
         )
     return found
@@ -123,7 +136,27 @@ def find_device(
     *,
     usb_lister: Callable[[], list[dict]] | None = None,
     mount_lister: Callable[[], list[Path]] | None = None,
+    identify: bool = True,
 ) -> Device:
+    """The connected Kindle, or `DeviceNotFound`.
+
+    `identify=False` answers the two questions that do not need the USB bus — is one
+    attached, and in which mode — and skips enumerating it when a mount already
+    answers both. The returned `Device` then carries no `serial`, `product_id` or
+    `model_hint`, so it MUST NOT be handed to `backup.device_key`: a device that
+    reports a serial would resolve to a different backup directory than the same
+    device found the ordinary way. It exists for `doctor`, which runs at every session
+    start, reports only the mode, and deliberately never prints a serial — the same
+    "do not spend a probe that cannot change the answer" gate Ruling R55 applied to
+    the `calibre-debug` driver probe. A device with no mount is MTP, and nothing but
+    the bus can say so, so that probe still runs.
+    """
+    # The mount is listed FIRST so `identify=False` can return on it without touching
+    # the bus. Neither lister has side effects, so the order is free.
+    mounts = [m for m in (mount_lister or list_candidate_mounts)() if _looks_like_a_kindle(m)]
+    if mounts and not identify:
+        return Device(serial=None, product_id=None, mode="mass_storage", mount=mounts[0])
+
     # The default listers already filter by vendor before returning, but an
     # injected `usb_lister` (tests, or a future caller) is not required to — a
     # stray non-Kindle USB device must never be mistaken for one in MTP mode.
@@ -132,7 +165,6 @@ def find_device(
         for entry in (usb_lister or list_usb_devices)()
         if entry.get("vendor_id") == KINDLE_VENDOR_ID
     ]
-    mounts = [m for m in (mount_lister or list_candidate_mounts)() if _looks_like_a_kindle(m)]
 
     if mounts:
         first = usb[0] if usb else {}
@@ -141,6 +173,7 @@ def find_device(
             product_id=first.get("product_id"),
             mode="mass_storage",
             mount=mounts[0],
+            model_hint=first.get("product"),
         )
     if usb:
         first = usb[0]
@@ -149,6 +182,7 @@ def find_device(
             product_id=first.get("product_id"),
             mode="mtp",
             mount=None,
+            model_hint=first.get("product"),
         )
     raise DeviceNotFound(
         "no Kindle found: connect one over USB and unlock it. A 2024-or-later model "

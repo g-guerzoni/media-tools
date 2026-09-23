@@ -262,10 +262,15 @@ class RestoreReport:
 def device_key(device) -> str:
     """The directory name a device's backups live under.
 
-    A serial, when the device reports one. When it does not, `unknown-<8 hex of the
-    sha256 of the mount name or model hint>` — never a shared constant, because two
-    serial-less devices under one root would write into each other's snapshots and
-    silently corrupt both.
+    A serial, when the device reports one. When it does not, `unknown-<8 hex>` of the
+    sha256 of the first of THREE things that is available — the mount name, the
+    `model_hint` the device reports over USB, then `"<mode>:<product_id>"` — never a
+    shared constant, because two serial-less devices under one root would write into
+    each other's snapshots and silently corrupt both.
+
+    The middle rung is the only one that can separate two serial-less MTP Kindles,
+    which have no mount to be named after; the last is a backstop that separates
+    nothing but always produces a name.
     """
     serial = _safe_key(getattr(device, "serial", None) or "")
     if serial:

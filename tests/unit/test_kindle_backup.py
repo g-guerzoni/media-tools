@@ -957,3 +957,25 @@ def test_a_backup_over_mtp_produces_the_same_manifest_as_over_mass_storage(kindl
     assert over_mass.bytes_copied == over_mtp.bytes_copied
     hashes = {e["path"]: e["sha256"] for e in manifest_of(over_mass.path)["files"]}
     assert {e["path"]: e["sha256"] for e in manifest_of(over_mtp.path)["files"]} == hashes
+
+
+def test_device_key_falls_back_through_mount_name_then_model_hint_then_mode():
+    """All three rungs of the chain the docs describe. The middle one was dead until
+    `detect.find_device` started setting `model_hint`: no serial and no mount is
+    exactly an MTP device, which is the only case that can reach it."""
+    assert backup.device_key(Device(serial="G000ABC", product_id=1, mode="mtp", mount=None)) == (
+        "G000ABC"
+    )
+
+    mounted = Device(serial=None, product_id=1, mode="mass_storage", mount=Path("/x/Kindle"))
+    assert backup.device_key(mounted).startswith("unknown-")
+
+    hinted = Device(
+        serial=None, product_id=0x9981, mode="mtp", mount=None, model_hint="Kindle Scribe"
+    )
+    bare = Device(serial=None, product_id=0x9981, mode="mtp", mount=None)
+    assert hinted != bare
+    assert backup.device_key(hinted).startswith("unknown-")
+    # The hint really is what distinguishes them: two serial-less, mount-less devices
+    # sharing one directory is what this fallback chain exists to prevent.
+    assert backup.device_key(hinted) != backup.device_key(bare)

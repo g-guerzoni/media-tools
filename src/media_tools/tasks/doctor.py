@@ -416,15 +416,24 @@ def _kindle_device_check() -> tuple[Check, kindle_detect.Device | None, str]:
     returned, so the driver probe still runs: whether the driver imports is a separate
     question from who is holding the device, and the probe never opens one.
 
-    Never raises and never reports `"missing"`. Detection shells out to `ioreg` on
-    macOS and reads `/sys` on Linux, so the failure modes are real; a broad catch is
-    deliberate, because a health check that dies halfway through its own report is
-    worse than one that says it could not tell. No serial is ever printed: it
-    identifies one physical device, and nothing here needs it — `ebook kindle status`
-    is where a user asks for that, deliberately and one command at a time.
+    Never raises and never reports `"missing"`. Detection reads the mount roots and,
+    only when none of them is a Kindle, shells out to `ioreg` on macOS or walks `/sys`
+    on Linux, so the failure modes are real; a broad catch is deliberate, because a
+    health check that dies halfway through its own report is worse than one that says
+    it could not tell. No serial is ever asked for or printed — `identify=False` says
+    so to `find_device` itself rather than merely leaving the value unused: it
+    identifies one physical device, and `ebook kindle status` is where a user asks for
+    that, deliberately and one command at a time.
     """
     try:
-        device = kindle_detect.find_device()
+        # `identify=False`: this check reports the MODE and never a serial, and a
+        # Kindle mount answers both questions on its own — so the USB enumeration
+        # (`ioreg` on macOS, a `/sys` walk on Linux) is skipped when it could not
+        # change the answer. The same gate Ruling R55 put on the `calibre-debug`
+        # probe, on the probe underneath it. With no mount, only the bus can say
+        # whether an MTP Kindle is attached, so that one still runs; it is cheap
+        # (measured at ~10 ms) and bounded by its own timeout.
+        device = kindle_detect.find_device(identify=False)
     except kindle_detect.DeviceNotFound:
         return (
             Check("kindle-device", "ok", "no Kindle connected", hint=_KINDLE_DEVICE_HINT),
