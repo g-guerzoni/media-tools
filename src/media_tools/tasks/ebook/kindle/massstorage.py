@@ -24,21 +24,24 @@ from pathlib import Path
 from media_tools.core.paths import fsync_replace, temp_path
 from media_tools.tasks.ebook.kindle.backend import DeviceFile
 
-_VOLUME_LITTER = {".Trashes", ".fseventsd", ".Spotlight-V100"}
+# These four are PUBLIC on purpose: `mtp.py` imports them rather than re-deriving the
+# same rules, so the two backends' listings cannot drift apart. `backend.py`'s protocol
+# docstring is where the rule itself is written down.
+VOLUME_LITTER = {".Trashes", ".fseventsd", ".Spotlight-V100"}
 # Fully off-limits, at any depth: `audible/` is Amazon's audiobook data, untouchable
 # by this whole plan. `system/` is different — only `system/thumbnails/` is ordinary
 # cache data; everything else under `system/` is device internals, not book content.
-_PROTECTED_DIRS = {"audible"}
-_RESTRICTED_PARENT = "system"
-_RESTRICTED_EXCEPTION = "thumbnails"
+PROTECTED_DIRS = {"audible"}
+RESTRICTED_PARENT = "system"
+RESTRICTED_EXCEPTION = "thumbnails"
 
 
-def _is_volume_litter(name: str) -> bool:
-    return name.startswith("._") or name in _VOLUME_LITTER
+def is_volume_litter(name: str) -> bool:
+    return name.startswith("._") or name in VOLUME_LITTER
 
 
-def _prefix_targets_a_forbidden_system_child(parts: tuple[str, ...]) -> bool:
-    return len(parts) >= 2 and parts[0] == _RESTRICTED_PARENT and parts[1] != _RESTRICTED_EXCEPTION
+def prefix_targets_a_forbidden_system_child(parts: tuple[str, ...]) -> bool:
+    return len(parts) >= 2 and parts[0] == RESTRICTED_PARENT and parts[1] != RESTRICTED_EXCEPTION
 
 
 class MassStorageBackend:
@@ -50,7 +53,7 @@ class MassStorageBackend:
 
     def list_files(self, prefix: str = "") -> list[DeviceFile]:
         parts = Path(prefix).parts if prefix else ()
-        if _PROTECTED_DIRS & set(parts) or _prefix_targets_a_forbidden_system_child(parts):
+        if PROTECTED_DIRS & set(parts) or prefix_targets_a_forbidden_system_child(parts):
             return []
         start = self.mount / prefix if prefix else self.mount
         if not start.is_dir():
@@ -66,14 +69,14 @@ class MassStorageBackend:
         # `system/` holds device internals (Wi-Fi credentials, logs, settings) that
         # are none of this project's business — only its `thumbnails/` child is
         # ordinary cache data worth listing.
-        restricted = directory.name == _RESTRICTED_PARENT
+        restricted = directory.name == RESTRICTED_PARENT
         for entry in entries:
-            if _is_volume_litter(entry.name):
+            if is_volume_litter(entry.name):
                 continue
-            if restricted and entry.name != _RESTRICTED_EXCEPTION:
+            if restricted and entry.name != RESTRICTED_EXCEPTION:
                 continue
             if entry.is_dir(follow_symlinks=False):
-                if entry.name in _PROTECTED_DIRS:
+                if entry.name in PROTECTED_DIRS:
                     continue
                 yield from self._walk(Path(entry.path))
             elif entry.is_file(follow_symlinks=False):
@@ -99,7 +102,10 @@ class MassStorageBackend:
         (self.mount / path).unlink()
 
     def exists(self, path: str) -> bool:
-        return (self.mount / path).exists()
+        # FILES only, per `backend.DeviceBackend`'s contract. `.exists()` answered
+        # `True` for a directory, which the MTP backend can never do (it only ever
+        # sees files), so a caller written against one backend broke against the other.
+        return (self.mount / path).is_file()
 
     def free_space(self) -> int:
         return shutil.disk_usage(self.mount).free

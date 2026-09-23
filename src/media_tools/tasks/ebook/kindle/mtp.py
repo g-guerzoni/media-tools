@@ -13,8 +13,13 @@ on a real library. `run_ops` is the entry point that matters; the eight
 `DeviceBackend` methods are thin single-op wrappers over it, and a bulk caller
 (backup, add, sync) is expected to build its own ops list and call `run_ops` once.
 `list_files` additionally caches the whole device listing for this backend's
-lifetime, invalidated by `write`/`remove`, so a command that lists and then acts does
-not pay for a second scan.
+lifetime, invalidated by `write`/`remove`/`close` — but NEVER caches a listing the
+helper flagged as incomplete, because a cached empty listing is how a backup writes
+nothing and calls itself a success.
+
+The exclusion rules (`audible/`, everything under `system/` except `thumbnails/`) are
+imported from `massstorage`, not restated here, so the two backends' listings cannot
+drift apart. `backend.DeviceBackend`'s docstring is the contract both conform to.
 """
 
 from __future__ import annotations
@@ -30,11 +35,19 @@ from pathlib import Path, PurePosixPath
 from media_tools.integrations.calibre import CALIBRE_DEBUG, CalibreError, config_env
 from media_tools.tasks.ebook.kindle.backend import DeviceFile, DeviceWriteProtected
 from media_tools.tasks.ebook.kindle.detect import Device, DeviceBusy, DeviceNotFound
+from media_tools.tasks.ebook.kindle.massstorage import (
+    PROTECTED_DIRS,
+    RESTRICTED_EXCEPTION,
+    RESTRICTED_PARENT,
+    is_volume_litter,
+    prefix_targets_a_forbidden_system_child,
+)
 
 # The helper's own copies of these are authoritative — this module cannot import it
 # (different interpreter, and it imports `calibre`), so the constants are duplicated
 # and `tests/unit/test_kindle_mtp.py` pins the two copies together.
 PROTOCOL_VERSION = 1
+START_MARKER = "@@media-tools-mtp-start-v1@@"
 RESULT_MARKER = "@@media-tools-mtp-result-v1@@"
 
 EXIT_OK = 0
@@ -57,6 +70,23 @@ _HELPER = Path(__file__).resolve().parents[3] / "integrations" / "kindle_mtp.py"
 # neither one holds the device — reporting them as the GUI would block the user with a
 # `DeviceBusy` they cannot act on.
 _GUI_EXECUTABLES = frozenset({"calibre", "calibre-gui", "calibre.exe"})
+
+
+class MtpPathNotInCachedTree(FileNotFoundError):
+    """`rm` could not reach this path.
+
+    Calibre's `delete_file_or_folder` needs a `FileOrFolder` from the CACHED device
+    tree, which omits `*.sdr` folders and everything under `system/`, and Calibre 9.15
+    exposes no delete-by-name primitive. So this means either "the file is already
+    gone" or "this class of path cannot be deleted over MTP at all", and the driver
+    cannot tell the two apart.
+
+    It subclasses `FileNotFoundError` so a caller written to `DeviceBackend`'s contract
+    ("remove of an absent path raises FileNotFoundError") works unchanged against both
+    backends, while a caller that cares — Task 8, which surfaces this as a warning
+    rather than a failure — can catch this class specifically instead of
+    substring-matching English prose.
+    """
 
 
 def _stderr_tail(stderr: str, lines: int = 10) -> str:
@@ -108,81 +138,91 @@ def calibre_gui_is_running() -> bool:
     return gui_is_running_in(proc.stdout or "")
 
 
+def _payload_from(stdout: str) -> dict | None:
+    """The last line that STARTS WITH the result marker, parsed.
+
+    The helper puts the marker and the payload on one line precisely so this can be a
+    line-level match rather than a substring search: `calibre-debug` and Calibre's
+    plugins print freely both before and after the result, and chatter may legitimately
+    contain the marker string itself.
+    """
+    for line in reversed((stdout or "").splitlines()):
+        stripped = line.strip()
+        if not stripped.startswith(RESULT_MARKER):
+            continue
+        try:
+            parsed = json.loads(stripped[len(RESULT_MARKER) :])
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _results_of(payload: dict | None) -> list | None:
+    if not isinstance(payload, dict):
+        return None
+    results = payload.get("results")
+    return results if isinstance(results, list) else None
+
+
 def parse_helper_output(stdout: str, stderr: str, returncode: int) -> dict:
     """Turn one `calibre-debug` invocation into the helper's result object, or into
-    the exception its exit code stands for.
-
-    `calibre-debug` writes its own banner and chatter to stdout, and a Calibre plugin
-    may print more at any point, so the result is found by the LAST occurrence of the
-    marker — never by assuming stdout is only the JSON, and never by the first
-    occurrence, which chatter could legitimately contain.
-    """
+    the exception its exit code stands for."""
     tail = _stderr_tail(stderr)
+    said = f" Calibre said: {tail}" if tail else ""
+    payload = _payload_from(stdout)
+
+    # A non-zero exit with no start marker means calibre-debug never reached the
+    # helper at all: the INVOCATION is broken (a wrong `-e ... --` convention, a
+    # Calibre that will not start), which has nothing to do with whether a Kindle is
+    # attached. Reporting it as DeviceNotFound would send the user hunting for a cable.
+    if returncode != EXIT_OK and START_MARKER not in (stdout or ""):
+        raise CalibreError(
+            "calibre-debug never reached the MTP helper — no start marker in its "
+            f"output, so the invocation itself failed (exit {returncode}), not the "
+            f"device. Check that `calibre-debug -e {_HELPER} -- <ops file>` runs." + said
+        )
+
     if returncode == EXIT_NO_DEVICE:
-        raise DeviceNotFound(
-            "no Kindle found over MTP: connect one over USB and unlock it."
-            + (f" Calibre said: {tail}" if tail else "")
-        )
+        raise DeviceNotFound("no Kindle found over MTP: connect one over USB and unlock it." + said)
     if returncode == EXIT_BUSY:
-        raise DeviceBusy(busy_hint() + (f" Calibre said: {tail}" if tail else ""))
+        raise DeviceBusy(busy_hint() + said)
     if returncode == EXIT_WRITE_PROTECTED:
-        raise DeviceWriteProtected(
-            "the Kindle refused the write as read-only."
-            + (f" Calibre said: {tail}" if tail else "")
-        )
+        error = DeviceWriteProtected("the Kindle refused the write as read-only." + said)
+        # The helper emits whatever it completed before aborting; without attaching it
+        # here that record is unreachable and a caller cannot tell which writes landed.
+        error.results = _results_of(payload) or []
+        raise error
     if returncode != EXIT_OK:
         raise CalibreError(tail or f"calibre-debug exited {returncode}")
 
-    marker_at = (stdout or "").rfind(RESULT_MARKER)
-    if marker_at < 0:
-        raise CalibreError(
-            "the MTP helper printed no result marker — calibre-debug may have failed "
-            "before the helper ran." + (f" Calibre said: {tail}" if tail else "")
-        )
-    remainder = stdout[marker_at + len(RESULT_MARKER) :]
-    payload = _first_json_object(remainder)
     if payload is None:
         raise CalibreError(
-            "could not parse the MTP helper's result object."
-            + (f" Calibre said: {tail}" if tail else "")
+            "could not parse the MTP helper's result object — no line starting with "
+            "the result marker, or malformed JSON after it." + said
         )
     if payload.get("v") != PROTOCOL_VERSION:
         raise CalibreError(
             f"the MTP helper spoke protocol version {payload.get('v')!r}, "
             f"expected {PROTOCOL_VERSION}"
         )
-    if not isinstance(payload.get("results"), list):
+    if _results_of(payload) is None:
         raise CalibreError("the MTP helper's result object carries no 'results' list")
     return payload
-
-
-def _first_json_object(text: str) -> dict | None:
-    """The helper prints the object on one line, but anything may follow it, so take
-    the first non-empty line after the marker; fall back to the whole remainder in
-    case a future helper pretty-prints it."""
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError:
-            break
-        return parsed if isinstance(parsed, dict) else None
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
 
 
 class CalibreDebugRunner:
     """The default `runner`: write the ops file, spawn `calibre-debug`, parse what
     comes back. Runs with `config_env(cache_dir)` like every other Calibre call in
     this project, so the user's own Calibre configuration is neither read nor
-    written."""
+    written. `serial` rides in the envelope so the helper can refuse a device that is
+    not the one detection found."""
 
-    def __init__(self, cache_dir: Path, *, timeout: int = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self, cache_dir: Path, *, serial: str | None = None, timeout: int = DEFAULT_TIMEOUT
+    ) -> None:
         self.cache_dir = Path(cache_dir)
+        self.serial = serial
         self.timeout = timeout
 
     def __call__(self, ops: list[dict]) -> dict:
@@ -196,7 +236,7 @@ class CalibreDebugRunner:
         ops_file = Path(name)
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                json.dump({"v": PROTOCOL_VERSION, "ops": ops}, stream)
+                json.dump({"v": PROTOCOL_VERSION, "serial": self.serial, "ops": ops}, stream)
             try:
                 proc = subprocess.run(
                     [tool, "-e", str(_HELPER), "--", str(ops_file)],
@@ -214,8 +254,8 @@ class CalibreDebugRunner:
 
 class MtpBackend:
     """Talks to a Kindle in MTP mode (a `Device` from `detect.find_device` with
-    `mode="mtp"`). Implements `backend.DeviceBackend`; every path it takes or returns
-    is device-relative and POSIX-style, exactly as the mass-storage backend's are."""
+    `mode="mtp"`). Implements `backend.DeviceBackend` — see that protocol's docstring
+    for the contract this shares with the mass-storage backend."""
 
     def __init__(
         self,
@@ -227,7 +267,7 @@ class MtpBackend:
     ) -> None:
         self.device = device
         self.cache_dir = Path(cache_dir)
-        self._runner = runner or CalibreDebugRunner(self.cache_dir)
+        self._runner = runner or CalibreDebugRunner(self.cache_dir, serial=device.serial)
         self._gui_check = gui_check or calibre_gui_is_running
         self._listing: list[DeviceFile] | None = None
 
@@ -235,16 +275,27 @@ class MtpBackend:
 
     def run_ops(self, ops: list[dict]) -> list[dict]:
         """Run a whole batch of operations in ONE helper invocation, returning the
-        helper's per-op result objects in the order given. This is what a bulk caller
-        should use: each invocation re-opens and re-scans the device, so splitting a
-        library's worth of work into one invocation per file is not a slower version
-        of this — it is unusable."""
+        helper's per-op result objects in the order given.
+
+        This is what a bulk caller should use: each invocation re-opens and re-scans
+        the device, so splitting a library's worth of work into one invocation per
+        file is not a slower version of this — it is unusable.
+
+        **The caller must check each result's `ok` field.** Unlike the eight
+        `DeviceBackend` methods, which raise, this hands back raw per-op results: an
+        exception here means the whole invocation failed, and a batch that ran fine
+        can still contain individual failures. A result that is not `ok` carries
+        `error` (human-readable) and usually `code` — `not_in_cached_tree`,
+        `not_found`, `write_protected`, `list_failed`, `list_partial`, `unknown_op`.
+        A `list` result may also carry `missing` (the prefix is not on the device) or
+        `partial` (the listing is incomplete and must not be treated as authoritative).
+        """
         if not ops:
             return []
         self._preflight()
         payload = self._runner(list(ops))
-        results = payload.get("results") if isinstance(payload, dict) else None
-        if not isinstance(results, list):
+        results = _results_of(payload)
+        if results is None:
             raise CalibreError("the MTP helper's result object carries no 'results' list")
         if len(results) != len(ops):
             raise CalibreError(
@@ -267,17 +318,23 @@ class MtpBackend:
         result = self.run_ops([op])[0]
         if not isinstance(result, dict):
             raise CalibreError(f"the MTP helper returned a malformed result: {result!r}")
-        if not result.get("ok"):
-            raise CalibreError(
-                result.get("error") or f"the MTP helper failed the {op['op']} operation"
-            )
-        return result
+        if result.get("ok"):
+            return result
+        raise _error_for(result, op)
 
     # -- the DeviceBackend protocol -----------------------------------------------
 
     def list_files(self, prefix: str = "") -> list[DeviceFile]:
+        parts = tuple(p for p in (prefix or "").strip("/").split("/") if p)
+        if PROTECTED_DIRS & set(parts) or prefix_targets_a_forbidden_system_child(parts):
+            return []
         if self._listing is None:
-            self._listing = self._files_under("")
+            files, complete = self._files_under("")
+            if not complete:
+                # An incomplete listing must never become this backend's idea of the
+                # device for the rest of its life.
+                return _under_prefix(files, prefix)
+            self._listing = files
         return _under_prefix(self._listing, prefix)
 
     def read(self, path: str, dest: Path) -> None:
@@ -297,7 +354,8 @@ class MtpBackend:
         # Cold cache: list only the parent folder rather than the whole device, so a
         # lone existence check does not pay for a full scan.
         parent = path.rsplit("/", 1)[0] if "/" in path else ""
-        return any(entry.path == path for entry in self._files_under(parent))
+        files, _ = self._files_under(parent)
+        return any(entry.path == path for entry in files)
 
     def free_space(self) -> int:
         return int(self._one({"op": "free"}).get("free") or 0)
@@ -315,16 +373,54 @@ class MtpBackend:
 
     # -- internals ----------------------------------------------------------------
 
-    def _files_under(self, prefix: str) -> list[DeviceFile]:
+    def _files_under(self, prefix: str) -> tuple[list[DeviceFile], bool]:
+        """`(files, complete)`. `complete` is False whenever the helper flagged the
+        listing as incomplete or as a missing prefix — such a listing is usable as an
+        answer but must not be cached as the state of the device."""
         result = self._one({"op": "list", "path": prefix})
-        return [
+        files = [
             DeviceFile(
                 path=str(entry.get("path", "")),
                 size=int(entry.get("size") or 0),
                 mtime=float(entry.get("mtime") or 0.0),
             )
             for entry in result.get("files") or []
+            if _is_listable(str(entry.get("path", "")))
         ]
+        complete = not (result.get("partial") or result.get("missing") or result.get("note"))
+        return files, complete
+
+
+def _error_for(result: dict, op: dict) -> Exception:
+    """The exception a failed per-op result maps to, per `DeviceBackend`'s contract."""
+    message = result.get("error") or f"the MTP helper failed the {op.get('op')} operation"
+    code = result.get("code")
+    if code == "not_in_cached_tree":
+        return MtpPathNotInCachedTree(message)
+    if code == "not_found":
+        return FileNotFoundError(message)
+    if code == "write_protected":
+        return DeviceWriteProtected(message)
+    return CalibreError(message)
+
+
+def _is_listable(path: str) -> bool:
+    """The mass-storage backend's exclusion rules, applied to an MTP listing.
+
+    `audible/` is off-limits at any depth and a `system/` directory exposes only its
+    `thumbnails/` child. The MTP helper deliberately does NOT apply this — the uncached
+    lookups exist precisely so `system/` is reachable at all — so the filter lives here,
+    where the fake runner can drive it, using `massstorage`'s own constants so the two
+    backends cannot diverge.
+    """
+    parts = path.split("/")
+    directories = parts[:-1]
+    if any(part in PROTECTED_DIRS for part in directories):
+        return False
+    for index, part in enumerate(directories):
+        if part == RESTRICTED_PARENT and parts[index + 1] != RESTRICTED_EXCEPTION:
+            return False
+    return not any(is_volume_litter(part) for part in parts)
 
 
 def _under_prefix(files: list[DeviceFile], prefix: str) -> list[DeviceFile]:

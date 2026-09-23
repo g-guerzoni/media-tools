@@ -37,6 +37,30 @@ class DeviceFile:
 
 
 class DeviceBackend(Protocol):
+    """The contract both backends conform to. A caller must not be able to tell which
+    one it is driving, so every rule below holds for mass storage AND for MTP — where
+    they used to differ (an absent path raising `FileNotFoundError` on one and a
+    backend-specific error on the other; `exists` answering `True` for a directory on
+    one and `False` on the other) the divergence was the bug, not the contract.
+
+    - **Paths** are device-relative and POSIX-style, never absolute host paths.
+    - **`list_files(prefix)`** returns FILES only, never directories, depth-first with
+      each directory's entries in name order. A prefix that is not on the device — or
+      one inside the excluded areas below — returns `[]` rather than raising.
+    - **Excluded from every listing**, on both backends: `audible/` at any depth
+      (Amazon's audiobook data, untouchable by this whole plan) and everything under a
+      `system/` directory except its `thumbnails/` child (device internals — Wi-Fi
+      credentials, logs, settings — not book content), plus volume litter. The
+      constants live in `massstorage.py` and the MTP backend imports them, so the two
+      cannot drift apart.
+    - **`read(path, dest)`** and **`remove(path)`** raise `FileNotFoundError` when
+      `path` is not on the device.
+    - **`exists(path)`** answers for FILES only: a directory is not "there".
+    - **`write(local, path)`** creates any missing parent directories.
+    - **`free_space()`** is bytes free on the device's main storage.
+    - **`close()`** releases whatever the backend holds, including any cached listing.
+    """
+
     def list_files(self, prefix: str = "") -> list[DeviceFile]: ...
     def read(self, path: str, dest: Path) -> None: ...
     def write(self, local: Path, path: str) -> None: ...
