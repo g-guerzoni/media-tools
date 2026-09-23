@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 
@@ -111,6 +112,10 @@ def test_duplicates_are_not_converted(make_epub, tmp_path):
     item = next(e for e in events if e["type"] == "item" and e["status"] == "done")
     assert item["input"].endswith(".mobi"), "mobi outranks epub in the default preference"
 
+    run_data = json.loads((out / "dedup" / "run.json").read_text())
+    (winner,) = [i for i in run_data["items"] if i["status"] == "done"]
+    assert winner["data"]["duplicates"] == [str(folder / "Twice - An Author.epub")]
+
 
 def test_the_output_carries_the_clean_name_and_a_stable_id(make_epub, tmp_path):
     folder = make_epub(
@@ -125,3 +130,60 @@ def test_the_output_carries_the_clean_name_and_a_stable_id(make_epub, tmp_path):
     records = exth.read_records(book)
     assert exth.record_text(records, exth.TAG_TITLE) == "Clean Name"
     assert exth.record_text(records, exth.TAG_UUID)
+
+
+def test_scan_persists_the_inventory_without_requiring_a_key(make_epub, tmp_path):
+    """Fix round 1, FIX 3: `scan` runs scan/metadata/normalize/dedup and persists the
+    inventory to the batch's run.json (so `status` can find it afterward) — and,
+    unlike every other subcommand, never blocks on a missing OpenRouter key: with no
+    `--no-llm` and no key configured, it silently falls back to the offline
+    heuristic instead of exiting 3 with config_missing."""
+    folder = make_epub(
+        title="Scanned Book", author="Some Author", language="en", name="Scanned Book - Some Author"
+    ).parent
+    out = tmp_path / "media"
+    env = {**os.environ}
+    env.pop("OPENROUTER_API_KEY", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "media_tools",
+            "ebook",
+            "scan",
+            str(folder),
+            "-o",
+            str(out),
+            "-b",
+            "scanned",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert not any(e["type"] == "error" for e in events)
+    assert events[-1]["type"] == "result"
+
+    # scan converts nothing and writes no output files.
+    assert not any(out.rglob("*.azw3"))
+
+    run_file = out / "scanned" / "run.json"
+    assert run_file.is_file()
+    data = json.loads(run_file.read_text())
+    (item,) = data["items"]
+    assert item["status"] == "done"
+    assert item["data"]["title"] == "Scanned Book"
+    assert item["data"]["author"] == "Some Author"
+    assert item["data"]["language"] == "en"
+    assert item["data"]["duplicates"] == []
+    assert item["data"]["output"] is None
+
+    status = _cli("status", "scanned", "-o", str(out), "--json")
+    assert status.returncode == 0
+    payload = json.loads(status.stdout)
+    assert payload["batch"]["batch"] == "scanned"
+    assert payload["batch"]["counts"]["done"] == 1

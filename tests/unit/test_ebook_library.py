@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+from media_tools.core.state import LOCK_FILENAME, BatchInUse, RunState
 from media_tools.tasks.ebook import library
 from media_tools.tasks.ebook.normalize import Verdict
 
@@ -220,3 +223,27 @@ def test_reconcile_keeps_a_target_that_already_exists(tmp_path):
     assert report.renamed == 0
     assert report.missing == []
     assert target.read_bytes() == b"already there"
+
+
+def test_reconcile_does_not_disturb_the_batch_lock(tmp_path):
+    """`reconcile()` walks the whole batch directory looking for existing books to
+    keep, rename or sweep to `_leftover/` — it must never treat `RunState`'s own
+    lock file as one of those. Before this exclusion, an `ebook build` run called
+    `reconcile()` against the batch it had just locked, the lock matched no planned
+    target, and `reconcile` moved it to `_leftover/.lock`: `release()` then unlinked
+    a path that no longer existed (no error, since `missing_ok=True`), and a second
+    `RunState.open()` on the same batch succeeded instead of raising `BatchInUse` —
+    silently defeating the mutual-exclusion guarantee for the rest of the run."""
+    state = RunState.open(tmp_path, task="ebook", options={}, inputs=[])
+    lock = tmp_path / LOCK_FILENAME
+    assert lock.is_file()
+
+    library.reconcile(tmp_path, {}, {}, dry_run=False, id_reader=lambda p: None)
+
+    assert lock.is_file(), "the lock must not be swept into _leftover/"
+    assert not (tmp_path / library.LEFTOVER_DIR / LOCK_FILENAME).exists()
+
+    with pytest.raises(BatchInUse):
+        RunState.open(tmp_path, task="ebook", options={}, inputs=[])
+
+    state.finish("done")

@@ -204,7 +204,13 @@ class Reporter:
         llm_part = ""
         # Only worth a line when the LLM was actually used this run — a --no-llm run's
         # all-zero summary would otherwise print a misleading "llm 0 req" every time.
-        if llm and (llm.get("requests") or llm.get("cache_hits")):
+        # `heuristic_fallback_batches` is included here (not just requests/cache_hits)
+        # so a total outage — every request failing and silently falling back to the
+        # heuristic, `requests` and `cache_hits` both 0 — still prints a line instead
+        # of hiding the exact case this summary exists to surface.
+        if llm and (
+            llm.get("requests") or llm.get("cache_hits") or llm.get("heuristic_fallback_batches")
+        ):
             llm_part = (
                 f" · llm {llm.get('requests', 0)} req"
                 f" · {llm.get('cache_hits', 0)} cached"

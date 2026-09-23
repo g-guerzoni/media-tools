@@ -14,6 +14,12 @@ from media_tools.core.redact import redact
 WRITE_EVERY_SECONDS = 5.0
 WRITE_EVERY_ITEMS = 25
 
+# The batch lock's filename, directly under the batch directory. Exported so any code
+# that walks a batch directory looking for "real" content (e.g. tasks.ebook.library.
+# reconcile's existing-file scan) can exclude it by name without hardcoding it a
+# second time and risking the two definitions drifting apart.
+LOCK_FILENAME = ".lock"
+
 
 class BatchInUse(RuntimeError):
     """Another live run owns this batch."""
@@ -114,7 +120,7 @@ class RunState:
 
     @staticmethod
     def _acquire(batch_dir: Path) -> None:
-        lock = batch_dir / ".lock"
+        lock = batch_dir / LOCK_FILENAME
         payload = json.dumps({"pid": os.getpid(), "host": socket.gethostname()})
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -132,7 +138,7 @@ class RunState:
             handle.write(payload)
 
     def release(self) -> None:
-        (self.batch_dir / ".lock").unlink(missing_ok=True)
+        (self.batch_dir / LOCK_FILENAME).unlink(missing_ok=True)
 
     def __enter__(self) -> RunState:
         return self

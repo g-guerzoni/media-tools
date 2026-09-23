@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from media_tools.core.paths import truncate_name
+from media_tools.core.state import LOCK_FILENAME
 from media_tools.tasks.ebook import exth
 from media_tools.tasks.ebook.normalize import Verdict
 
@@ -146,7 +147,10 @@ def reconcile(
     existing = [
         path
         for path in batch_dir.rglob("*")
-        if path.is_file() and LEFTOVER_DIR not in path.parts and path.name != "run.json"
+        if path.is_file()
+        and LEFTOVER_DIR not in path.parts
+        and path.name != "run.json"
+        and path.name != LOCK_FILENAME
     ]
     by_id: dict[str, Path] = {}
     for path in existing:

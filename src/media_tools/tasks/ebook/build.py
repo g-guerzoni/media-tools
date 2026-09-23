@@ -66,8 +66,20 @@ KINDLE_FORMATS = frozenset({"azw3", "mobi"})
 STAGE_ORDER = ("scan", "metadata", "normalize", "dedup", "covers", "convert", "verify", "organize")
 
 # subcommand name -> (stage it stops after, help text)
+#
+# `scan` stops at the same stage as `dedup` — it is the cheap "what is in this
+# folder" command an agent runs before committing to a real build (spec 8.1: it
+# "creates/updates the batch run.json" with the inventory and "converts nothing").
+# What actually sets it apart from `dedup` is the LLM policy (see `run()`): `scan`
+# never blocks on a missing key, silently falling back to the offline heuristic,
+# while every other subcommand keeps the LLM-on-by-default / missing-key-is-fatal
+# contract `build` has.
 SUBCOMMANDS = {
-    "scan": ("scan", "Inventory sources only; converts nothing."),
+    "scan": (
+        "dedup",
+        "Inventory sources — metadata, resolved title/author/language, duplicates — "
+        "into the batch's run.json. Converts nothing; never requires an API key.",
+    ),
     "normalize": ("normalize", "Scan, read metadata, and clean title/author/language."),
     "dedup": ("dedup", "...through duplicate grouping (see `scan`/`normalize`)."),
     "covers": ("covers", "...through cover resolution."),
@@ -307,22 +319,33 @@ def run(args) -> int:
         try:
             api_key = openrouter.resolve_key(args.op_item)
         except openrouter.OpenRouterError as error:
-            # "config_missing", not "dependency_missing": nothing to install fixes a
-            # missing key. The hint is the resolver's own message, which already
-            # names all three ways to supply one plus --no-llm (Decision 5).
-            raise UsageError(
-                "no OpenRouter API key available",
-                code="config_missing",
-                hint=str(error),
-                exit_code=EXIT_DEPENDENCY,
-            ) from error
+            if args.ebook_command == "scan":
+                # `scan` is the cheap "what is in this folder" command an agent runs
+                # before committing to a real build (fix round 1 ruling) — it never
+                # blocks on a missing key, it just falls back to the offline
+                # heuristic instead of the LLM passes.
+                llm_enabled = False
+            else:
+                # "config_missing", not "dependency_missing": nothing to install
+                # fixes a missing key. The hint is the resolver's own message,
+                # which already names all three ways to supply one plus --no-llm
+                # (Decision 5).
+                raise UsageError(
+                    "no OpenRouter API key available",
+                    code="config_missing",
+                    hint=str(error),
+                    exit_code=EXIT_DEPENDENCY,
+                ) from error
 
-    # `scan` never touches Calibre at all (pure filesystem listing); every other
-    # subcommand reads metadata (ebook-meta) at minimum, and `build` also converts
-    # (ebook-convert). Checked once, up front, so a real run fails fast with one
-    # clear message instead of every single item failing with a cryptic engine_error.
-    if not args.dry_run and stop_after != "scan":
-        for dep in (calibre.EBOOK_CONVERT, calibre.EBOOK_META):
+    # Every subcommand reads metadata (ebook-meta) at minimum; only `convert`/`build`
+    # also convert (ebook-convert). Checked once, up front, so a real run fails fast
+    # with one clear message instead of every single item failing with a cryptic
+    # engine_error.
+    if not args.dry_run:
+        needed = [calibre.EBOOK_META]
+        if _stage_index(stop_after) >= _stage_index("convert"):
+            needed.append(calibre.EBOOK_CONVERT)
+        for dep in needed:
             if dep.locate() is None:
                 raise UsageError(
                     f"missing dependency: {dep.name}",
@@ -361,9 +384,6 @@ def run(args) -> int:
         raise UsageError(str(error)) from error
     batch_dir = root / batch_name
 
-    if stop_after == "scan":
-        return _run_scan_only(paths, reporter=reporter, batch_dir=batch_dir, options=options)
-
     return _run_pipeline(
         paths,
         overrides,
@@ -377,47 +397,6 @@ def run(args) -> int:
         api_key=api_key,
         llm_enabled=llm_enabled,
     )
-
-
-def _run_scan_only(paths: list[Path], *, reporter: Reporter, batch_dir: Path, options: dict) -> int:
-    """`ebook scan`: inventory only, no metadata read, converts nothing."""
-    stages = ["scan"]
-    reporter.start(
-        tool=NAME,
-        batch=batch_dir.name,
-        output_dir=batch_dir,
-        stages=stages,
-        items=len(paths),
-        options=options,
-    )
-    reporter.stage(stage="scan", index=1, count=1)
-    for index, path in enumerate(paths, start=1):
-        exists = path.is_file()
-        reporter.item(
-            id=index,
-            status="done" if exists else "failed",
-            input=path,
-            outputs=[],
-            bytes_in=path.stat().st_size if exists else None,
-            reason=None if exists else "source_missing",
-        )
-    ok = all(p.is_file() for p in paths)
-    reporter.result(
-        ok=ok,
-        exit_code=EXIT_OK if ok else EXIT_FAILED,
-        counts={
-            "total": len(paths),
-            "done": sum(1 for p in paths if p.is_file()),
-            "skipped": 0,
-            "failed": sum(1 for p in paths if not p.is_file()),
-            "pending": 0,
-        },
-        failed=[],
-        pending=[],
-        outputs=[],
-        run_file=None,
-    )
-    return EXIT_OK if ok else EXIT_FAILED
 
 
 @dataclass
@@ -573,41 +552,55 @@ def _run_pipeline(
     llm_enabled: bool,
 ) -> int:
     dry_run = args.dry_run
-    plan = _build_plan(
-        paths,
-        overrides,
-        args=args,
-        stop_after=stop_after,
-        dry_run=dry_run,
-        llm_enabled=llm_enabled,
-        api_key=api_key,
-        cache_dir=cache_dir,
-        prefer=prefer,
-    )
-
     stages = list(STAGE_ORDER[: _stage_index(stop_after) + 1])
-    total_items = len(plan.groups) + len(plan.dropped)
 
-    if dry_run:
-        return _report_dry_run(
-            plan,
-            stages=stages,
-            reporter=reporter,
-            batch_dir=batch_dir,
-            options=options,
-            stop_after=stop_after,
-        )
-
+    # `start` (and the stage announcements) are emitted BEFORE the expensive planning
+    # phase below — metadata reads across the whole library, the LLM normalize/dedup
+    # passes, cover resolution — rather than after it. For a library of any size that
+    # phase is minutes of work plus network calls: the single most likely place a
+    # person presses Ctrl+C, and until `start` reaches stdout a --json caller has
+    # nothing to make sense of. `items` is the raw source count; the true post-dedup
+    # item count is only known once planning finishes and is what `result.counts`
+    # reports.
     reporter.start(
         tool=NAME,
         batch=batch_dir.name,
         output_dir=batch_dir,
         stages=stages,
-        items=total_items,
+        items=len(paths),
         options=options,
     )
     for index, stage_name in enumerate(stages, start=1):
         reporter.stage(stage=stage_name, index=index, count=len(stages))
+
+    try:
+        plan = _build_plan(
+            paths,
+            overrides,
+            args=args,
+            stop_after=stop_after,
+            dry_run=dry_run,
+            llm_enabled=llm_enabled,
+            api_key=api_key,
+            cache_dir=cache_dir,
+            prefer=prefer,
+        )
+    except KeyboardInterrupt:
+        # No batch was ever opened yet (planning runs before RunState.open()), so
+        # there is nothing for `run_file` to point at — same shape `empty_result`
+        # already gives a batch-conflict abort.
+        reporter.error(code="interrupted", message="interrupted by user")
+        reporter.result(**empty_result(EXIT_INTERRUPTED))
+        return EXIT_INTERRUPTED
+
+    if dry_run:
+        return _report_dry_run(
+            plan,
+            reporter=reporter,
+            batch_dir=batch_dir,
+            options=options,
+            stop_after=stop_after,
+        )
 
     try:
         state_cm = RunState.open(
@@ -943,21 +936,16 @@ def _convert_missing_books(
 def _report_dry_run(
     plan: _Plan,
     *,
-    stages: list[str],
     reporter: Reporter,
     batch_dir: Path,
     options: dict,
     stop_after: str,
 ) -> int:
+    """Report the plan as `item`/`result` events. `start` and the stage announcements
+    were already emitted by the caller before planning began (see `_run_pipeline`),
+    so this only ever adds `item`s and the final `result` — nothing here writes
+    anything to disk."""
     total = len(plan.groups) + len(plan.dropped)
-    reporter.start(
-        tool=NAME,
-        batch=batch_dir.name,
-        output_dir=batch_dir,
-        stages=stages,
-        items=total,
-        options=options,
-    )
     reaches_convert = _stage_index(stop_after) >= _stage_index("convert")
 
     exit_code = EXIT_OK
