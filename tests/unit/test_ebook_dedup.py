@@ -249,3 +249,66 @@ def test_two_different_invalid_books_do_not_become_duplicates_of_each_other():
     }
     groups = dedup.group(entries, formats=_formats(entries))
     assert len(groups) == 2
+
+
+def test_refine_never_calls_the_model_for_books_that_did_not_qualify_for_exact_grouping():
+    # The exact scenario from the finding: two different blank/invalid books both
+    # land in the (None, "") bucket unless refine() excludes them the same way
+    # group() does — otherwise the model is asked to compare "scan0001" against
+    # "scan0002" and has every reason to hallucinate a match.
+    entries = {
+        Path("/b/scan0001.pdf"): Verdict("invalid", "", None, None, "heuristic"),
+        Path("/b/scan0002.pdf"): Verdict("invalid", "", None, None, "heuristic"),
+    }
+    groups = dedup.group(entries, formats=_formats(entries))
+    assert len(groups) == 2
+
+    calls = []
+
+    def chat(messages, **kwargs):
+        calls.append(1)
+        from media_tools.integrations.openrouter import Usage
+
+        return {"clusters": [[0, 1]]}, Usage(1, 1)
+
+    refined, _stats = dedup.refine(
+        groups,
+        entries,
+        _formats(entries),
+        model="m",
+        api_key="k",
+        preference=dedup.DEFAULT_PREFERENCE,
+        chat=chat,
+    )
+    assert len(refined) == 2
+    assert calls == [], "an ineligible pair must never even be sent to the model"
+
+
+def test_the_exclusion_does_not_swallow_a_genuine_duplicate():
+    # Guard against the fix above being too broad: a real same-language duplicate
+    # (both "ok", both a usable title) must still merge through refine() as before.
+    entries = _entries(
+        [
+            ("/b/Solaris - Lem.epub", "Solaris", "Lem", "pl"),
+            ("/b/Solaris.pdf", "Solaris", None, "pl"),
+        ]
+    )
+    groups = dedup.group(entries, formats=_formats(entries))
+    assert len(groups) == 2
+
+    def chat(messages, **kwargs):
+        from media_tools.integrations.openrouter import Usage
+
+        return {"clusters": [[0, 1]]}, Usage(1, 1)
+
+    refined, stats = dedup.refine(
+        groups,
+        entries,
+        _formats(entries),
+        model="m",
+        api_key="k",
+        preference=dedup.DEFAULT_PREFERENCE,
+        chat=chat,
+    )
+    assert len(refined) == 1
+    assert stats["llm_calls"] == 1

@@ -163,6 +163,15 @@ def _bucket_key(entry: Group, entries: dict[Path, Verdict]) -> tuple[str | None,
     return (entry.language, blocking_key(entries[entry.winner].title))
 
 
+def _is_bucketable(candidate: Group, entries: dict[Path, Verdict]) -> bool:
+    """A group only enters the fuzzy-merge pass if it would have qualified for
+    exact grouping too (see `group()`'s own guard): a non-"ok" verdict or an
+    empty blocking key gives the model nothing reliable to compare, and every
+    reason to hallucinate a match between two blank/invalid entries."""
+    verdict = entries[candidate.winner]
+    return verdict.status == "ok" and bool(blocking_key(verdict.title))
+
+
 def _ask_clusters(
     chunk: list[Group], entries: dict[Path, Verdict], model: str, api_key: str, chat
 ) -> tuple[list[list[int]], openrouter.Usage]:
@@ -248,22 +257,30 @@ def refine(
 ) -> tuple[list[Group], dict]:
     """The LLM pass: bucket the exact groups by `(language, blocking_key)` — never
     across languages — and ask the model which ones, within one bucket, are really
-    the same book. A bucket with fewer than two groups costs no request at all. A
-    batch whose request fails or comes back in an unexpected shape is left ungrouped
-    rather than dropped, and counted in `stats["errors"]` — dedup calls cost money
-    too, and the run summary is the only warning before a large bill. The model's
-    clusters are trusted only where their indices are well-formed, and a cluster
-    spanning more than one language is never merged, whatever the model said
-    (`stats["blocked_merges"]`) — `_merge_cluster` is the second line of defense for
-    that rule, independent of the bucketing that should already keep languages apart."""
+    the same book. A group that did not qualify for exact grouping (a non-"ok"
+    verdict, or an empty blocking key) does not qualify for fuzzy merging either —
+    it is excluded from bucketing and passed through untouched, since the model has
+    nothing reliable to compare and every reason to hallucinate a match between two
+    blank/invalid entries. A bucket with fewer than two groups costs no request at
+    all. A batch whose request fails or comes back in an unexpected shape is left
+    ungrouped rather than dropped, and counted in `stats["errors"]` — dedup calls
+    cost money too, and the run summary is the only warning before a large bill.
+    The model's clusters are trusted only where their indices are well-formed, and
+    a cluster spanning more than one language is never merged, whatever the model
+    said (`stats["blocked_merges"]`) — `_merge_cluster` is the second line of
+    defense for that rule, independent of the bucketing that should already keep
+    languages apart."""
     chat = chat or openrouter.chat
 
     buckets: dict[tuple[str | None, str], list[Group]] = {}
+    result: list[Group] = []
     for candidate in groups:
+        if not _is_bucketable(candidate, entries):
+            result.append(candidate)
+            continue
         buckets.setdefault(_bucket_key(candidate, entries), []).append(candidate)
 
     stats = {"llm_calls": 0, "buckets": 0, "merges": 0, "errors": 0, "blocked_merges": 0}
-    result: list[Group] = []
 
     for bucket_groups in buckets.values():
         if len(bucket_groups) < 2:
