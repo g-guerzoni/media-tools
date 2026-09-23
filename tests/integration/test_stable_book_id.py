@@ -1,11 +1,8 @@
-import pytest
-
 from media_tools.integrations import calibre
 from media_tools.tasks.ebook import exth, opf
+from tests.conftest import requires_calibre
 
-pytestmark = pytest.mark.skipif(
-    calibre.find_tool("ebook-convert") is None, reason="Calibre is not installed"
-)
+pytestmark = requires_calibre
 
 
 def test_the_same_source_converts_to_the_same_embedded_id_every_time(make_epub, tmp_path):
@@ -19,7 +16,7 @@ def test_the_same_source_converts_to_the_same_embedded_id_every_time(make_epub, 
         title="Stable",
         author="Ada Lovelace",
         language="en",
-        uuid=opf.book_id(book),
+        book_uuid=opf.book_id(book),
     )
 
     ids = []

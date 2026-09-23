@@ -1,10 +1,9 @@
 import pytest
 
 from media_tools.integrations import calibre
+from tests.conftest import requires_calibre
 
-pytestmark = pytest.mark.skipif(
-    calibre.find_tool("ebook-convert") is None, reason="Calibre is not installed"
-)
+pytestmark = requires_calibre
 
 
 def test_read_metadata_returns_the_embedded_fields(make_epub, tmp_path):
@@ -28,6 +27,14 @@ def test_read_metadata_of_a_missing_file_is_all_none(tmp_path):
     assert meta.title is None and meta.author is None and meta.uuid is None
 
 
+def test_read_metadata_reports_a_cover_when_the_book_has_one(make_epub, tmp_path):
+    # ebook-convert auto-generates a default cover for every book that doesn't supply
+    # one, so has_cover should be True for any book made by the make_epub fixture.
+    book = make_epub(title="Has A Cover")
+    meta = calibre.read_metadata(book, cache_dir=tmp_path / "cache")
+    assert meta.has_cover is True
+
+
 def test_convert_produces_the_target_format(make_epub, tmp_path):
     book = make_epub(title="Convertible")
     out = tmp_path / "out.azw3"
@@ -42,10 +49,34 @@ def test_convert_raises_with_the_tail_of_stderr(tmp_path):
         calibre.convert(
             broken, tmp_path / "out.azw3", opf=None, cover=None, cache_dir=tmp_path / "cache"
         )
-    assert str(excinfo.value)
+    # Pin the actual message Calibre prints for a corrupt/non-ZIP epub, not just "some
+    # string" — a bare truthiness check would still pass if the tail were empty text.
+    assert "Not a ZIP file" in str(excinfo.value)
 
 
 def test_calls_never_touch_the_user_config(make_epub, tmp_path):
     cache = tmp_path / "cache"
     calibre.read_metadata(make_epub(title="Isolated"), cache_dir=cache)
     assert (cache / "calibre-config").is_dir()
+
+
+def test_extract_cover_returns_false_on_internal_failure(monkeypatch, tmp_path):
+    def _boom(*args, **kwargs):
+        raise calibre.CalibreError("boom")
+
+    monkeypatch.setattr(calibre, "_run", _boom)
+    result = calibre.extract_cover(
+        tmp_path / "book.epub", tmp_path / "cover.jpg", cache_dir=tmp_path / "cache"
+    )
+    assert result is False
+
+
+def test_fetch_cover_returns_false_on_internal_failure(monkeypatch, tmp_path):
+    def _boom(*args, **kwargs):
+        raise calibre.CalibreError("boom")
+
+    monkeypatch.setattr(calibre, "_run", _boom)
+    result = calibre.fetch_cover(
+        "Some Title", "Some Author", tmp_path / "cover.jpg", cache_dir=tmp_path / "cache"
+    )
+    assert result is False

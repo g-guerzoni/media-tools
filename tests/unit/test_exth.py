@@ -31,7 +31,7 @@ def test_write_opf_round_trips_the_fields(tmp_path):
         title="Título & Cia",
         author="Machado de Assis",
         language="pt",
-        uuid="12345678-1234-5678-1234-567812345678",
+        book_uuid="12345678-1234-5678-1234-567812345678",
     )
     text = target.read_text(encoding="utf-8")
     assert "Título &amp; Cia" in text

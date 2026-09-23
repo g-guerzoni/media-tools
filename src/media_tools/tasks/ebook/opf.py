@@ -37,7 +37,7 @@ def book_id(source: Path) -> str:
 
 
 def write_opf(
-    path: Path, *, title: str, author: str | None, language: str | None, uuid: str
+    path: Path, *, title: str, author: str | None, language: str | None, book_uuid: str
 ) -> None:
     creator = f'    <dc:creator opf:role="aut">{escape(author)}</dc:creator>\n' if author else ""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -46,7 +46,7 @@ def write_opf(
             title=escape(title),
             creator=creator,
             language=escape(language or "und"),
-            uuid=escape(uuid),
+            uuid=escape(book_uuid),
         ),
         encoding="utf-8",
     )

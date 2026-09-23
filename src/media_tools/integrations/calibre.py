@@ -176,8 +176,10 @@ def read_metadata(path: Path, *, cache_dir: Path, timeout: int = 120) -> BookMet
             break
         if uuid is None:
             uuid = value
-    has_cover = any(item.get("name") == "cover" for item in root.findall(".//meta")) or any(
-        ref.get("type") == "cover" for ref in root.findall(".//guide/reference")
+    has_cover = any(
+        item.get("name") == "cover" for item in root.findall(".//opf:meta", _OPF_NS)
+    ) or any(
+        ref.get("type") == "cover" for ref in root.findall(".//opf:guide/opf:reference", _OPF_NS)
     )
     language = text("language")
     if language:
@@ -219,7 +221,10 @@ def extract_cover(src: Path, dest: Path, *, cache_dir: Path, timeout: int = 120)
     if tool is None:
         return False
     dest.unlink(missing_ok=True)
-    _run([tool, str(src), "--get-cover", str(dest)], cache_dir=cache_dir, timeout=timeout)
+    try:
+        _run([tool, str(src), "--get-cover", str(dest)], cache_dir=cache_dir, timeout=timeout)
+    except CalibreError:
+        return False
     return dest.exists() and dest.stat().st_size > 1000
 
 

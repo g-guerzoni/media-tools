@@ -11,6 +11,13 @@ import pytest
 from media_tools.core.ffmpeg import ffmpeg_exe
 from media_tools.integrations import calibre
 
+# Shared by every test module gated on a real Calibre install (metadata/convert tests
+# today; the future convert-engine and build-pipeline tests per the ebook plan), so the
+# skip condition and its reason are defined once instead of duplicated per file.
+requires_calibre = pytest.mark.skipif(
+    calibre.find_tool("ebook-convert") is None, reason="Calibre is not installed"
+)
+
 
 @pytest.fixture(scope="session")
 def ffmpeg_path() -> str:
