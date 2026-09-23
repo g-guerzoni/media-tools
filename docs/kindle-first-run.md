@@ -70,14 +70,18 @@ closing the session is really the whole of an MTP eject.
 media-tools doctor
 ```
 
-Two lines in the report are about this feature, and both are warnings by design — a
-machine with no Kindle attached is not a broken machine:
+Two lines in the report are about this feature:
 
+- `kindle-device` — whether a Kindle is connected, and in which mode. Having none
+  attached is reported `ok`, not as a problem: a machine with no Kindle is not a broken
+  machine. A Kindle another program is holding IS flagged, because there is something
+  to do about that.
 - `kindle-mtp-driver` — whether Calibre's MTP driver imports inside Calibre's own
-  interpreter. Only an MTP Kindle needs it; a mass-storage Kindle needs none of it.
-- `kindle-device` — whether a Kindle is connected, and in which mode.
+  interpreter. It is only probed when the line above found an **MTP** Kindle; otherwise
+  it says `not probed`, because nothing else on the machine needs the driver.
 
-Neither can ever report `missing`, and neither moves `doctor`'s exit code.
+Neither can ever report `missing`, and neither moves `doctor`'s exit code. Run this
+again with the Kindle plugged in — that is when both lines start saying something.
 
 ## 1. `status` — read-only
 
@@ -91,8 +95,9 @@ Expected: exit 0, and a final `result` event whose `data.device` reports
 
 - `mode` — `"mass_storage"` or `"mtp"`,
 - `backend` — the matching `"mass_storage"` / `"mtp"` literal,
-- `serial`, `free_space`, and `held_by` (`"calibre_gui"` when Calibre's GUI has the
-  device, otherwise `null`),
+- `serial`, `free_space`, and `held_by` — **MTP only**: it reads `"calibre_gui"` when
+  Calibre's GUI has the device, and is `null` on a mass-storage Kindle even with
+  Calibre open, because mass storage has no single-holder lock to report on,
 
 plus `data.backup` with `last: null` (no snapshot yet), `abandoned_partials: []` and
 `header_cache_bytes: 0`.
@@ -143,6 +148,10 @@ the snapshot just written. It lands under
 ```
 
 with a `manifest.json` and a `files/` tree mirroring the device's own paths.
+`<serial>` is the device's own serial when it reports one — and `unknown-<8 hex>`,
+derived from the mount name or model hint, when it does not. **Check which you got
+before going looking for a serial-named folder**; `status` above reported the serial,
+and a `null` there means the directory is the `unknown-` one.
 
 What to check:
 
@@ -273,6 +282,13 @@ This is the step with the least verification behind it (item 4 above). Check tha
 volume really did disappear, that the Kindle says it is safe to unplug, and — over
 MTP — that the device is in a clean state afterwards and nothing else on the host is
 still holding it.
+
+If it fails, the error code says which kind of failure it was: `device_busy` means the
+volume is still in use after the one retry (close whatever is reading it and run
+`eject` again), and `dependency_missing` means a platform binary — `diskutil`,
+`udisksctl` or `sync` — is not there. Both exit 3, and the device is untouched either
+way. Worth deliberately provoking the busy case once, by leaving a file manager open on
+the volume, since neither branch has ever run for real.
 
 ## When something does not match
 

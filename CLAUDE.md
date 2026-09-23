@@ -38,14 +38,18 @@ Each entry in `checks` is `{"name", "status", "detail", "hint"}` with `status` o
   them; `calibre` not found only matters for `ebook build` and for `convert` on ebook
   formats). `doctor --json` reports both, plus `--op-item NAME` if you need to check a
   named 1Password item rather than an env var.
-- **The two Kindle checks are warnings ABSOLUTELY, never `"missing"`.**
-  `kindle-mtp-driver` reports whether Calibre's own MTP driver imports inside
-  Calibre's interpreter (needed only for an MTP Kindle; a mass-storage one needs none
-  of it), and `kindle-device` reports whether a Kindle is connected and in which mode.
-  A machine with no Kindle attached is not a broken machine, so neither can move
-  `doctor`'s exit code, and neither should be relayed as something to fix unless the
-  user is actually trying to drive `ebook kindle`. `kindle-device` never prints a
-  serial — `ebook kindle status` is where that is asked for deliberately.
+- **The two Kindle checks never report `"missing"`, and never `"warn"` for a state
+  with nothing to do about it.** `kindle-device` reports whether a Kindle is connected
+  and in which mode; **no Kindle connected is `"ok"`**, not a warning, because there is
+  no action attached to it and a permanent warn in a report whose other warns are all
+  actionable teaches everyone to skim the level that carries the real blockers. A
+  Kindle another program HOLDS is a warn — that one has an action. `kindle-device`
+  never prints a serial; `ebook kindle status` is where that is asked for deliberately.
+  `kindle-mtp-driver` reports whether Calibre's own MTP driver imports inside Calibre's
+  interpreter, and **it only probes when `kindle-device` found an MTP Kindle** —
+  otherwise it reports `"ok"` with `"not probed: no MTP Kindle connected"`, which keeps
+  a `calibre-debug` subprocess off the session-start path entirely. Neither can move
+  `doctor`'s exit code.
 - With `--check-updates`, an extra `"<package>-update"` entry (status `"warn"`) appears
   for every pip-managed dependency (`yt-dlp`, `yt-dlp-ejs`, `deno`, `imageio-ffmpeg` —
   never `media-tools` itself) that has a newer version on PyPI. If you see one, run:
@@ -732,9 +736,10 @@ recognise), never a Python class name.
 
 The MTP backend cannot import Calibre's driver from this process; it shells out to
 `calibre-debug` running `integrations/kindle_mtp.py`. So MTP needs Calibre installed;
-mass storage needs none of it. `doctor` reports both facts (`kindle-mtp-driver`,
-`kindle-device`) as warnings — a machine with no Kindle attached is not a broken
-machine, and neither check can ever report `missing` or move `doctor`'s exit code.
+mass storage needs none of it. `doctor` reports both facts (`kindle-device`, then
+`kindle-mtp-driver`, which only probes when the first found an MTP device); neither can
+report `missing` or move `doctor`'s exit code, and neither warns about a state with
+nothing to act on.
 
 Three things behave differently over MTP, all because of what Calibre's cached device
 tree exposes:
@@ -773,11 +778,23 @@ do not write, and a run that does not write has nothing to protect.
     .cache/book-ids.json           `add`'s EXTH 113 index
 ```
 
-`_kindle` is one of `core.paths.RESERVED_ROOT_ENTRIES`; never point an input at it. A
-device with no serial gets `unknown-<8 hex>` derived from its mount name or model hint,
-never a shared constant. Snapshots are incremental (hard links from the previous one
+`_kindle` is one of `core.paths.RESERVED_ROOT_ENTRIES`; never point an input at it.
+`<serial>` above is `backup.device_key(device)`, NOT always a serial: a device that
+reports none gets `unknown-<8 hex of its mount name or model hint>`, never a shared
+constant (two serial-less devices under one root would otherwise write into each
+other's snapshots). Resolve the directory through `device_key`, or read it off
+`status`; do not build it from `data.device.serial`, which is `null` for exactly the
+devices whose directory is not named after it.
+
+`status`'s `data.device.held_by` is **MTP-only**: `run_status` sets it only when
+`device.mode == "mtp"`, so on a mass-storage Kindle it is `null` even with Calibre's
+GUI open. That is not a claim the device is free — mass storage has no single-holder
+lock to report on. Snapshots are incremental (hard links from the previous one
 for a file whose path/size match and whose mtime differs by at most 2s, or by a whole
-number of hours — FAT stores local time, so DST shifts every mtime by exactly an hour).
+number of hours, **at most two of them** (`MAX_DST_HOURS`) — FAT stores local time, so
+DST shifts every mtime by exactly an hour, and an unbounded rule would forgive a
+24-hour gap that has nothing to do with DST. `.sdr` sidecar content is exempt from the
+hours clause entirely).
 
 **Snapshots are never pruned.** Nothing in this tool deletes a backup; the only
 directory it ever removes is its own `.partial` staging area after a failure it caught.
@@ -808,6 +825,14 @@ one begins. The lists are exactly:
 
 A `--dry-run` list never contains `backup`, because a dry run takes none.
 
+**This subsystem is the exception to the `stage` contract above** ("once per entry in
+`start`'s `stages` list, in that order"). A failed precondition returns from `body`
+early, so a run that declared six stages can emit only `detect` and `backup` — most
+obviously a failed mandatory backup (`error: backup_failed`, exit 3), but also a
+`restore` whose `--op` id or snapshot cannot be resolved. `result` is still the last
+stdout line in every one of those cases; the stages list in `start` is what the run
+INTENDED, not a promise of what it reached.
+
 #### What each command puts in `result.data`
 
 Every key below is always present for that command — a plan or a `--dry-run` reports a
@@ -816,7 +841,7 @@ missing key, so one parser reads both shapes.
 
 | command | `data` keys |
 | --- | --- |
-| `status` | `device` (`mode`, `backend`, `model_hint`, `serial`, `free_space`, `held_by`), `backup` (`last`, `abandoned_partials`, `header_cache_bytes`) |
+| `status` | `device` (`mode`, `backend`, `model_hint`, `serial`, `free_space`, `held_by` — **MTP only**, see below), `backup` (`last`, `abandoned_partials`, `header_cache_bytes`) |
 | `scan` | `books[]`; `compare` (`batch`, `device_only`, `library_only`, `both`) only with `--compare` |
 | `backup` | `snapshot` |
 | `thumbnails` | `thumbnails` (`{book id or device path: "installed"\|"rejected"\|"no_cover"\|"failed"}`), `snapshot` |
@@ -968,10 +993,20 @@ that deletes books.
 
 The adding half IS `add --batch NAME` — shared code, not a second implementation. An
 extra is a device book whose EXTH 113 id the batch does not carry. **Four things are
-never extras**: a book whose id could not be read (absence cannot be PROVEN for it), a
-book outside `backup.DEFAULT_SCOPE`, a book at a path this run's own plan targets, and
-every book of a batch that never finished — which is refused up front as a usage error
-rather than silently treated as "the library does not have these".
+never extras:**
+
+1. **A book with no id to compare.** The test is `(ids.get(path) or "") not in ("",
+   *library_ids)`, so an EMPTY id is never an extra — and that covers BOTH a read that
+   failed AND a book that legitimately carries no EXTH 113 at all (an `.epub`, a
+   `.pdf`, a MOBI nobody wrote one into). Do not read this as "unreadable ids only": an
+   id-less device book is never deleted by `--delete-extras --yes`, because absence from
+   the library cannot be proven for it either way.
+2. A book outside `backup.DEFAULT_SCOPE` — no snapshot holds it, so no `restore` could
+   undo it.
+3. A book at a path this run's own plan targets: the copy phase is about to write
+   there, or already refused to.
+4. Every book of a batch that never finished — refused up front as a usage error rather
+   than silently treated as "the library does not have these".
 
 Extras are reported in `result.data.extras` whether or not `--delete-extras` was given.
 The two halves are journalled as TWO operations, an `add` and a `remove`
@@ -1002,10 +1037,14 @@ the state it had just recorded. One `item` per selected FILE, not per book.
 with no backup, because it has nothing to protect. Mass storage runs `sync` and then the
 platform eject (`diskutil eject` on the mount's parent whole disk on macOS, `udisksctl
 unmount` + `power-off` on Linux, retried once on a busy volume); MTP closes the session.
-A failure maps through the same table as every other command, which means a missing
-`diskutil`/`udisksctl` AND a volume still busy after the retry both surface as
-`dependency_missing`/exit 3 — the closed registry has no narrower code, and the device
-is untouched either way.
+A failure maps through the same table as every other command, and the two it actually
+has are told apart: a volume still busy after the retry is `device_busy`
+(`massstorage._run_with_retry` raises `DeviceBusy` for exactly that, and
+`_error_code_for` tests it before anything broader) — close whatever is reading the
+volume and run `eject` again. A missing `diskutil`, `udisksctl` **or `sync`** binary is
+`dependency_missing`, which is what that code means. Both exit 3, and the device is
+untouched either way. A `sync` that RUNS and returns non-zero is not a failure at all:
+its return code is deliberately unchecked, since it says nothing actionable.
 
 #### `scan`'s report, field by field
 
