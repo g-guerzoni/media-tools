@@ -731,6 +731,108 @@ def test_scan_over_mtp_reuses_the_cache_then_invalidates_and_prunes_it(tmp_path,
     assert status_result["data"]["backup"]["header_cache_bytes"] > 0
 
 
+def test_a_cache_index_write_failure_does_not_fail_the_scan(monkeypatch, tmp_path, capsys):
+    """A full disk / read-only output root / permissions change under `_kindle/` is
+    HOST-side cache bookkeeping, not a device problem — it must never be reported as
+    the device having gone away (widening finding 2's catch to `OSError` is exactly
+    what would otherwise let it), and it must never fail a scan that already
+    successfully listed and fetched every book."""
+    device = _mtp_device()
+    path = "documents/en/Book.azw3"
+    backend = _FakeMtpBackend(
+        files={path: mobi_bytes(book_id="CACHEWRITE0001", title="Book", author="A", language="en")}
+    )
+    original_write_text = Path.write_text
+
+    def failing_write_text(self, *args, **kwargs):
+        if self.name == "index.json":
+            raise OSError("disk full")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "scan", "--json", "-o", str(tmp_path / "media")]
+    )
+    exit_code = kindle_cli.run_scan(
+        args, device_finder=lambda: device, backend_factory=lambda d, *, cache_dir: backend
+    )
+    assert exit_code == EXIT_OK
+    result = _events(capsys)[-1]
+    assert result["ok"] is True
+    assert result["data"]["books"][0]["title"] == "Book"
+
+
+def test_a_stale_cache_prune_failure_does_not_fail_the_scan(monkeypatch, tmp_path, capsys):
+    device = _mtp_device()
+    root = tmp_path / "media"
+    path = "documents/en/Book.azw3"
+    backend = _FakeMtpBackend(
+        files={
+            path: mobi_bytes(book_id="PRUNEV1000001", title="Version 1", author="A", language="en")
+        }
+    )
+    args = build_parser().parse_args(["ebook", "kindle", "scan", "--json", "-o", str(root)])
+    kindle_cli.run_scan(
+        args, device_finder=lambda: device, backend_factory=lambda d, *, cache_dir: backend
+    )
+    _events(capsys)  # drain the first scan's output
+
+    # The book changes on the device -> a new cache key -> the PREVIOUS cached copy is
+    # now stale and would normally be pruned.
+    _set_file_bytes(
+        backend,
+        path,
+        mobi_bytes(book_id="PRUNEV2000001", title="Version 2", author="A", language="en")
+        + b"padding to change the size",
+    )
+    monkeypatch.setattr(
+        Path, "unlink", lambda self, *a, **k: (_ for _ in ()).throw(OSError("permission denied"))
+    )
+
+    exit_code = kindle_cli.run_scan(
+        args, device_finder=lambda: device, backend_factory=lambda d, *, cache_dir: backend
+    )
+    assert exit_code == EXIT_OK
+    result = _events(capsys)[-1]
+    assert result["ok"] is True
+    assert result["data"]["books"][0]["title"] == "Version 2"
+
+
+def test_scan_over_mtp_ignores_a_malicious_cache_index_entry(tmp_path, capsys):
+    """`index.json` is this module's own state, but a value read back from it drives a
+    `Path.unlink()` call — a `..`-bearing entry must be skipped rather than trusted."""
+    device = _mtp_device()
+    root = tmp_path / "media"
+    path = "documents/en/Book.azw3"
+    backend = _FakeMtpBackend(
+        files={
+            path: mobi_bytes(
+                book_id="SAFEBOOK00000001", title="Safe Book", author="A", language="en"
+            )
+        }
+    )
+    header_cache_dir = root / "_kindle" / device.serial / ".cache" / "headers"
+    header_cache_dir.mkdir(parents=True)
+    # A file OUTSIDE the cache directory that a malicious/corrupt index entry could
+    # otherwise point `unlink()` at.
+    outside_target = header_cache_dir.parent / "do-not-delete.txt"
+    outside_target.write_text("must survive", encoding="utf-8")
+    (header_cache_dir / "index.json").write_text(
+        json.dumps({path: "../do-not-delete.txt"}), encoding="utf-8"
+    )
+
+    args = build_parser().parse_args(["ebook", "kindle", "scan", "--json", "-o", str(root)])
+    exit_code = kindle_cli.run_scan(
+        args, device_finder=lambda: device, backend_factory=lambda d, *, cache_dir: backend
+    )
+    assert exit_code == EXIT_OK
+    assert outside_target.is_file()
+    assert outside_target.read_text(encoding="utf-8") == "must survive"
+    result = _events(capsys)[-1]
+    assert result["data"]["books"][0]["title"] == "Safe Book"
+
+
 # --- backup -------------------------------------------------------------------------
 
 
@@ -788,8 +890,9 @@ def test_backup_and_status_report_the_same_snapshot_shape(fake_kindle, tmp_path,
 
 def test_backup_failure_maps_to_backup_failed_and_exits_1_not_3(fake_kindle, tmp_path, capsys):
     """The snapshot IS the work `backup` was asked to do, so a failure inside it is
-    "at least one item failed" (exit 1), not "missing dependency or configuration"
-    (exit 3) — unlike `device_not_found`/`device_busy`, which keep exit 3."""
+    "at least one item failed" (exit 1, `counts.failed: 1`), not "missing dependency or
+    configuration" (exit 3, all-zero counts) — unlike `device_not_found`/`device_busy`,
+    which keep exit 3 and empty counts, since there nothing was attempted at all."""
     kindle = kindle_device(fake_kindle)
     args = build_parser().parse_args(
         ["ebook", "kindle", "backup", "--json", "-o", str(tmp_path / "media")]
@@ -801,8 +904,21 @@ def test_backup_failure_maps_to_backup_failed_and_exits_1_not_3(fake_kindle, tmp
     )
     assert exit_code == EXIT_FAILED
     events = _events(capsys)
-    assert events[-1]["exit_code"] == EXIT_FAILED
+    result = events[-1]
+    assert result["type"] == "result"
+    assert result["ok"] is False
+    assert result["exit_code"] == EXIT_FAILED
+    # The exit code alone is not enough evidence: an all-zero `counts` here would still
+    # misreport a run that demonstrably did fail an item.
+    assert result["counts"] == {"total": 1, "done": 0, "skipped": 0, "failed": 1, "pending": 0}
+    assert result["failed"] == [
+        {"id": 1, "input": f"kindle:{kindle.serial}", "reason": "engine_error"}
+    ]
     assert any(e.get("code") == "backup_failed" for e in events if e["type"] == "error")
+    item_events = [e for e in events if e["type"] == "item"]
+    assert len(item_events) == 1
+    assert item_events[0]["status"] == "failed"
+    assert item_events[0]["input"] == f"kindle:{kindle.serial}"
 
 
 # --- end-to-end (no real device in this environment) ---------------------------------

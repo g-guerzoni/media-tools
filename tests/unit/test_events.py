@@ -159,3 +159,63 @@ def test_error_written_even_when_quiet_or_json():
     assert "fatal error" in err.getvalue()
     # JSON event also present
     assert json.loads(out.getvalue())["type"] == "error"
+
+
+def test_result_with_nothing_to_summarise_prints_no_human_line():
+    """A `result` whose counts are all zero and that never owned a batch (`run_file`
+    is `None`) never did any work — most commonly a `UsageError` raised before a
+    task's own `start`. The human already saw the `error` line; a bare, content-free
+    "✗  · 0.0s" underneath it is noise, not information."""
+    err = io.StringIO()
+    reporter = Reporter(json_mode=False, quiet=False, stdout=io.StringIO(), stderr=err)
+    reporter.error(code="usage", message="no input given")
+    reporter.result(
+        ok=False,
+        exit_code=2,
+        counts={"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0},
+        failed=[],
+        pending=[],
+        outputs=[],
+        run_file=None,
+        elapsed_s=0.0,
+    )
+    assert "no input given" in err.getvalue()
+    assert "✗" not in err.getvalue()
+
+
+def test_result_with_real_counts_still_prints_the_human_line():
+    """The suppression above must not swallow a genuine summary — only the
+    nothing-happened case."""
+    err = io.StringIO()
+    reporter = Reporter(json_mode=False, quiet=False, stdout=io.StringIO(), stderr=err)
+    reporter.result(
+        ok=True,
+        exit_code=0,
+        counts={"total": 1, "done": 1, "skipped": 0, "failed": 0, "pending": 0},
+        failed=[],
+        pending=[],
+        outputs=["/out/a.mp4"],
+        run_file="/out/run.json",
+        elapsed_s=1.0,
+    )
+    assert "✓" in err.getvalue()
+    assert "done 1" in err.getvalue()
+
+
+def test_result_with_a_run_file_but_all_zero_counts_still_prints(tmp_path):
+    """`run_file is not None` alone is enough to summarise, even if every count
+    happens to be zero (a batch that was opened but never processed an item) — the
+    suppression is specifically for a run that never owned a batch at all."""
+    err = io.StringIO()
+    reporter = Reporter(json_mode=False, quiet=False, stdout=io.StringIO(), stderr=err)
+    reporter.result(
+        ok=True,
+        exit_code=0,
+        counts={"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0},
+        failed=[],
+        pending=[],
+        outputs=[],
+        run_file=str(tmp_path / "run.json"),
+        elapsed_s=0.5,
+    )
+    assert "✓" in err.getvalue()

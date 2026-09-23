@@ -18,14 +18,20 @@ that (an `AttributeError`/`KeyError`/etc., a genuine bug in this module) is deli
 left to escape to `cli.py`'s own catch-all, which already gives it an honest
 `internal_error`/exit 1 instead of a dishonest device-shaped code.
 
-**Every mapped code exits 3, except `backup_failed`, which exits 1.** In the `backup`
-command the snapshot IS the work being asked for, so a mid-transfer failure or a hash
-mismatch is "at least one item failed", not "missing dependency or configuration" —
-`ok: false` with `counts.failed: 0` would otherwise misreport a run that demonstrably
-did fail. This does NOT generalise to a future WRITE command (`add`/`remove`/`sync`,
-Task 7) whose MANDATORY pre-write backup fails: there the backup is a precondition and
-nothing the user actually asked for was attempted, so that failure should keep exit 3 —
-see `_EXIT_FOR_CODE`'s own comment.
+**Every mapped code exits 3, except `backup_failed`, which exits 1 AND reports
+`counts.failed: 1`.** In the `backup` command the snapshot IS the work being asked for,
+so a mid-transfer failure or a hash mismatch is "at least one item failed", not
+"missing dependency or configuration" — `ok: false` with `counts.failed: 0` would
+otherwise misreport a run that demonstrably did fail, which is why `run_backup`'s own
+`body` catches `backup_module.BackupFailed` ITSELF (`counts: {"total": 1, "failed":
+1, ...}`, a real `failed` entry, an `item` event) rather than letting it reach `_run`'s
+generic `_fail`/`empty_result` path, which can only express "nothing was attempted" —
+right for `device_not_found`/`device_busy`, wrong for a backup that really did run and
+really did fail. This does NOT generalise to a future WRITE command
+(`add`/`remove`/`sync`, Task 7) whose MANDATORY pre-write backup fails: there the
+backup is a precondition and nothing the user actually asked for was attempted, so
+that failure should keep exit 3 AND `_fail`'s all-zero counts — see `_EXIT_FOR_CODE`'s
+own comment.
 
 **Hold ONE backend instance across a backup and whatever operation follows it, and
 never re-detect between them.** `resolve_device` is called exactly once per command
@@ -47,14 +53,19 @@ reading the file straight off the mount; MTP has no local path at all, so each b
 materialised once into `<output root>/_kindle/<serial>/.cache/headers/`, keyed by
 device path + size + mtime (`_cache_key`), and reused on every later scan — see
 `_materialize_for_scan`, which also prunes a path's OLD cached copy once a newer one
-replaces it, so an edited book does not leave a forgotten full copy behind forever.
-The whole batch goes through `read_many` in one round trip, never a per-file loop (the
-same rule `backup.py` follows, for the same reason: a per-file MTP call re-opens and
-re-scans the device every time) — but `read_many` raises all-or-nothing on the first
-op that fails, so `_materialize_for_scan` catches that and treats whatever did not
-transfer as simply absent, rather than letting one book deleted/renamed mid-scan abort
-the whole command (`exth.read_records` on a missing path already returns `{}`, exactly
-matching mass storage's own behaviour for a vanished book).
+replaces it, so an edited book does not leave a forgotten full copy behind forever. The
+prune (and the small on-disk index, `index.json`, that makes it possible) is entirely
+best-effort: an `OSError` writing it, or a malformed/malicious entry read back from it
+(validated by `_is_safe_cache_key` before it can drive a `Path.unlink()` call), is
+swallowed rather than failing a scan that already succeeded, or reported as if the
+DEVICE were the problem. The whole batch goes through `read_many` in one round trip,
+never a per-file loop (the same rule `backup.py` follows, for the same reason: a
+per-file MTP call re-opens and re-scans the device every time) — but `read_many` raises
+all-or-nothing on the first op that fails, so `_materialize_for_scan` catches that and
+treats whatever did not transfer as simply absent, rather than letting one book
+deleted/renamed mid-scan abort the whole command (`exth.read_records` on a missing path
+already returns `{}`, exactly matching mass storage's own behaviour for a vanished
+book).
 
 **A listing's exception type is deliberately unspecified** (`backend.DeviceBackend`'s
 own docstring): mass storage raises `FileNotFoundError` for a device that vanished
@@ -223,6 +234,16 @@ def _error_code_for(error: BaseException) -> str:
 # (Task 7's `add`/`remove`/`sync`) must NOT reuse this table for that failure: nothing
 # the user asked for was attempted there, which is exit 3's meaning, not exit 1's —
 # map that case separately rather than assuming every `backup_failed` means "exit 1".
+#
+# This table (via `_fail`, below) is the GENERIC path: `empty_result`'s all-zero counts,
+# for a failure before any work was attempted. `run_backup`'s own body catches
+# `BackupFailed` itself instead of letting it reach here, precisely because a snapshot
+# failure is NOT that case — the backup WAS attempted and DID fail, so its `result`
+# needs `counts.failed: 1`, not zero, which `_fail`/`empty_result` cannot express. The
+# `"backup_failed"` entry below only matters if `BackupFailed` somehow escapes from
+# EARLIER than that (e.g. `resolve_device` itself) — realistically unreachable, since
+# `backup.device_key` never returns an empty key, but kept as an honest fallback rather
+# than assumed impossible.
 _EXIT_FOR_CODE = {
     "device_not_found": EXIT_DEPENDENCY,
     "device_busy": EXIT_DEPENDENCY,
@@ -265,9 +286,12 @@ def _run(
     """The shared skeleton every kindle subcommand runs through: emit `start`, resolve
     ONE device+backend, run `body`, and turn whatever it raises into the right `error`
     — always followed by exactly one `result`, whether the run succeeded, failed, or
-    was interrupted. `body` returns the kwargs `reporter.result()` needs beyond
-    `ok`/`exit_code` (always `True`/`EXIT_OK` here; every failure path returns from the
-    `except` clauses below instead)."""
+    was interrupted. `body` returns the kwargs `reporter.result()` needs; `ok` and
+    `exit_code` default to `True`/`EXIT_OK` (the common case: `body` completed and has
+    nothing to apologise for) but `body` may override both — `run_backup` does, when
+    the ONE thing it was asked to do (the snapshot) itself fails, so the `result` can
+    report `counts.failed: 1` instead of the all-zero shape `_fail` gives a failure
+    that stopped the run before any work was attempted at all."""
     reporter = Reporter(json_mode=args.json_mode, quiet=args.quiet)
     root = output_root(args.output_dir)
     reporter.start(
@@ -295,9 +319,11 @@ def _run(
         _close_quietly(backend)
         return _fail(reporter, _error_code_for(error), str(error))
 
-    reporter.result(ok=True, exit_code=EXIT_OK, **result_kwargs)
+    ok = result_kwargs.pop("ok", True)
+    exit_code = result_kwargs.pop("exit_code", EXIT_OK)
+    reporter.result(ok=ok, exit_code=exit_code, **result_kwargs)
     _close_quietly(backend)
-    return EXIT_OK
+    return exit_code
 
 
 # --- status --------------------------------------------------------------------------
@@ -372,21 +398,40 @@ def _backend_label(backend: DeviceBackend) -> str:
     return _BACKEND_LABELS.get(type(backend), "unknown")
 
 
-def _snapshot_summary(snapshot_dir: Path) -> dict | None:
+def _snapshot_summary(
+    snapshot_dir: Path, *, fallback: backup_module.Snapshot | None = None
+) -> dict | None:
     """The ONE shape both `status`'s `data.backup.last` and `backup`'s `data.snapshot`
     use, so an agent parsing either field never has to handle two different shapes for
-    the same kind of object. Built from the manifest ON DISK in both cases — `backup`
+    the same kind of object. Built from the manifest ON DISK by preference — `backup`
     calls this with the snapshot it just took (`snap.path`), `status` with whatever
     `backup.latest()` finds — never by hand-assembling a second, subtly different dict
-    from a live `Snapshot` object's own fields."""
+    from a live `Snapshot` object's own fields.
+
+    `fallback`, when given (only `run_backup` has one to give — `status` never does,
+    since it only ever has a `Path` from `backup.latest()`, not a live object), is used
+    if the manifest cannot be read back. `backup.snapshot()` just fsynced it, so this
+    should not happen, but it is cheap insurance against `data.snapshot` reporting
+    `null` on a backup that, from the device's perspective, fully succeeded.
+    """
     try:
         manifest = json.loads(
             (snapshot_dir / backup_module.MANIFEST_NAME).read_text(encoding="utf-8")
         )
     except (OSError, ValueError):
-        return None
+        manifest = None
     if not isinstance(manifest, dict):
-        return None
+        if fallback is None:
+            return None
+        return {
+            "snapshot": fallback.path.name,
+            "path": str(fallback.path),
+            "manifest": str(fallback.manifest),
+            "created_at": None,
+            "files": fallback.files,
+            "bytes_copied": fallback.bytes_copied,
+            "bytes_linked": fallback.bytes_linked,
+        }
     counts = manifest.get("counts") if isinstance(manifest.get("counts"), dict) else {}
     sizes = manifest.get("bytes") if isinstance(manifest.get("bytes"), dict) else {}
     return {
@@ -415,10 +460,15 @@ def _cache_size(cache_dir: Path) -> int:
     """Total bytes of materialised MTP book copies under `.cache/headers/` — reported
     by `status` alongside the abandoned `.partial` snapshots, since this directory
     (despite its name) stores whole books and is only ever pruned incrementally, per
-    device path, by `_materialize_for_scan` — never wholesale."""
+    device path, by `_materialize_for_scan` — never wholesale. Excludes the index file
+    itself (`_CACHE_INDEX_NAME`), which is bookkeeping, not a cached book."""
     if not cache_dir.is_dir():
         return 0
-    return sum(entry.stat().st_size for entry in cache_dir.rglob("*") if entry.is_file())
+    return sum(
+        entry.stat().st_size
+        for entry in cache_dir.rglob("*")
+        if entry.is_file() and entry.name != _CACHE_INDEX_NAME
+    )
 
 
 # --- scan ------------------------------------------------------------------------
@@ -610,8 +660,16 @@ def _materialize_for_scan(
         previous_key = index.get(book.path)
         if previous_key and previous_key != key:
             stale = cache_dir / previous_key
-            if stale.is_file():
-                stale.unlink(missing_ok=True)
+            # `OSError` here (a read-only output root, a full disk, a permissions
+            # change under `_kindle/`) must never fail a scan that already
+            # successfully listed and fetched every book — every book was already
+            # accounted for above; this is host-side cache bookkeeping, not a device
+            # operation, and must not be reported as one (it would otherwise reach
+            # `_run`'s widened `except (RuntimeError, OSError)` and be misdiagnosed as
+            # the device having gone away, AFTER everything already succeeded).
+            with contextlib.suppress(OSError):
+                if stale.is_file():
+                    stale.unlink(missing_ok=True)
         if previous_key != key:
             index[book.path] = key
             index_changed = True
@@ -621,16 +679,46 @@ def _materialize_for_scan(
     return mapping
 
 
+def _is_safe_cache_key(value: object) -> bool:
+    """A cache key must be a bare filename directly under `cache_dir` — never a path
+    with a separator, and never empty or a directory-traversal token. `index.json` is
+    this module's own state, so the likelihood of it holding anything else is low, but
+    a value read back from it drives a `Path.unlink()` call above, and a delete driven
+    by file contents deserves validating on principle rather than trusting it blindly."""
+    return (
+        isinstance(value, str)
+        and value not in ("", ".", "..")
+        and "/" not in value
+        and "\\" not in value
+    )
+
+
 def _read_cache_index(index_path: Path) -> dict[str, str]:
     try:
         data = json.loads(index_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    # An entry that fails `_is_safe_cache_key` is dropped rather than kept-but-unused:
+    # the next successful materialise of that path simply treats it as never-cached
+    # (no prune, since `index.get(book.path)` then reads as absent) and overwrites it
+    # with a good value — self-healing, not just self-protecting.
+    return {
+        path: key for path, key in data.items() if isinstance(path, str) and _is_safe_cache_key(key)
+    }
 
 
 def _write_cache_index(index_path: Path, index: dict[str, str]) -> None:
-    index_path.write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
+    """Best-effort, deliberately NOT `core.paths.fsync_replace`'s temp+fsync+rename:
+    this is a low-stakes cache, and a torn write here only means `_read_cache_index`
+    falls back to `{}` next time, so the prune quietly stops working until the index
+    can be written again — exactly the unbounded-growth failure mode this index exists
+    to prevent, returning quietly rather than as a crash. `OSError` (a full disk, a
+    read-only output root, ...) is swallowed for the same reason the prune above
+    swallows it: this must never fail a scan that already succeeded."""
+    with contextlib.suppress(OSError):
+        index_path.write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
 
 
 def _read_library_index(root: Path, batch_name: str) -> dict[str, dict]:
@@ -729,15 +817,43 @@ def run_backup(
         # A single backend instance, resolved once by `_run` above and threaded
         # through unchanged — see this module's own docstring for why re-detecting
         # between a backup and a later step is the one ordering this design forecloses.
-        snap = backup_module.snapshot(
-            backend,
-            root=root,
-            serial=key,
-            full=args.full,
-            verify_hashes=args.verify_hashes,
-            on_progress=on_progress,
-            on_warning=on_warning,
-        )
+        try:
+            snap = backup_module.snapshot(
+                backend,
+                root=root,
+                serial=key,
+                full=args.full,
+                verify_hashes=args.verify_hashes,
+                on_progress=on_progress,
+                on_warning=on_warning,
+            )
+        except backup_module.BackupFailed as error:
+            # Caught HERE, not left to `_run`'s outer `except (RuntimeError, OSError)`:
+            # the snapshot IS the work `backup` was asked to do, so this failure needs
+            # `counts.failed: 1` (an item demonstrably failed), which only this body —
+            # the one place that knows there is exactly one "item" — can report. `_fail`
+            # would report all-zero counts, which is right for "nothing was attempted"
+            # (device not found/busy/...) but wrong here.
+            reporter.error(code="backup_failed", message=str(error))
+            reporter.item(
+                id=1,
+                status="failed",
+                input=f"kindle:{key}",
+                outputs=[],
+                bytes_in=None,
+                reason="engine_error",
+                warnings=[],
+            )
+            return {
+                "ok": False,
+                "exit_code": EXIT_FAILED,
+                "counts": {"total": 1, "done": 0, "skipped": 0, "failed": 1, "pending": 0},
+                "failed": [{"id": 1, "input": f"kindle:{key}", "reason": "engine_error"}],
+                "pending": [],
+                "outputs": [],
+                "run_file": None,
+                "data": {},
+            }
 
         reporter.item(
             id=1,
@@ -757,8 +873,10 @@ def run_backup(
             "run_file": None,
             # `_snapshot_summary`, not a second hand-built dict: this must be the exact
             # same shape `status`'s `data.backup.last` reports for the same kind of
-            # object (see that function's own docstring).
-            "data": {"snapshot": _snapshot_summary(snap.path)},
+            # object (see that function's own docstring). `fallback=snap` is what keeps
+            # `data.snapshot` from being `null` on an otherwise fully successful backup
+            # in the implausible case the manifest it just wrote cannot be read back.
+            "data": {"snapshot": _snapshot_summary(snap.path, fallback=snap)},
         }
 
     return _run(

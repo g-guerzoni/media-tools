@@ -127,17 +127,25 @@ begins) rather than real work.
 
 **Two contract details that are easy to get wrong:**
 
-1. **`result` is always the last line, whether or not `start` ever printed.** A run
-   that fails validation before `run_items`/`_download_all` begins — an unrecognized
-   flag, no input given, no input matched, an unsupported input format, a missing
-   dependency, an unknown subcommand — raises `UsageError`, which `cli.main` turns into
-   an `error` immediately followed by a matching `result` (built with
-   `core.runner.empty_result`, the same "never owned a batch" shape a batch conflict or
-   a pre-batch Ctrl+C already used) — there is no `start` in between, since the run
-   never got that far, but `result` still comes last. Once `start` HAS been printed,
-   `result` is guaranteed to follow too — including on a failed item, a batch conflict,
-   or Ctrl+C (`exit_code` 130) — so you can always parse the last stdout line as the
-   outcome of any run, whether or not it got as far as `start`.
+1. **For every event-stream task (`compress`/`convert`/`split`/`download`/`ebook`,
+   including `ebook kindle`), `result` is always the last stdout line, whether or not
+   `start` ever printed.** A run that fails validation before `run_items`/
+   `_download_all` begins — an unrecognized flag, no input given, no input matched, an
+   unsupported input format, a missing dependency, an unknown subcommand — raises
+   `UsageError`, which `cli.main` turns into an `error` immediately followed by a
+   matching `result` (built with `core.runner.empty_result`, the same "never owned a
+   batch" shape a batch conflict or a pre-batch Ctrl+C already use) — there is no
+   `start` in between, since the run never got that far, but `result` still comes last.
+   Once `start` HAS been printed, `result` is guaranteed to follow too — including on a
+   failed item, a batch conflict, or Ctrl+C (`exit_code` 130) — so for any of these five
+   tasks you can always parse the last stdout line as that run's outcome, whether or
+   not it got as far as `start`. **This does not extend to `status`/`formats`/
+   `doctor`** (see "Query commands" below): a SUCCESSFUL run of one of those three never
+   emits a `result` event at all — their last stdout line is their own single-object
+   envelope (`{"type": "status"/"formats"/"doctor", ...}`) instead. `cli.main`'s
+   `UsageError` handling above is task-agnostic, so a genuine usage failure from one of
+   these three (e.g. `status <unknown-batch>`) still gets the `error`+`result` pair —
+   only a successful run of a query command has no `result` to expect.
 2. **`error` also always prints to stderr as text**, even under `--json` and even under
    `--quiet` — it is the one message `Reporter` never silences. If you only read stdout
    you still get the structured version; this just means stderr is not "clean" the way

@@ -19,7 +19,7 @@ def register(subparsers):
     parser = subparsers.add_parser(NAME, help=HELP, description=HELP)
     # `build.register_subparsers` gives `parser` its one subparsers action (argparse
     # allows only one per parser) with dest="ebook_command", covering its six
-    # stage-based subcommands (`SUBCOMMANDS"), AND RETURNS that action for exactly this
+    # stage-based subcommands (`SUBCOMMANDS`), AND RETURNS that action for exactly this
     # reason: `kindle` is not a stage in that pipeline — it gets its own nested dispatch
     # instead (dest="kindle_command": status/scan/backup, wired by
     # `kindle.register_subparsers` below) rather than a slot in `build.SUBCOMMANDS` —

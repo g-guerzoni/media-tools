@@ -221,4 +221,11 @@ class Reporter:
             fallback = llm.get("heuristic_fallback_batches", 0)
             if fallback:
                 llm_part += f" · {fallback} batch(es) fell back to heuristic"
-        self._say(f"{'✓' if ok else '✗'} {parts} · {elapsed:.1f}s{llm_part}")
+        # A `result` with every count at 0 and no `run_file` never owned any work — most
+        # commonly a `UsageError` from before a task's own `start` (a bad flag, no input
+        # given, ...), but also a batch conflict or a pre-batch Ctrl+C. There is nothing
+        # to summarise there beyond what the `error` line already said, and printing one
+        # anyway reads as a content-free "✗  · 0.0s" (note the double space where the
+        # counts would go) on every such failure of every task.
+        if any(counts.values()) or run_file is not None:
+            self._say(f"{'✓' if ok else '✗'} {parts} · {elapsed:.1f}s{llm_part}")
