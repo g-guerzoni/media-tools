@@ -81,7 +81,8 @@ from typing import Any
 from uuid import uuid4
 
 from media_tools.core.paths import fsync_replace, temp_path, truncate_name
-from media_tools.tasks.ebook.exth import TAG_UUID, read_records, record_text
+from media_tools.tasks.ebook.exth import TAG_CDETYPE, TAG_UUID, read_records, record_text
+from media_tools.tasks.ebook.kindle import thumbnails
 from media_tools.tasks.ebook.kindle.backend import DeviceFile
 from media_tools.tasks.ebook.kindle.massstorage import (
     PROTECTED_DIRS,
@@ -750,16 +751,20 @@ def _companions_of(directory: Path, index: dict[str, dict], path: str) -> tuple[
     found.update(p for p in index if p.startswith(sidecar))
 
     stored = directory / FILES_DIR / _stored_of(index[path])
-    book_id = record_text(read_records(stored), TAG_UUID) if stored.is_file() else None
+    records = read_records(stored) if stored.is_file() else {}
+    book_id = record_text(records, TAG_UUID)
     if not book_id:
         return found, False
-    # TODO(task-6): replace this substring match with `thumbnails.thumbnail_name(
-    # book_id, cdetype)` once Task 6 lands the canonical name. Matching the id INSIDE
-    # the name is deliberate until then — the CDE type and the suffix vary by firmware
-    # while the id does not — but it is looser than an exact name.
-    found.update(
-        p for p in index if p.startswith("system/thumbnails/") and book_id in PurePath(p).name
-    )
+    # The EXACT name `thumbnails.thumbnail_name` builds — not a substring match
+    # against every path under `system/thumbnails/`. The id alone was ambiguous
+    # (nothing stopped it from matching a DIFFERENT book's thumbnail that happened to
+    # share a substring); the content-type tag is read the same way the id itself is
+    # (never assumed), and defaults to "EBOK" for a book that carries none, matching
+    # the device's own fallback.
+    cdetype = record_text(records, TAG_CDETYPE) or thumbnails.DEFAULT_CDETYPE
+    thumb_path = f"{thumbnails.THUMBNAIL_DIR}{thumbnails.thumbnail_name(book_id, cdetype)}"
+    if thumb_path in index:
+        found.add(thumb_path)
     return found, True
 
 

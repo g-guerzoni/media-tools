@@ -20,6 +20,7 @@ from pathlib import Path
 from media_tools.cli import build_parser
 from media_tools.core.events import EXIT_DEPENDENCY, EXIT_FAILED, EXIT_INTERRUPTED, EXIT_OK
 from media_tools.core.paths import temp_path
+from media_tools.tasks.ebook.covers import cache_path
 from media_tools.tasks.ebook.kindle import cli as kindle_cli
 from media_tools.tasks.ebook.kindle import massstorage
 from media_tools.tasks.ebook.kindle.backend import DeviceFile, DeviceWriteProtected
@@ -252,6 +253,68 @@ class _FakeMtpBackend:
 
 def _set_file_bytes(backend: _FakeMtpBackend, path: str, data: bytes) -> None:
     backend._files[path] = data  # noqa: SLF001 - test-only access to the fake's own state
+
+
+def _make_cover_image(path: Path, ffmpeg_path: str, *, width: int = 400, height: int = 800) -> None:
+    """A tiny synthetic JPEG via ffmpeg's own `lavfi` `color` source — the same
+    dependency-free technique `tests/conftest.py`'s `make_video`/`make_audio` use for
+    synthetic media, so a cover cache test never needs a checked-in fixture image."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            ffmpeg_path,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=blue:s={width}x{height}",
+            "-frames:v",
+            "1",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+class _ThumbnailRejectingBackend:
+    """Wraps a real `MassStorageBackend` but makes a write to `system/thumbnails/`
+    silently no-op — the same shape a Colorsoft-or-newer device's own real behaviour
+    takes (the write is accepted, but the file never actually lands), so
+    `run_thumbnails` has something honest to detect through its own post-write
+    `exists` check."""
+
+    def __init__(self, mount: Path) -> None:
+        self._inner = massstorage.MassStorageBackend(mount)
+
+    def list_files(self, prefix: str = ""):
+        return self._inner.list_files(prefix)
+
+    def read(self, path: str, dest: Path) -> None:
+        self._inner.read(path, dest)
+
+    def read_many(self, items) -> None:
+        self._inner.read_many(items)
+
+    def write(self, local: Path, path: str) -> None:
+        if path.startswith("system/thumbnails/"):
+            return  # accepted, then silently dropped
+        self._inner.write(local, path)
+
+    def remove(self, path: str) -> None:
+        self._inner.remove(path)
+
+    def exists(self, path: str) -> bool:
+        return self._inner.exists(path)
+
+    def free_space(self) -> int:
+        return self._inner.free_space()
+
+    def eject(self) -> None:
+        self._inner.eject()
+
+    def close(self) -> None:
+        self._inner.close()
 
 
 # --- argument wiring ----------------------------------------------------------------
@@ -919,6 +982,177 @@ def test_backup_failure_maps_to_backup_failed_and_exits_1_not_3(fake_kindle, tmp
     assert len(item_events) == 1
     assert item_events[0]["status"] == "failed"
     assert item_events[0]["input"] == f"kindle:{kindle.serial}"
+
+
+# --- thumbnails ------------------------------------------------------------------
+
+
+def test_thumbnails_command_is_registered_with_a_force_flag():
+    args = build_parser().parse_args(["ebook", "kindle", "thumbnails", "--json", "--force"])
+    assert args.kindle_command == "thumbnails"
+    assert args.force is True
+
+
+def test_thumbnails_defaults_force_to_false():
+    args = build_parser().parse_args(["ebook", "kindle", "thumbnails", "--json"])
+    assert args.force is False
+
+
+def test_thumbnails_takes_a_backup_before_writing_and_aborts_if_it_fails(
+    fake_kindle, tmp_path, capsys
+):
+    """A failed pre-write backup is a precondition that was never met — nothing about
+    the actual write was attempted — so this keeps exit 3 and all-zero counts, unlike
+    `backup` itself (which exits 1 with `counts.failed: 1`, since there the snapshot
+    IS the work). Nothing must be written to the device either way."""
+    kindle = kindle_device(fake_kindle)
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "thumbnails", "--json", "-o", str(tmp_path / "media")]
+    )
+    exit_code = kindle_cli.run_thumbnails(
+        args,
+        device_finder=lambda: kindle,
+        backend_factory=lambda d, *, cache_dir: _BrokenListingBackend(),
+    )
+    assert exit_code == EXIT_DEPENDENCY
+
+    events = _events(capsys)
+    results = [e for e in events if e["type"] == "result"]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert results[0]["exit_code"] == EXIT_DEPENDENCY
+    assert results[0]["counts"] == {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0}
+    errors = [e for e in events if e["type"] == "error"]
+    assert any(e["code"] == "backup_failed" for e in errors)
+    # Nothing was even LISTED for thumbnail work, let alone written.
+    assert [e for e in events if e["type"] == "item"] == []
+    assert not (
+        kindle.mount / "system" / "thumbnails" / "thumbnail_PTBOOK0000000001_EBOK_portrait.jpg"
+    ).exists()
+
+
+def test_thumbnails_installs_a_missing_one_and_reports_an_existing_one_as_exists(
+    fake_kindle, tmp_path, capsys, ffmpeg_path
+):
+    kindle = kindle_device(fake_kindle)
+    root = tmp_path / "media"
+    _make_cover_image(cache_path(root / ".cache", PT_ID), ffmpeg_path)
+
+    args = build_parser().parse_args(["ebook", "kindle", "thumbnails", "--json", "-o", str(root)])
+    exit_code = kindle_cli.run_thumbnails(
+        args, device_finder=lambda: kindle, backend_factory=_mass_storage_factory
+    )
+    assert exit_code == EXIT_OK
+
+    events = _events(capsys)
+    result = events[-1]
+    assert result["ok"] is True
+
+    # PT had no thumbnail and a cached cover: installed, and the file is really there.
+    pt_thumb = kindle.mount / "system" / "thumbnails" / f"thumbnail_{PT_ID}_EBOK_portrait.jpg"
+    assert pt_thumb.is_file()
+    assert result["data"]["thumbnails"][PT_ID] == "installed"
+
+    item_events = {e["input"]: e for e in events if e["type"] == "item"}
+    assert item_events[PT_PATH]["status"] == "done"
+    assert item_events[PT_PATH]["reason"] is None
+    # EN already carried its exact thumbnail name (planted by `kindle_device`): left
+    # alone, but still reported — never silently dropped from the event stream.
+    assert item_events[EN_PATH]["status"] == "skipped"
+    assert item_events[EN_PATH]["reason"] == "exists"
+    assert item_events[EN_PATH]["warnings"] == []
+
+    # The mandatory pre-write backup really ran before anything was written.
+    assert (root / "_kindle" / kindle.serial / "backups").is_dir()
+
+
+def test_thumbnails_force_reinstalls_a_book_that_already_has_one(
+    fake_kindle, tmp_path, capsys, ffmpeg_path
+):
+    kindle = kindle_device(fake_kindle)
+    root = tmp_path / "media"
+    _make_cover_image(cache_path(root / ".cache", EN_ID), ffmpeg_path)
+
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "thumbnails", "--force", "--json", "-o", str(root)]
+    )
+    exit_code = kindle_cli.run_thumbnails(
+        args, device_finder=lambda: kindle, backend_factory=_mass_storage_factory
+    )
+    assert exit_code == EXIT_OK
+
+    item_events = {e["input"]: e for e in _events(capsys) if e["type"] == "item"}
+    assert item_events[EN_PATH]["status"] == "done"
+    assert item_events[EN_PATH]["reason"] is None
+    # The planted placeholder ("thumb") is gone, replaced by a real resized cover.
+    en_thumb = kindle.mount / "system" / "thumbnails" / f"thumbnail_{EN_ID}_EBOK_portrait.jpg"
+    assert en_thumb.read_bytes() != b"thumb"
+
+
+def test_thumbnails_reports_rejected_and_the_warning_when_the_device_discards_the_write(
+    fake_kindle, tmp_path, capsys, ffmpeg_path
+):
+    kindle = kindle_device(fake_kindle)
+    root = tmp_path / "media"
+    _make_cover_image(cache_path(root / ".cache", PT_ID), ffmpeg_path)
+
+    args = build_parser().parse_args(["ebook", "kindle", "thumbnails", "--json", "-o", str(root)])
+    exit_code = kindle_cli.run_thumbnails(
+        args,
+        device_finder=lambda: kindle,
+        backend_factory=lambda d, *, cache_dir: _ThumbnailRejectingBackend(d.mount),
+    )
+    # A rejected write is never a failure: the user did nothing wrong.
+    assert exit_code == EXIT_OK
+
+    events = _events(capsys)
+    result = events[-1]
+    assert result["ok"] is True
+    assert result["data"]["thumbnails"][PT_ID] == "rejected"
+
+    item_events = {e["input"]: e for e in events if e["type"] == "item"}
+    assert item_events[PT_PATH]["status"] == "skipped"
+    assert item_events[PT_PATH]["reason"] == "device_rejected"
+    assert item_events[PT_PATH]["warnings"] == ["device_rejected_thumbnail"]
+    pt_thumb = kindle.mount / "system" / "thumbnails" / f"thumbnail_{PT_ID}_EBOK_portrait.jpg"
+    assert not pt_thumb.exists()
+
+
+def test_thumbnails_reports_no_cover_for_a_book_with_neither_a_cache_hit_nor_an_embedded_cover(
+    fake_kindle, tmp_path, capsys
+):
+    kindle = kindle_device(fake_kindle)
+    root = tmp_path / "media"
+    args = build_parser().parse_args(["ebook", "kindle", "thumbnails", "--json", "-o", str(root)])
+    exit_code = kindle_cli.run_thumbnails(
+        args, device_finder=lambda: kindle, backend_factory=_mass_storage_factory
+    )
+    assert exit_code == EXIT_OK
+
+    events = _events(capsys)
+    assert events[-1]["data"]["thumbnails"][PT_ID] == "no_cover"
+    item_events = {e["input"]: e for e in events if e["type"] == "item"}
+    assert item_events[PT_PATH]["status"] == "skipped"
+    assert item_events[PT_PATH]["reason"] is None
+    assert item_events[PT_PATH]["warnings"] == []
+
+
+def test_thumbnails_handles_a_book_with_no_exth_113_without_crashing(fake_kindle, tmp_path, capsys):
+    kindle = kindle_device(fake_kindle)
+    (kindle.mount / PT_PATH).write_bytes(
+        mobi_bytes(title="Um Livro", author="Um Autor", language="pt")  # no book_id
+    )
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "thumbnails", "--json", "-o", str(tmp_path / "media")]
+    )
+    exit_code = kindle_cli.run_thumbnails(
+        args, device_finder=lambda: kindle, backend_factory=_mass_storage_factory
+    )
+    assert exit_code == EXIT_OK
+
+    item_events = {e["input"]: e for e in _events(capsys) if e["type"] == "item"}
+    assert item_events[PT_PATH]["status"] == "skipped"
+    assert item_events[PT_PATH]["reason"] is None
 
 
 # --- end-to-end (no real device in this environment) ---------------------------------

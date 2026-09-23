@@ -763,6 +763,27 @@ def test_restore_records_a_book_it_cannot_pair_with_a_thumbnail(mass, tmp_path):
     assert paired.no_thumbnail == []
 
 
+def test_restore_pairs_a_thumbnail_by_its_exact_name_not_an_id_substring(mass, tmp_path):
+    """The id-inside-the-name substring match this replaced could pair the WRONG
+    book's thumbnail (an id that is itself a substring of another book's id), or the
+    WRONG content-type's thumbnail for the SAME book, as long as the id happened to
+    appear somewhere in the name. `thumbnails.thumbnail_name`'s exact name rules both
+    out — only the one filename the device's own firmware would look for is paired.
+    """
+    other_id = f"{BOOK_ID}X"  # a superstring: BOOK_ID is a substring of this one
+    other_thumb = f"system/thumbnails/thumbnail_{other_id}_EBOK_portrait.jpg"
+    wrong_type_thumb = f"system/thumbnails/thumbnail_{BOOK_ID}_PDOC_portrait.jpg"
+    (mass.mount / other_thumb).write_bytes(b"a different book's thumbnail")
+    (mass.mount / wrong_type_thumb).write_bytes(b"the same book, wrong content type")
+
+    snap = backup.snapshot(mass, root=tmp_path / "out", serial="S")
+    report = backup.restore(mass, snap.path, only=[BOOK], dry_run=True)
+
+    assert THUMB in report.paths
+    assert other_thumb not in report.paths
+    assert wrong_type_thumb not in report.paths
+
+
 # --- journal --------------------------------------------------------------------
 
 

@@ -30,7 +30,11 @@ class CoverResult:
     source: str  # "embedded" | "fetched" | "none"
 
 
-def _cache_path(cache_dir: Path, book_id: str) -> Path:
+def cache_path(cache_dir: Path, book_id: str) -> Path:
+    """Where a book's resolved cover lives, keyed by its stable EXTH 113 id. PUBLIC on
+    purpose: `tasks.ebook.kindle.thumbnails` reuses this exact path rather than
+    inventing a second cache for the same cover, the same way `massstorage.py`'s
+    exclusion constants are public for `mtp.py` to import instead of restating them."""
     return Path(cache_dir) / "covers" / f"{book_id}.jpg"
 
 
@@ -69,7 +73,7 @@ def resolve(
     pending: list[Path] = []
 
     for done, (source, (_title, _author, book_id)) in enumerate(books.items(), start=1):
-        dest = _cache_path(cache_dir, book_id)
+        dest = cache_path(cache_dir, book_id)
         try:
             found = _is_cached(dest) or extract(source, dest, cache_dir=cache_dir)
         except Exception:
@@ -91,7 +95,7 @@ def resolve(
 
     def _fetch_one(source: Path) -> CoverResult:
         title, author, book_id = books[source]
-        dest = _cache_path(cache_dir, book_id)
+        dest = cache_path(cache_dir, book_id)
         if fetch_cover(title, author, dest, cache_dir=cache_dir):
             return CoverResult(path=dest, source="fetched")
         return CoverResult(path=None, source="none")

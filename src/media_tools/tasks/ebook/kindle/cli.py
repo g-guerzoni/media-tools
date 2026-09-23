@@ -97,7 +97,7 @@ from media_tools.core.runner import empty_result
 from media_tools.tasks.common import UsageError
 from media_tools.tasks.ebook import exth
 from media_tools.tasks.ebook.kindle import backup as backup_module
-from media_tools.tasks.ebook.kindle import detect, massstorage, mtp
+from media_tools.tasks.ebook.kindle import detect, massstorage, mtp, thumbnails
 from media_tools.tasks.ebook.kindle.backend import DeviceBackend, DeviceFile, DeviceWriteProtected
 from media_tools.tasks.ebook.kindle.detect import Device, DeviceBusy, DeviceNotFound
 
@@ -106,7 +106,6 @@ HELP = "Report on, scan or back up a connected Kindle."
 
 # The formats `exth.read_records` can actually parse (MOBI-family containers).
 BOOK_SUFFIXES = frozenset({".azw", ".azw3", ".azw8", ".kfx", ".mobi", ".prc", ".pdb"})
-_THUMBNAIL_PREFIX = "system/thumbnails/"
 _CACHE_INDEX_NAME = "index.json"
 
 
@@ -151,6 +150,20 @@ def register_subparsers(kindle_parser) -> None:
         "snapshot's recorded one (checks the BACKUP, not the device).",
     )
 
+    thumbnails_help = (
+        "Install a cover thumbnail for every device book missing one. Takes a backup "
+        "first, like every other command that writes to the device."
+    )
+    thumbnails_parser = subparsers.add_parser(
+        "thumbnails", help=thumbnails_help, description=thumbnails_help
+    )
+    _add_kindle_flags(thumbnails_parser)
+    thumbnails_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reinstall a thumbnail even for a book that already has one on the device.",
+    )
+
 
 def _add_kindle_flags(parser) -> None:
     parser.add_argument(
@@ -173,6 +186,8 @@ def run(args) -> int:
         return run_scan(args)
     if args.kindle_command == "backup":
         return run_backup(args)
+    if args.kindle_command == "thumbnails":
+        return run_thumbnails(args)
     raise UsageError(f"unknown kindle subcommand: {args.kindle_command!r}")  # pragma: no cover
 
 
@@ -530,8 +545,9 @@ def run_scan(
             title = exth.record_text(records, exth.TAG_TITLE)
             author = exth.record_text(records, exth.TAG_AUTHOR)
             language = exth.record_text(records, exth.TAG_LANGUAGE)
+            cdetype = exth.record_text(records, exth.TAG_CDETYPE) or thumbnails.DEFAULT_CDETYPE
             has_sdr = _has_sdr(book.path, all_paths)
-            has_thumbnail = bool(book_id) and _has_thumbnail(book_id, all_paths)
+            has_thumbnail = bool(book_id) and _has_thumbnail(book_id, cdetype, all_paths)
             warnings = [] if book_id else ["book_id_missing"]
 
             reporter.item(
@@ -594,14 +610,13 @@ def _has_sdr(book_path: str, all_paths: set[str]) -> bool:
     return any(path.startswith(prefix) for path in all_paths)
 
 
-def _has_thumbnail(book_id: str, all_paths: set[str]) -> bool:
-    # TODO(task-6): match through `thumbnails.thumbnail_name(book_id, cdetype)` once
-    # that lands, the same way `backup._companions_of` flags it. The id-inside-the-name
-    # substring match is deliberate until then (CDE type and suffix vary by firmware).
-    return any(
-        path.startswith(_THUMBNAIL_PREFIX) and book_id in PurePosixPath(path).name
-        for path in all_paths
-    )
+def _has_thumbnail(book_id: str, cdetype: str, all_paths: set[str]) -> bool:
+    """The EXACT name `thumbnails.thumbnail_name` builds, not a substring match
+    against every path under `system/thumbnails/` — the same fix
+    `backup._companions_of` applies to `restore`'s own pairing, for the same reason:
+    an id-inside-the-name match could hit a DIFFERENT book's thumbnail that happened
+    to share a substring."""
+    return f"{thumbnails.THUMBNAIL_DIR}{thumbnails.thumbnail_name(book_id, cdetype)}" in all_paths
 
 
 def _cache_key(path: str, size: int, mtime: float) -> str:
@@ -882,6 +897,183 @@ def run_backup(
     return _run(
         args,
         kindle_command="backup",
+        stages=stages,
+        options=options,
+        device_finder=device_finder or detect.find_device,
+        backend_factory=backend_factory or default_backend_factory,
+        body=body,
+    )
+
+
+# --- thumbnails ----------------------------------------------------------------------
+
+
+def run_thumbnails(
+    args,
+    *,
+    device_finder: Callable[[], Device] | None = None,
+    backend_factory: Callable[..., DeviceBackend] | None = None,
+) -> int:
+    """Install a cover thumbnail for every device book that lacks one (or, with
+    `--force`, for every book regardless).
+
+    Writing a thumbnail is a device write, so it takes the SAME mandatory backup
+    every write command takes, through the SAME backend instance `_run` already
+    resolved (see this module's own docstring on holding one backend across a backup
+    and the operation that follows it). Unlike `run_backup` itself, a failure in
+    THIS backup is a precondition that was never met — nothing about the actual
+    write was attempted — so it keeps exit 3 and `_fail`'s all-zero-counts shape
+    rather than `backup`'s own exit-1 "an item demonstrably failed" shape (Ruling
+    R27, carried forward to every future write command's own mandatory backup).
+
+    A book already carrying its exact thumbnail name (`_has_thumbnail`) is reported
+    `skipped`/`exists` without being handed to `thumbnails.install` at all, unless
+    `--force`. A device that accepts a write and then silently drops it (Colorsoft
+    and newer, by design) is reported `skipped`/`device_rejected` with the
+    `device_rejected_thumbnail` warning — never `failed`, since the user did nothing
+    wrong and nothing is broken.
+    """
+    stages = ["detect", "backup", "thumbnails"]
+    options = {"kindle_command": "thumbnails", "force": bool(args.force)}
+
+    def body(reporter: Reporter, root: Path, device: Device, backend: DeviceBackend) -> dict:
+        reporter.stage(stage="backup", index=2, count=len(stages))
+        key = backup_module.device_key(device)
+
+        def on_backup_progress(done: int, total: int, phase: str) -> None:
+            reporter.progress(
+                stage=phase,
+                index=done,
+                count=total,
+                path=f"kindle:{key}",
+                percent=(100.0 * done / total) if total else 100.0,
+            )
+
+        def on_backup_warning(code: str, message: str) -> None:
+            reporter.warning(code=code, message=message)
+
+        try:
+            backup_module.snapshot(
+                backend,
+                root=root,
+                serial=key,
+                on_progress=on_backup_progress,
+                on_warning=on_backup_warning,
+            )
+        except backup_module.BackupFailed as error:
+            reporter.error(code="backup_failed", message=str(error))
+            return {
+                "ok": False,
+                "exit_code": EXIT_DEPENDENCY,
+                "counts": {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0},
+                "failed": [],
+                "pending": [],
+                "outputs": [],
+                "run_file": None,
+                "data": {},
+            }
+
+        reporter.stage(stage="thumbnails", index=3, count=len(stages))
+        all_entries = backend.list_files()
+        all_paths = {entry.path for entry in all_entries}
+        book_entries = [
+            entry
+            for entry in all_entries
+            if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
+        ]
+
+        if device.mode == "mass_storage":
+            records_by_path = {
+                book.path: exth.read_records(device.mount / book.path) for book in book_entries
+            }
+        else:
+            cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
+            local_paths = _materialize_for_scan(backend, book_entries, cache_dir)
+            records_by_path = {
+                book.path: exth.read_records(local_paths[book.path]) for book in book_entries
+            }
+
+        # One (book, already_covered) pair per device book, decided up front: a book
+        # already carrying its exact thumbnail name is never handed to
+        # `thumbnails.install` at all (unless `--force`), but it still gets its own
+        # `item` event below — silently dropping it would hide it from an agent
+        # reading the event stream, the same reason `compress`/`convert` report an
+        # `exists` skip rather than omitting the item entirely.
+        plan: list[tuple[thumbnails.Book, bool]] = []
+        to_install: list[thumbnails.Book] = []
+        for entry in book_entries:
+            records = records_by_path[entry.path]
+            book_id = exth.record_text(records, exth.TAG_UUID) or ""
+            cdetype = exth.record_text(records, exth.TAG_CDETYPE) or thumbnails.DEFAULT_CDETYPE
+            book = thumbnails.Book(device_path=entry.path, book_id=book_id, cdetype=cdetype)
+            covered = (
+                bool(book_id) and not args.force and _has_thumbnail(book_id, cdetype, all_paths)
+            )
+            plan.append((book, covered))
+            if not covered:
+                to_install.append(book)
+
+        cover_cache_dir = root / ".cache"
+
+        def on_install_progress(done: int, total: int) -> None:
+            reporter.progress(
+                stage="thumbnails",
+                index=done,
+                count=total,
+                path=f"kindle:{key}",
+                percent=(100.0 * done / total) if total else 100.0,
+            )
+
+        statuses = thumbnails.install(
+            backend, to_install, cache_dir=cover_cache_dir, on_progress=on_install_progress
+        )
+
+        counts = {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0}
+        outputs: list[str] = []
+        for item_id, (book, covered) in enumerate(plan, start=1):
+            item_outputs: list[str] = []
+            if covered:
+                item_status, reason, warnings = "skipped", "exists", []
+            else:
+                status = statuses.get(book.book_id or book.device_path, "no_cover")
+                if status == "installed":
+                    item_status, reason, warnings = "done", None, []
+                    thumb_path = (
+                        f"{thumbnails.THUMBNAIL_DIR}"
+                        f"{thumbnails.thumbnail_name(book.book_id, book.cdetype)}"
+                    )
+                    item_outputs = [thumb_path]
+                    outputs.append(thumb_path)
+                elif status == "rejected":
+                    item_status = "skipped"
+                    reason = "device_rejected"
+                    warnings = ["device_rejected_thumbnail"]
+                else:
+                    item_status, reason, warnings = "skipped", None, []
+            counts["total"] += 1
+            counts[item_status] += 1
+            reporter.item(
+                id=item_id,
+                status=item_status,
+                input=book.device_path,
+                outputs=item_outputs,
+                bytes_in=None,
+                reason=reason,
+                warnings=warnings,
+            )
+
+        return {
+            "counts": counts,
+            "failed": [],
+            "pending": [],
+            "outputs": outputs,
+            "run_file": None,
+            "data": {"thumbnails": statuses},
+        }
+
+    return _run(
+        args,
+        kindle_command="thumbnails",
         stages=stages,
         options=options,
         device_finder=device_finder or detect.find_device,
