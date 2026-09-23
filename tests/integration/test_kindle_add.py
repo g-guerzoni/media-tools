@@ -1576,3 +1576,190 @@ def test_a_batch_output_in_a_format_no_kindle_reads_is_skipped_not_copied(
     inputs = [e["input"] for e in _events(capsys) if e["type"] == "item"]
     assert inputs == [str(keeper)]
     assert not (fake_kindle.mount / "documents" / "en" / "Notes.txt").exists()
+
+
+# --- provenance authorises overwriting only this tool's own unfinished write ------------
+
+
+def _add_epub(root: Path, source: Path, kindle, backend_factory=_mass_storage_factory) -> int:
+    return kindle_cli.run_add(
+        _add_args(root, str(source)),
+        device_finder=lambda: kindle,
+        backend_factory=backend_factory,
+    )
+
+
+def test_a_users_own_file_at_a_journalled_path_is_refused_not_overwritten(
+    fake_kindle, tmp_path, capsys
+):
+    """The journal says this tool put these bytes at P — but it also says that write
+    was VERIFIED, so whatever is at P now differs because something other than this
+    tool changed it. A stale journal entry must not be sufficient authorisation to
+    overwrite a file the user put there."""
+    root = tmp_path / "media"
+    source = tmp_path / "books" / "Some Book.epub"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"PK\x03\x04" + b"epub bytes" * 40)
+
+    assert _add_epub(root, source, fake_kindle) == EXIT_OK
+    landed = fake_kindle.mount / "documents" / kindle_cli.UNKNOWN_LANGUAGE / "Some Book.epub"
+    assert landed.is_file()
+    capsys.readouterr()
+
+    # The user replaces it with something of their own, at the same path.
+    theirs = b"MY OWN COMPLETELY DIFFERENT FILE"
+    landed.write_bytes(theirs)
+
+    assert _add_epub(root, source, fake_kindle) == EXIT_FAILED
+    item = next(e for e in _events(capsys) if e["type"] == "item")
+    assert item["status"] == "failed"
+    assert item["reason"] == "output_collision"
+    assert landed.read_bytes() == theirs
+
+
+def test_an_edited_source_is_not_skipped_as_already_on_the_device(fake_kindle, tmp_path, capsys):
+    """Deliberately edited to the SAME SIZE, so only the recorded digest can tell the
+    two versions apart. Path-and-size matching alone would report `exists` for a file
+    whose contents had changed. It is REFUSED rather than silently replaced: the
+    earlier placement verified, so replacing it is a decision for the user, not for a
+    re-run that was only asked to add."""
+    root = tmp_path / "media"
+    source = tmp_path / "books" / "Some Book.epub"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    original = b"PK\x03\x04" + b"a" * 400
+    source.write_bytes(original)
+
+    assert _add_epub(root, source, fake_kindle) == EXIT_OK
+    capsys.readouterr()
+
+    edited = b"PK\x03\x04" + b"b" * 400
+    assert len(edited) == len(original)
+    source.write_bytes(edited)
+
+    assert _add_epub(root, source, fake_kindle) == EXIT_FAILED
+    item = next(e for e in _events(capsys) if e["type"] == "item")
+    assert item["status"] != "skipped"
+    assert item["reason"] == "output_collision"
+    landed = fake_kindle.mount / "documents" / kindle_cli.UNKNOWN_LANGUAGE / "Some Book.epub"
+    assert landed.read_bytes() == original
+
+
+def test_the_journal_records_whether_each_write_was_verified(fake_kindle, tmp_path, capsys):
+    """The flag the collision waiver turns on. A completed write is `verified: true`;
+    a short one is `verified: false`, which is what lets the next run replace it."""
+    root = tmp_path / "media"
+    good = tmp_path / "books" / "Good.epub"
+    good.parent.mkdir(parents=True, exist_ok=True)
+    good.write_bytes(b"PK\x03\x04" + b"good" * 60)
+
+    assert _add_epub(root, good, fake_kindle) == EXIT_OK
+    assert backup_module.journal_read(root, fake_kindle.serial)[0]["books"][0]["verified"] is True
+    capsys.readouterr()
+
+    short = tmp_path / "books" / "Short.epub"
+    short.write_bytes(b"PK\x03\x04" + b"short" * 60)
+    assert (
+        _add_epub(
+            root,
+            short,
+            fake_kindle,
+            backend_factory=lambda d, *, cache_dir: _ShortWriteBackend(d.mount),
+        )
+        == EXIT_FAILED
+    )
+    entries = backup_module.journal_read(root, fake_kindle.serial)
+    assert entries[-1]["books"][0]["verified"] is False
+
+
+def test_an_interrupt_while_hashing_still_journals_the_book_already_on_the_device(
+    fake_kindle, tmp_path, capsys, monkeypatch
+):
+    """The provenance hash re-reads the whole source, a window proportional to file
+    size that opens AFTER the bytes are already on the device. A Ctrl+C there must not
+    lose the record — the journal entry is created before the hash runs and simply
+    carries no digest."""
+    root = tmp_path / "media"
+    source = tmp_path / "books" / "Some Book.epub"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"PK\x03\x04" + b"epub bytes" * 40)
+
+    def interrupted_digest(path):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(kindle_cli, "_source_digest", interrupted_digest)
+
+    assert _add_epub(root, source, fake_kindle) == 130
+
+    landed = fake_kindle.mount / "documents" / kindle_cli.UNKNOWN_LANGUAGE / "Some Book.epub"
+    assert landed.is_file()
+    entries = backup_module.journal_read(root, fake_kindle.serial)
+    assert len(entries) == 1
+    record = entries[0]["books"][0]
+    assert record["device_path"] == f"documents/{kindle_cli.UNKNOWN_LANGUAGE}/Some Book.epub"
+    assert record["sha256"] == ""
+    assert record["verified"] is False
+
+
+def test_a_record_with_no_digest_never_authorises_a_skip_or_an_overwrite(
+    fake_kindle, tmp_path, capsys, monkeypatch
+):
+    """A journal entry whose hash could not be computed proves nothing about the bytes,
+    so it is ignored in both directions rather than trusted on its path alone."""
+    root = tmp_path / "media"
+    source = tmp_path / "books" / "Some Book.epub"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"PK\x03\x04" + b"epub bytes" * 40)
+
+    monkeypatch.setattr(kindle_cli, "_source_digest", lambda path: "")
+    assert _add_epub(root, source, fake_kindle) == EXIT_OK
+    assert backup_module.journal_read(root, fake_kindle.serial)[0]["books"][0]["sha256"] == ""
+    capsys.readouterr()
+
+    monkeypatch.undo()
+    # The device copy is intact and identical, but the digestless record cannot say so.
+    assert _add_epub(root, source, fake_kindle) == EXIT_FAILED
+    item = next(e for e in _events(capsys) if e["type"] == "item")
+    assert item["reason"] == "output_collision"
+
+
+# --- one corrupt book on the device is not a failed add ---------------------------------
+
+
+def test_a_device_book_that_will_not_parse_does_not_abort_the_whole_add(
+    fake_kindle, tmp_path, capsys, monkeypatch, ffmpeg_path
+):
+    """`exth.read_records` documents "unreadable -> no records", but it reaches that
+    verdict through struct-unpacked offsets a malformed file can send off the end. This
+    runs over EVERY book on the device, in the one command where aborting costs the
+    most — the backup has already run."""
+    corrupt = fake_kindle.mount / "documents" / "en" / "Corrupt.azw3"
+    corrupt.write_bytes(b"\x00" * 64)
+
+    real_read_records = kindle_cli.exth.read_records
+
+    def exploding_read_records(path):
+        if Path(path).name == "Corrupt.azw3":
+            raise struct.error("unpack requires a buffer of 4 bytes")
+        return real_read_records(path)
+
+    monkeypatch.setattr(kindle_cli.exth, "read_records", exploding_read_records)
+
+    root = tmp_path / "media"
+    source = _plant_source(
+        tmp_path / "books",
+        "Fine Book.azw3",
+        book_id="FINEBOOK00000001",
+        title="Fine",
+        author="A",
+        language="en",
+    )
+    _plant_cover(root, "FINEBOOK00000001", ffmpeg_path)
+
+    exit_code = kindle_cli.run_add(
+        _add_args(root, str(source)),
+        device_finder=lambda: fake_kindle,
+        backend_factory=_mass_storage_factory,
+    )
+    assert exit_code == EXIT_OK
+    assert (fake_kindle.mount / "documents" / "en" / "Fine Book.azw3").is_file()
+    assert _events(capsys)[-1]["counts"]["done"] == 1
