@@ -61,8 +61,66 @@ def test_plan_placement_maps_each_source_to_its_target(tmp_path):
     verdict = Verdict("ok", "Solaris", "Stanislaw Lem", "en", "llm")
     source = Path("/books/solaris.epub")
     entries = {source: (verdict, "azw3", "id-1")}
-    plan = library.plan_placement(tmp_path, entries)
+    plan, collisions = library.plan_placement(tmp_path, entries)
     assert plan == {source: tmp_path / "en" / "Solaris - Stanislaw Lem.azw3"}
+    assert collisions == {}
+
+
+def test_colliding_titles_after_sanitising_get_distinct_targets(tmp_path):
+    # "AC/DC Story" and "AC:DC Story" both lose their only distinguishing
+    # character once sanitised, and would otherwise land on the same path.
+    verdict_a = Verdict("ok", "AC/DC Story", "X", "en", "llm")
+    verdict_b = Verdict("ok", "AC:DC Story", "X", "en", "llm")
+    source_a = Path("/books/a.epub")
+    source_b = Path("/books/b.epub")
+    entries = {
+        source_b: (verdict_b, "azw3", "id-b"),
+        source_a: (verdict_a, "azw3", "id-a"),
+    }
+
+    plan, collisions = library.plan_placement(tmp_path, entries)
+
+    assert plan[source_a] == tmp_path / "en" / "ACDC Story - X.azw3"
+    assert plan[source_b] == tmp_path / "en" / "ACDC Story - X (2).azw3"
+    assert collisions == {source_b: "name_collision_suffixed"}
+
+    # Simulate the pipeline actually writing each book's converted output: both
+    # must land on disk, distinct, with their own content intact.
+    for source, target in plan.items():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("BOOK A CONTENT" if source == source_a else "BOOK B CONTENT")
+
+    assert plan[source_a].read_text() == "BOOK A CONTENT"
+    assert plan[source_b].read_text() == "BOOK B CONTENT"
+
+
+def test_a_third_collision_gets_a_3_suffix(tmp_path):
+    verdict = Verdict("ok", "Same Title", "Author", "en", "llm")
+    sources = [Path(f"/books/{letter}.epub") for letter in ("a", "b", "c")]
+    entries = {source: (verdict, "azw3", f"id-{i}") for i, source in enumerate(sources)}
+
+    plan, collisions = library.plan_placement(tmp_path, entries)
+
+    assert plan[sources[0]] == tmp_path / "en" / "Same Title - Author.azw3"
+    assert plan[sources[1]] == tmp_path / "en" / "Same Title - Author (2).azw3"
+    assert plan[sources[2]] == tmp_path / "en" / "Same Title - Author (3).azw3"
+    assert collisions == {
+        sources[1]: "name_collision_suffixed",
+        sources[2]: "name_collision_suffixed",
+    }
+
+
+def test_collision_disambiguation_is_deterministic_regardless_of_dict_order(tmp_path):
+    verdict = Verdict("ok", "Same Title", "Author", "en", "llm")
+    sources = [Path(f"/books/{letter}.epub") for letter in ("a", "b", "c")]
+    forward = {source: (verdict, "azw3", f"id-{i}") for i, source in enumerate(sources)}
+    backward = dict(reversed(list(forward.items())))
+
+    plan_forward, collisions_forward = library.plan_placement(tmp_path, forward)
+    plan_backward, collisions_backward = library.plan_placement(tmp_path, backward)
+
+    assert plan_forward == plan_backward
+    assert collisions_forward == collisions_backward
 
 
 def test_reconcile_renames_a_book_whose_title_changed(tmp_path):

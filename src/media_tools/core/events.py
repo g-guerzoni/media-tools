@@ -67,6 +67,7 @@ WARNING_CODES = frozenset(
         "extension_filter_bypassed",
         "device_rejected_thumbnail",
         "hash_from_previous",
+        "name_collision_suffixed",
     }
 )
 

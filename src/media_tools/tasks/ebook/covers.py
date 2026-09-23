@@ -64,10 +64,17 @@ def resolve(
     done = 0
     for source, (_title, _author, book_id) in books.items():
         dest = _cache_path(cache_dir, book_id)
-        if _is_cached(dest) or extract(source, dest, cache_dir=cache_dir):
-            results[source] = CoverResult(path=dest, source="embedded")
+        try:
+            found = _is_cached(dest) or extract(source, dest, cache_dir=cache_dir)
+        except Exception:
+            # A corrupt file or a flaky extractor must not take the whole batch down
+            # with it — every other book's already-resolved cover still matters.
+            results[source] = CoverResult(path=None, source="none")
         else:
-            pending.append(source)
+            if found:
+                results[source] = CoverResult(path=dest, source="embedded")
+            else:
+                pending.append(source)
         done += 1
         if on_progress:
             on_progress(done, total)
@@ -88,7 +95,13 @@ def resolve(
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             futures = {pool.submit(_fetch_one, source): source for source in pending}
             for future in as_completed(futures):
-                results[futures[future]] = future.result()
+                source = futures[future]
+                try:
+                    results[source] = future.result()
+                except Exception:
+                    # Same isolation as the extraction phase: one flaky fetch must
+                    # not discard every other book's already-resolved cover.
+                    results[source] = CoverResult(path=None, source="none")
                 done += 1
                 if on_progress:
                     on_progress(done, total)

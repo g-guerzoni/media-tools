@@ -115,6 +115,58 @@ def test_a_tiny_stale_cache_file_is_not_treated_as_a_valid_cover(tmp_path):
     assert results[book].path.stat().st_size == 2000
 
 
+def test_an_extraction_error_is_isolated_to_its_own_book(tmp_path):
+    book_a = _book(tmp_path, "a.epub")
+    book_b = _book(tmp_path, "b.epub")
+    book_c = _book(tmp_path, "c.epub")
+
+    def extract(src, dest, *, cache_dir):
+        if src == book_b:
+            raise RuntimeError("corrupt file")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"x" * 2000)
+        return True
+
+    results = covers.resolve(
+        {
+            book_a: ("A", "X", "id-a"),
+            book_b: ("B", "X", "id-b"),
+            book_c: ("C", "X", "id-c"),
+        },
+        cache_dir=tmp_path / "cache",
+        fetch=False,
+        extract=extract,
+    )
+    assert results[book_a].source == "embedded"
+    assert results[book_b] == covers.CoverResult(path=None, source="none")
+    assert results[book_c].source == "embedded"
+
+
+def test_a_fetch_error_is_isolated_to_its_own_book(tmp_path):
+    book_a = _book(tmp_path, "a.epub")
+    book_b = _book(tmp_path, "b.epub")
+
+    def extract(src, dest, *, cache_dir):
+        return False
+
+    def fetch_cover(title, author, dest, *, cache_dir):
+        if title == "B":
+            raise RuntimeError("network blew up")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"y" * 2000)
+        return True
+
+    results = covers.resolve(
+        {book_a: ("A", "X", "id-a"), book_b: ("B", "X", "id-b")},
+        cache_dir=tmp_path / "cache",
+        fetch=True,
+        extract=extract,
+        fetch_cover=fetch_cover,
+    )
+    assert results[book_a].source == "fetched"
+    assert results[book_b] == covers.CoverResult(path=None, source="none")
+
+
 def test_a_failed_fetch_leaves_the_book_without_a_cover(tmp_path):
     book = _book(tmp_path)
 

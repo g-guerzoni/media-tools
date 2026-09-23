@@ -62,16 +62,49 @@ def target_path(batch_dir: Path, verdict: Verdict, extension: str) -> Path:
     return batch_dir / verdict.language / filename
 
 
+def _suffixed(target: Path, n: int) -> Path:
+    return target.parent / truncate_name(f"{target.stem} ({n}){target.suffix}", MAX_FILENAME)
+
+
 def plan_placement(
     batch_dir: Path, entries: dict[Path, tuple[Verdict, str, str]]
-) -> dict[Path, Path]:
+) -> tuple[dict[Path, Path], dict[Path, str]]:
     """Where every source book should end up. `entries` maps each source to its
     `(verdict, extension, book_id)` — only `verdict`/`extension` decide the target
-    here; the book id is what `reconcile` uses separately to avoid reconverting."""
-    return {
-        source: target_path(batch_dir, verdict, extension)
-        for source, (verdict, extension, _book_id) in entries.items()
-    }
+    here; the book id is what `reconcile` uses separately to avoid reconverting.
+
+    Two different books can sanitise to the identical target — e.g. "AC/DC Story"
+    and "AC:DC Story" by the same author both lose their only distinguishing
+    character. Silently letting that happen would mean the second book converted
+    just overwrites the first the moment it is written. Sources are processed in a
+    deterministic order (sorted by source path), independent of dict iteration
+    order, so the outcome never varies between runs; the first source to reach a
+    given target keeps the clean name, and every later collision gets a numeric
+    suffix before the extension — " (2)", " (3)", ... — each candidate re-checked
+    against every target already handed out so a suffixed name can't itself
+    collide. The second return value lists every source that had to be suffixed,
+    keyed by source, so the caller can attach a `name_collision_suffixed` warning
+    to that book.
+    """
+    plan: dict[Path, Path] = {}
+    used: set[Path] = set()
+    collisions: dict[Path, str] = {}
+
+    for source in sorted(entries, key=str):
+        verdict, extension, _book_id = entries[source]
+        target = target_path(batch_dir, verdict, extension)
+        if target in used:
+            n = 2
+            candidate = _suffixed(target, n)
+            while candidate in used:
+                n += 1
+                candidate = _suffixed(target, n)
+            target = candidate
+            collisions[source] = "name_collision_suffixed"
+        used.add(target)
+        plan[source] = target
+
+    return plan, collisions
 
 
 @dataclass
