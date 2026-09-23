@@ -527,20 +527,17 @@ def test_device_busy_maps_to_device_busy_and_exits_3(tmp_path, capsys):
     assert any(e.get("code") == "device_busy" for e in events if e["type"] == "error")
 
 
-def test_device_write_protected_maps_to_device_write_protected_and_exits_3(tmp_path, capsys):
-    args = build_parser().parse_args(
-        ["ebook", "kindle", "status", "--json", "-o", str(tmp_path / "media")]
-    )
-    exit_code = kindle_cli.run_status(
-        args,
-        device_finder=_mtp_device,
-        backend_factory=lambda d, *, cache_dir: _RaisingBackend(
-            DeviceWriteProtected("the Kindle refused the write as read-only.")
-        ),
-    )
-    assert exit_code == EXIT_DEPENDENCY
-    events = _events(capsys)
-    assert any(e.get("code") == "device_write_protected" for e in events if e["type"] == "error")
+def test_device_write_protected_maps_to_device_write_protected_and_exits_3():
+    """The MAPPING, pinned directly rather than by handing a refused-write exception to
+    `status` — a read-only command that cannot produce one. Which commands really do
+    is pinned where it can actually happen: over mass storage in
+    `tests/integration/test_kindle_remove_sync.py` (a `restore` onto a read-only
+    volume) and over MTP in `tests/unit/test_kindle_mtp.py` (helper exit code 4)."""
+    error = DeviceWriteProtected("the Kindle refused the write as read-only.")
+    assert kindle_cli._error_code_for(error) == "device_write_protected"
+    assert kindle_cli._EXIT_FOR_CODE["device_write_protected"] == EXIT_DEPENDENCY
+    # Ahead of the broader pair, or a `RuntimeError` subclass would be shadowed.
+    assert kindle_cli._error_code_for(DeviceNotFound("gone")) == "device_not_found"
 
 
 def test_a_permission_error_maps_to_device_not_found_not_an_uncaught_crash(

@@ -870,6 +870,46 @@ def test_sync_never_treats_an_id_less_device_book_as_an_extra(fake_kindle, tmp_p
 # --- restore -----------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="a chmod 0555 directory is still writable by root",
+)
+def test_a_restore_onto_a_read_only_kindle_reports_device_write_protected(
+    fake_kindle, tmp_path, capsys
+):
+    """The registry code, reached over MASS STORAGE. `CLAUDE.md` said both backends
+    raised it while only `mtp.py` ever did, and the only test for it raised it from a
+    stub — so no mass-storage path could produce it and nothing noticed. A read-only
+    Kindle used to report `device_not_found` ("it went away"), after the mandatory
+    backup had already run."""
+    device = prepare_device(fake_kindle)
+    root = tmp_path / "media"
+    mount = device.mount
+
+    removed = kindle_cli.run_remove(
+        _remove_args(root, "--match", EN_AUTHOR, "--yes"),
+        device_finder=lambda: device,
+        backend_factory=_mass_storage_factory,
+    )
+    assert removed == EXIT_OK
+    operation_id = _events(capsys)[-1]["data"]["operation"]
+    capsys.readouterr()
+
+    (mount / "documents" / "en").chmod(0o555)
+    try:
+        exit_code = kindle_cli.run_restore(
+            _restore_args(root, "--op", operation_id, "--yes"),
+            device_finder=lambda: device,
+            backend_factory=_mass_storage_factory,
+        )
+    finally:
+        (mount / "documents" / "en").chmod(0o755)
+
+    assert exit_code == EXIT_DEPENDENCY
+    errors = [e for e in _events(capsys) if e["type"] == "error"]
+    assert [e["code"] for e in errors] == ["device_write_protected"]
+
+
 def test_restore_op_puts_back_exactly_what_that_operation_removed(fake_kindle, tmp_path, capsys):
     device = prepare_device(fake_kindle)
     root = tmp_path / "media"

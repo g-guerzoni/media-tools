@@ -21,11 +21,16 @@ device internals (Wi-Fi credentials, logs, settings), not book content. `write` 
 refuses any path outside what this project will ever touch (`validate_writable_path`,
 `backend.py`) before it moves a single byte — a device path can be built from
 untrusted data (a book's own EXTH records), so this is not merely a mirror of the
-read-side exclusions above; it is the one place a write specifically is checked.
+read-side exclusions above; it is the one place a write specifically is checked. A
+device that refuses a write (or a delete) as read-only is reported as
+`DeviceWriteProtected`, not as the bare `OSError` that `cli._error_code_for` reads as
+"the Kindle went away" — see `_for_write`.
 """
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import os
 import platform
 import plistlib
@@ -40,6 +45,7 @@ from media_tools.tasks.ebook.kindle.backend import (
     RESTRICTED_PARENT,
     VOLUME_LITTER,
     DeviceFile,
+    DeviceWriteProtected,
     is_volume_litter,
     prefix_targets_a_forbidden_system_child,
     validate_writable_path,
@@ -176,16 +182,25 @@ class MassStorageBackend:
         # `..`/`audible/`/a forbidden `system/` child from ever reaching a real write.
         path = validate_writable_path(path)
         target = self.mount / path
-        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise _for_write(error, target) from error
         temp = temp_path(target)
         try:
             shutil.copyfile(local, temp)
             fsync_replace(temp, target)
-        except BaseException:
+        except BaseException as error:
             # BaseException, not Exception: a Ctrl+C mid-copy is exactly when a
             # `.partial` would be left sitting ON THE DEVICE, which is what this
-            # module's own docstring promises never happens.
-            temp.unlink(missing_ok=True)
+            # module's own docstring promises never happens. The cleanup itself is
+            # suppressed because on a read-only volume it is the SECOND thing to fail,
+            # and a `PermissionError` from the tidy-up must not replace the diagnosis
+            # of why the write failed in the first place.
+            with contextlib.suppress(OSError):
+                temp.unlink(missing_ok=True)
+            if isinstance(error, OSError):
+                raise _for_write(error, target) from error
             raise
 
     def remove(self, path: str) -> None:
@@ -205,7 +220,16 @@ class MassStorageBackend:
             self._device_id is not None and _device_id(self.mount) != self._device_id
         ):
             raise DeviceNotFound(f"the Kindle is no longer mounted at {self.mount}")
-        (self.mount / path).unlink()
+        target = self.mount / path
+        try:
+            target.unlink()
+        except OSError as error:
+            # A delete IS a write to the volume, so a read-only or locked device
+            # refuses it the same way it refuses a copy — and must say so with the
+            # same code. `FileNotFoundError` is deliberately untouched: its errno is
+            # not in the write-protected set, so it keeps meaning "THIS PATH is not on
+            # the device", which is what this method's caller acts on.
+            raise _for_write(error, target) from error
 
     def exists(self, path: str) -> bool:
         # FILES only, per `backend.DeviceBackend`'s contract. `.exists()` answered
@@ -240,6 +264,35 @@ class MassStorageBackend:
 
     def close(self) -> None:
         pass
+
+
+#: The `errno` values a device that refuses writes ANSWERS with. `EROFS` is a volume
+#: mounted read-only; `EACCES`/`EPERM` is the same refusal expressed as permissions,
+#: which is what a Kindle locked by its own firmware and a read-only FAT mount both
+#: produce in practice. Nothing else is folded in: `ENOSPC` is a full device and
+#: `ENOENT`/`ENODEV` are a device that left, and both of those already have their own
+#: honest answers further up.
+_WRITE_PROTECTED_ERRNOS = frozenset({errno.EROFS, errno.EACCES, errno.EPERM})
+
+
+def _for_write(error: OSError, target: Path) -> BaseException:
+    """`DeviceWriteProtected` when the device refused this write as read-only, and the
+    original error otherwise.
+
+    This code used to be raised in exactly ONE place — `mtp.py`, which this module
+    never even imported from — while `CLAUDE.md`'s registry section said both backends
+    raised it. A read-only mass-storage Kindle therefore raised a plain `OSError`,
+    which `cli._error_code_for` maps to `device_not_found`: the user was told their
+    Kindle had gone away, about a device sitting on the desk, and only after the
+    mandatory backup had already run.
+    """
+    if error.errno in _WRITE_PROTECTED_ERRNOS:
+        return DeviceWriteProtected(
+            f"the Kindle refused the write to {target.name!r} as read-only "
+            f"({error.strerror}): it is mounted read-only, or locked by the device "
+            "itself. Nothing was written."
+        )
+    return error
 
 
 def _device_id(mount: Path) -> int | None:

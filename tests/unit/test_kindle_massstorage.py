@@ -96,6 +96,46 @@ def test_an_unreadable_mount_root_raises_rather_than_answering_empty(fake_kindle
         fake_kindle.mount.chmod(0o755)
 
 
+@skip_as_root
+def test_a_write_the_device_refuses_as_read_only_is_write_protected_not_not_found(
+    fake_kindle, tmp_path
+):
+    """`DeviceWriteProtected` used to be raised in exactly one place, `mtp.py` — this
+    module never even imported it. So a Kindle mounted read-only, or one locked by its
+    own firmware, raised a plain `OSError` here, which `cli._error_code_for` maps to
+    `device_not_found`: the user was told their Kindle had gone away, for a device
+    sitting on the desk, after a mandatory backup had already run."""
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    source = tmp_path / "A Book.azw3"
+    source.write_bytes(b"book")
+
+    read_only = fake_kindle.mount / "documents" / "en"
+    read_only.chmod(0o555)
+    try:
+        with pytest.raises(backend.DeviceWriteProtected):
+            device.write(source, "documents/en/A Book.azw3")
+        # And nothing is left sitting at a `.partial` name on the device either.
+        assert [p.name for p in read_only.iterdir() if p.name.endswith(".partial")] == []
+    finally:
+        read_only.chmod(0o755)
+
+
+@skip_as_root
+def test_a_delete_the_device_refuses_as_read_only_is_write_protected_too(fake_kindle):
+    """The other half of "anywhere it writes": a removal on a read-only volume is the
+    same refusal, and must not read as "the book was already gone" (`FileNotFoundError`,
+    which `_remove_one` acts on) or as an unplugged device."""
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    read_only = fake_kindle.mount / "documents" / "en"
+    read_only.chmod(0o555)
+    try:
+        with pytest.raises(backend.DeviceWriteProtected):
+            device.remove("documents/en/A Book - An Author.azw3")
+    finally:
+        read_only.chmod(0o755)
+    assert (read_only / "A Book - An Author.azw3").is_file()
+
+
 def test_read_leaves_nothing_behind_when_the_copy_dies_part_way(fake_kindle, tmp_path, monkeypatch):
     """The same guarantee `write` makes for the device, in the other direction — and
     the one MTP's helper already made by removing its half-fetched local file."""

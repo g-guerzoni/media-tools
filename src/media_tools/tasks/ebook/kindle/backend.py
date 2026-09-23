@@ -117,7 +117,11 @@ class DeviceBackend(Protocol):
       for anything outside what this project will ever touch — the same exclusions
       `list_files` enforces for reads, now enforced before a write too, since `path`
       may be built from data this project did not produce (a book's own EXTH
-      records).
+      records). A device that refuses the write as READ-ONLY raises
+      `DeviceWriteProtected` on BOTH backends — mass storage classifies the
+      `EROFS`/`EACCES`/`EPERM` its filesystem call answers with, MTP its helper's own
+      exit code — so a locked Kindle is never reported as one that went away.
+      `remove(path)` is a write to the volume too and follows the same rule.
     - **`free_space()`** is bytes free on the device's main storage.
     - **`close()`** releases whatever the backend holds, including any cached listing.
     """
@@ -134,9 +138,13 @@ class DeviceBackend(Protocol):
 
 
 class DeviceWriteProtected(RuntimeError):
-    """The device refused a write outright — locked, or mounted read-only —
-    rather than failing with an ordinary OSError a caller already knows how to
-    handle."""
+    """The device refused a write outright — locked, or mounted read-only — rather
+    than failing with an ordinary `OSError` a caller already knows how to handle.
+
+    Raised by BOTH backends, which is what makes `device_write_protected` reachable at
+    all: `cli._error_code_for` maps a bare `OSError` to `device_not_found`, so while
+    only `mtp.py` raised this, a read-only mass-storage Kindle reported "it went away"
+    about a device on the desk — after a mandatory backup had already run."""
 
 
 class DeviceWritePathRejected(RuntimeError):
