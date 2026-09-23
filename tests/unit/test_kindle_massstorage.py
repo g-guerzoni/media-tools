@@ -121,6 +121,42 @@ def test_a_write_the_device_refuses_as_read_only_is_write_protected_not_not_foun
 
 
 @skip_as_root
+def test_a_HOST_side_permission_failure_never_claims_the_device_is_write_protected(
+    fake_kindle, tmp_path
+):
+    """`write` copies FROM a host file — a library book for `add`/`sync`, a file out of
+    a snapshot for `restore`. Classifying by errno alone therefore turned a host-side
+    `EACCES` into "the Kindle refused the write as read-only": a confident false
+    statement about the user's hardware, which is the exact defect the write-protected
+    code was added to stop, reintroduced one layer up.
+
+    On `restore` it is worse than a misleading per-book detail — the write is unguarded
+    there, so it becomes a run-level `device_write_protected`/exit 3 asserting the
+    device is locked when nothing is wrong with the device at all.
+    """
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    unreadable_source = tmp_path / "library" / "A Book.azw3"
+    unreadable_source.parent.mkdir(parents=True)
+    unreadable_source.write_bytes(b"book")
+    unreadable_source.chmod(0o000)
+    try:
+        with pytest.raises(OSError) as caught:
+            device.write(unreadable_source, "documents/en/A Book.azw3")
+    finally:
+        unreadable_source.chmod(0o644)
+
+    assert not isinstance(caught.value, backend.DeviceWriteProtected)
+    # The original error survives, naming the host path and the errno — which is what
+    # a user needs in order to look in the right place.
+    assert caught.value.filename == str(unreadable_source)
+    assert [
+        p.name
+        for p in (fake_kindle.mount / "documents" / "en").iterdir()
+        if p.name.endswith(".partial")
+    ] == []
+
+
+@skip_as_root
 def test_a_delete_the_device_refuses_as_read_only_is_write_protected_too(fake_kindle):
     """The other half of "anywhere it writes": a removal on a read-only volume is the
     same refusal, and must not read as "the book was already gone" (`FileNotFoundError`,

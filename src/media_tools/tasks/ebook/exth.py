@@ -59,9 +59,10 @@ def _records_from(data: bytes) -> dict[int, bytes]:
             position += length
         return found
     except struct.error:
-        # `struct.error` only: every index above is a SLICE, which never raises, and
-        # the one subscript-shaped read (`offsets`) is bounds-checked first. The
-        # `IndexError` that used to be caught here could not happen.
+        # `struct.error` only: every read above is a SLICE of `data` or `record`, and
+        # slicing never raises — a slice past the end is simply short, which is what
+        # `struct.unpack` then rejects. There is no subscript in this function at all,
+        # so the `IndexError` that used to be caught here could not happen.
         return {}
 
 

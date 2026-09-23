@@ -197,7 +197,7 @@ class MassStorageBackend:
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
         except OSError as error:
-            raise _for_write(error, target) from error
+            raise _for_write(error, target, self.mount) from error
         temp = temp_path(target)
         try:
             shutil.copyfile(local, temp)
@@ -212,7 +212,7 @@ class MassStorageBackend:
             with contextlib.suppress(OSError):
                 temp.unlink(missing_ok=True)
             if isinstance(error, OSError):
-                raise _for_write(error, target) from error
+                raise _for_write(error, target, self.mount) from error
             raise
 
     def remove(self, path: str) -> None:
@@ -241,7 +241,7 @@ class MassStorageBackend:
             # same code. `FileNotFoundError` is deliberately untouched: its errno is
             # not in the write-protected set, so it keeps meaning "THIS PATH is not on
             # the device", which is what this method's caller acts on.
-            raise _for_write(error, target) from error
+            raise _for_write(error, target, self.mount) from error
 
     def exists(self, path: str) -> bool:
         # FILES only, per `backend.DeviceBackend`'s contract. `.exists()` answered
@@ -287,8 +287,31 @@ class MassStorageBackend:
 _WRITE_PROTECTED_ERRNOS = frozenset({errno.EROFS, errno.EACCES, errno.EPERM})
 
 
-def _for_write(error: OSError, target: Path) -> BaseException:
-    """`DeviceWriteProtected` when the device refused this write as read-only, and the
+def _refused_path_is_on_the_device(error: OSError, mount: Path) -> bool:
+    """Whether the path the OS refused is on the DEVICE rather than on the host.
+
+    `write` copies FROM a host file — a library book for `add`/`sync`, a file out of a
+    snapshot for `restore` — so the errno alone does not say whose filesystem said no.
+    Every `OSError` on this path names the path it refused (`shutil.copyfile` names
+    whichever of the two it could not open; `mkdir` and `Path.replace` name their own
+    targets), so that name is the answer.
+
+    An error naming NO path is treated as the device's: the only one this module can
+    produce is `os.fsync` inside `fsync_replace`, whose descriptor is the staged file
+    already on the device.
+    """
+    named = [str(name) for name in (error.filename, error.filename2) if name]
+    if not named:
+        return True
+    root = os.path.abspath(mount)
+    return any(
+        os.path.abspath(name) == root or os.path.abspath(name).startswith(root + os.sep)
+        for name in named
+    )
+
+
+def _for_write(error: OSError, target: Path, mount: Path) -> BaseException:
+    """`DeviceWriteProtected` when the DEVICE refused this write as read-only, and the
     original error otherwise.
 
     This code used to be raised in exactly ONE place — `mtp.py`, which this module
@@ -297,8 +320,15 @@ def _for_write(error: OSError, target: Path) -> BaseException:
     which `cli._error_code_for` maps to `device_not_found`: the user was told their
     Kindle had gone away, about a device sitting on the desk, and only after the
     mandatory backup had already run.
+
+    **The errno is not enough on its own**, which is that same defect one layer up: a
+    library book or a snapshot file the HOST refuses to open answers `EACCES` too, and
+    calling that "the Kindle is mounted read-only" is a confident false statement about
+    hardware that is working. `restore` makes it run-level (`device_write_protected`,
+    exit 3), because its writes are unguarded. So the refused path has to be ON the
+    device before this code is used for it.
     """
-    if error.errno in _WRITE_PROTECTED_ERRNOS:
+    if error.errno in _WRITE_PROTECTED_ERRNOS and _refused_path_is_on_the_device(error, mount):
         return DeviceWriteProtected(
             f"the Kindle refused the write to {target.name!r} as read-only "
             f"({error.strerror}): it is mounted read-only, or locked by the device "

@@ -1373,8 +1373,8 @@ def test_thumbnails_reports_the_protecting_snapshot_and_journals_the_run(
     assert entries[0]["snapshot"] == snapshot_name
     thumb_path = f"system/thumbnails/thumbnail_{PT_ID}_EBOK_portrait.jpg"
     assert thumb_path in entries[0]["paths"]
-    # The id was journalled and then DISCARDED, so nothing a user can read named the
-    # operation they would have to pass to `restore --op`.
+    # The id reaches `result`. It used to be journalled and then dropped on the floor,
+    # which left nothing a user could read naming the operation `restore --op` takes.
     assert result["data"]["operation"] == entries[0]["id"]
 
 

@@ -125,13 +125,23 @@ def test_identify_false_never_touches_the_usb_bus_for_a_mounted_kindle(tmp_path)
 
 def test_identify_false_still_asks_when_there_is_no_mount_to_answer(tmp_path):
     """An MTP Kindle has no mount, so the bus is the only thing that can answer — the
-    gate skips a probe that cannot change the answer, not one that can."""
+    gate skips a probe that cannot change the answer, not one that can.
+
+    And because that probe runs, the `Device` that comes back carries its full identity,
+    exactly as `identify=True` would have produced it. The flag changes the RESULT for
+    the mounted branch only, so a caller cannot tell the two apart from the value — the
+    reason a `Device` obtained this way must not reach `backup.device_key` at all."""
     calls = []
 
     def lister():
         calls.append(1)
-        return _kindle_usb(product_id=0x9981)
+        return _kindle_usb(product_id=0x9981, serial="G000MTP", product="Kindle Scribe")
 
     device = detect.find_device(usb_lister=lister, mount_lister=lambda: [], identify=False)
     assert calls == [1]
     assert device.mode == "mtp"
+    assert (device.serial, device.product_id, device.model_hint) == (
+        "G000MTP",
+        0x9981,
+        "Kindle Scribe",
+    )

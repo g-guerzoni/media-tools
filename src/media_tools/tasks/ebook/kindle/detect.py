@@ -144,14 +144,21 @@ def find_device(
 
     `identify=False` answers the two questions that do not need the USB bus — is one
     attached, and in which mode — and skips enumerating it when a mount already
-    answers both. The returned `Device` then carries no `serial`, `product_id` or
-    `model_hint`, so it MUST NOT be handed to `backup.device_key`: a device that
-    reports a serial would resolve to a different backup directory than the same
-    device found the ordinary way. It exists for `doctor`, which runs at every session
-    start, reports only the mode, and deliberately never prints a serial — the same
-    "do not spend a probe that cannot change the answer" gate Ruling R55 applied to
-    the `calibre-debug` driver probe. A device with no mount is MTP, and nothing but
-    the bus can say so, so that probe still runs.
+    answers both. It exists for `doctor`, which runs at every session start, reports
+    only the mode, and deliberately never prints a serial: the same "do not spend a
+    probe that cannot change the answer" gate Ruling R55 applied to the
+    `calibre-debug` driver probe.
+
+    **The flag changes the RESULT for only one of the two branches**, which is the part
+    to hold on to. A mounted Kindle comes back with `serial`, `product_id` and
+    `model_hint` all `None`, because nothing was asked. A device with no mount is MTP,
+    and nothing but the bus can say so, so that probe still runs and the `Device` that
+    comes back is identical to the one `identify=True` would have produced, identity
+    included. A caller therefore CANNOT tell from the result which it got — which is
+    why a `Device` obtained this way must not be handed to `backup.device_key` at all:
+    the same physical Kindle would resolve to its serial-named backup directory on one
+    run and to a hashed `unknown-` one on the next, and neither would hold the other's
+    snapshots.
     """
     # The mount is listed FIRST so `identify=False` can return on it without touching
     # the bus. Neither lister has side effects, so the order is free.
