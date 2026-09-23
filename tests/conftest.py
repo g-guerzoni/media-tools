@@ -9,6 +9,7 @@ import subprocess
 import pytest
 
 from media_tools.core.ffmpeg import ffmpeg_exe
+from media_tools.integrations import calibre
 
 
 @pytest.fixture(scope="session")
@@ -46,6 +47,39 @@ def make_video(tmp_path, ffmpeg_path):
             ],
             check=True,
             capture_output=True,
+        )
+        return target
+
+    return _make
+
+
+@pytest.fixture
+def make_epub(tmp_path):
+    """Build a real EPUB with Calibre so metadata tests have something honest to read."""
+
+    def _make(title="Test Book", author="Test Author", language="en", name=None):
+        source = tmp_path / f"{name or title}.html"
+        source.write_text(
+            f"<html><head><title>{title}</title></head>"
+            f"<body><h1>{title}</h1><p>Body text.</p></body></html>",
+            encoding="utf-8",
+        )
+        target = source.with_suffix(".epub")
+        subprocess.run(
+            [
+                calibre.find_tool("ebook-convert"),
+                str(source),
+                str(target),
+                "--title",
+                title,
+                "--authors",
+                author,
+                "--language",
+                language,
+            ],
+            check=True,
+            capture_output=True,
+            env={**calibre.config_env(tmp_path / "cache"), "PATH": "/usr/bin:/bin"},
         )
         return target
 
