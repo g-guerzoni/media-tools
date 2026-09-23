@@ -793,3 +793,117 @@ def test_a_non_calibre_error_during_repair_fails_only_that_book(
     assert beta_target.is_file()
     unchanged = calibre.read_metadata(beta_target, cache_dir=tmp_path / "verify-cache-rb24")
     assert unchanged.title == "Stranded Beta"
+
+
+def test_a_non_calibre_error_during_rename_rewrite_fails_only_that_book(
+    make_epub, tmp_path, monkeypatch, capsys
+):
+    """Companion to the self-heal regression above, for the OTHER
+    `update_metadata` call site RB24 touched: `_plan_and_reconcile`'s
+    `_rewrite_before_rename` (`build.py:885`), which runs on a twin BEFORE
+    `library.reconcile` renames it into place following a `--list` title
+    change. Four books; only one (`Beta`) is retitled through `--list`, forcing
+    the rename path, and its rewrite is monkeypatched to raise `OSError` instead
+    of `calibre.CalibreError` — the other three books (already at their target,
+    nothing to rename) must still complete, and the run must still end with a
+    `result`."""
+    from media_tools.cli import build_parser
+    from media_tools.tasks.ebook import build as build_mod
+
+    titles = ["Alpha", "Beta", "Gamma", "Delta"]
+    books = {}
+    books_dir = None
+    for title in titles:
+        book = make_epub(title=title, author="Author", language="en", name=f"{title} - Author")
+        books[title] = book
+        books_dir = book.parent
+
+    out = tmp_path / "media"
+    _cli(
+        "ebook",
+        "build",
+        str(books_dir),
+        "--no-llm",
+        "-o",
+        str(out),
+        "-b",
+        "rb24rename",
+        "--no-cover-fetch",
+    )
+    old_beta_target = out / "rb24rename" / "en" / "Beta - Author.azw3"
+    assert old_beta_target.is_file()
+
+    listing = tmp_path / "list.json"
+    listing.write_text(
+        json.dumps(
+            [
+                {"path": str(books["Alpha"])},
+                {
+                    "path": str(books["Beta"]),
+                    "title": "New Beta",
+                    "author": "Author",
+                    "language": "en",
+                },
+                {"path": str(books["Gamma"])},
+                {"path": str(books["Delta"])},
+            ]
+        )
+    )
+
+    real_update_metadata = calibre.update_metadata
+
+    def flaky_update_metadata(path, **kwargs):
+        if "Beta" in str(path):
+            raise OSError(28, "No space left on device")
+        return real_update_metadata(path, **kwargs)
+
+    monkeypatch.setattr(build_mod.calibre, "update_metadata", flaky_update_metadata)
+
+    args = build_parser().parse_args(
+        [
+            "ebook",
+            "build",
+            "--list",
+            str(listing),
+            "--no-llm",
+            "-o",
+            str(out),
+            "-b",
+            "rb24rename",
+            "--no-cover-fetch",
+            "--json",
+        ]
+    )
+    exit_code = build_mod.run(args)
+    assert exit_code == 1  # one item failed; the batch itself still finishes cleanly
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert events[-1]["type"] == "result"
+    items = [e for e in events if e["type"] == "item"]
+    assert len(items) == 4
+
+    def title_of(item):
+        return Path(item["input"]).stem.split(" - ")[0]
+
+    statuses = {title_of(i): i["status"] for i in items}
+    assert statuses["Beta"] == "failed"
+    for title in ("Alpha", "Gamma", "Delta"):
+        assert statuses[title] == "skipped"
+
+    run_data = json.loads((out / "rb24rename" / "run.json").read_text())
+    assert run_data["status"] == "failed"
+    assert all(i["status"] != "pending" for i in run_data["items"])
+    beta_item = next(i for i in run_data["items"] if "Beta" in i["input"])
+    assert beta_item["reason"] == "engine_error"
+    assert "OSError" in beta_item["data"]["error"]
+    assert "No space left" in beta_item["data"]["error"]
+
+    # RB23 rewrites the twin BEFORE renaming it, so a failed rewrite must leave
+    # the twin under its OLD name/content — nothing was ever renamed.
+    assert old_beta_target.is_file()
+    new_beta_target = out / "rb24rename" / "en" / "New Beta - Author.azw3"
+    assert not new_beta_target.exists()
+    unchanged = calibre.read_metadata(
+        old_beta_target, cache_dir=tmp_path / "verify-cache-rb24rename"
+    )
+    assert unchanged.title == "Beta"
