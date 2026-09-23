@@ -1502,8 +1502,9 @@ def test_a_surviving_pdf_keeps_the_sidecar_it_shares_with_a_removed_book(
 
 
 def test_asin_for_a_book_outside_the_backed_up_area_says_why(fake_kindle, tmp_path, capsys):
-    """An identity selector names ONE book, so it earns the refusal and its reason —
-    unlike `--match`, which is a net and simply does not reach there."""
+    """An identity selector names the books it names — one path, or every copy
+    carrying one id — so it earns the refusal and its reason, unlike `--match`, which
+    is a net and simply never casts it there."""
     device = prepare_device(fake_kindle)
     outside = device.mount / "Books" / "Novel.azw3"
     outside.parent.mkdir(parents=True)
@@ -1538,3 +1539,32 @@ def test_a_book_that_vanished_still_has_its_orphans_cleaned_up(fake_kindle, tmp_
     # The book was already gone; its sidecar and cover were not, and they were its.
     assert not (mount / EN_SDR).exists()
     assert not (mount / "system" / "thumbnails" / f"thumbnail_{EN_ID}_EBOK_portrait.jpg").exists()
+
+
+def test_a_named_out_of_scope_path_alongside_a_match_is_still_refused(
+    fake_kindle, tmp_path, capsys
+):
+    """The selectors are not mutually exclusive. A named path outside the backed-up
+    area has to be READ (for the thumbnail's content type) even on a run whose
+    `--match` narrows the reads to the backed-up area, and it has to reach its
+    refusal — while the book the net did catch goes."""
+    device = prepare_device(fake_kindle)
+    mount = device.mount
+    outside = mount / "Books" / "Novel.azw3"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(mobi_bytes(book_id="OUTSIDEBOOK00001", title="Novel"))
+
+    args = _remove_args(tmp_path / "media", "Books/Novel.azw3", "--match", EN_AUTHOR, "--yes")
+    exit_code = kindle_cli.run_remove(
+        args, device_finder=lambda: device, backend_factory=_mass_storage_factory
+    )
+    assert exit_code == EXIT_FAILED
+
+    items = {e["input"]: e for e in _events(capsys) if e["type"] == "item"}
+    assert set(items) == {EN_PATH, "Books/Novel.azw3"}
+    assert items[EN_PATH]["status"] == "done"
+    assert items["Books/Novel.azw3"]["status"] == "failed"
+    assert items["Books/Novel.azw3"]["detail"].startswith(f"{kindle_cli.DETAIL_PROTECTED}: ")
+
+    assert not (mount / EN_PATH).exists()
+    assert outside.is_file()

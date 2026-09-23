@@ -1878,8 +1878,10 @@ def _library_batch(root: Path, batch: str, *, flag: str) -> tuple[list[_SourceBo
     whose output happens to be a format this tool would not ADD is still a book the
     library has, so deleting the device's copy of it would be wrong.
 
-    The THIRD value counts items that are NEITHER (`pending`, `failed`, anything a
-    future version invents): a batch holding any of them is not a complete statement
+    The THIRD value counts every item that describes no book: one whose status is
+    NEITHER of the two (`pending`, `failed`, anything a future version invents), AND
+    one that carries a library status but no `data` at all, which is the same hole
+    wearing a better status. A batch holding any of them is not a complete statement
     about the library, and `sync --delete-extras` refuses it rather than reading every
     book behind them as "the library does not have this".
     """
@@ -2877,10 +2879,13 @@ def _sidecar_prefix(book_path: str) -> str:
 def _protection_refusal(path: str, all_paths: set[str], *, sidecars_visible: bool) -> str | None:
     """Why this tool will never delete `path`, or `None` if it may.
 
-    Five rules, listed in the order they are CHECKED — a path can break several, and
+    Six rules, listed in the order they are CHECKED — a path can break several, and
     the first match is the message the user gets, so the more specific reasons come
     before the more general one:
 
+    0. **An empty path**, which names nothing to remove. Only reachable from a command
+       line (`remove ""`), and answered rather than allowed to fall through the five
+       below into a `None` that would read as permission.
     1. **An absolute path, or one with a `.`/`..` component** — the same shapes
        `validate_writable_path` refuses before a write. Unreachable from a device
        listing, reachable from a command line, and the two checks are otherwise
@@ -2899,9 +2904,9 @@ def _protection_refusal(path: str, all_paths: set[str], *, sidecars_visible: boo
        true rather than merely intended, and it costs nothing: everything this tool
        itself places lives under `documents/<lang>/`, which is in scope.
 
-    `sidecars_visible` is what makes rule 4 safe on BOTH backends. Over MTP the cached
-    device tree omits `*.sdr` folders entirely, so the `assets/` marker is simply not
-    there to be found — and "no marker" would then read as "sideloaded, delete away"
+    `sidecars_visible` is what makes rule 4 (the KFX one) safe on BOTH backends. Over
+    MTP the cached device tree omits `*.sdr` folders entirely, so the `assets/` marker
+    is simply not there to be found — and "no marker" would then read as "sideloaded, delete away"
     for exactly the books this rule exists to protect. So over MTP every `*.kfx` is
     refused, sideloaded or not: the two cannot be told apart there, and the wrong
     guess costs a purchase.
@@ -3524,10 +3529,13 @@ def run_remove(
     under `system/` but its `thumbnails/` child, and a purchased `*.kfx` whose
     `.sdr/assets` holds its DRM — over MTP, where that marker cannot be listed at all,
     EVERY `*.kfx` instead (`_protection_refusal`). A refusal makes the run's own exit
-    code 1, because something the user asked for demonstrably did not happen. Only
-    books INSIDE that backed-up area are selectable in the first place, so `--match`
-    can never sweep in one of them; a path named explicitly still gets its refusal, so
-    the user learns why rather than watching nothing happen.
+    code 1, because something the user asked for demonstrably did not happen.
+
+    **The selectors reach those refusals differently, on purpose.** `--match` is a net
+    and never casts it outside the backed-up area, so a book in a folder of the user's
+    own making produces no item at all. A named path and `--asin` are identities: they
+    name specific books, reach the refusal, and get the message — a run that reported
+    nothing and exited 0 would leave the user wondering which of the two it meant.
 
     **Over MTP a `.sdr` sidecar and anything under `system/` cannot be deleted at
     all** — Calibre 9.15 exposes no delete-by-name and its cached tree omits both, so

@@ -185,10 +185,16 @@ def test_remove_refuses_to_call_a_vanished_device_an_absent_file(fake_kindle, mo
     from media_tools.tasks.ebook.kindle.detect import DeviceNotFound
 
     device = massstorage.MassStorageBackend(fake_kindle.mount)
-    # A path that really is absent still reports itself as absent, and as nothing else.
-    with pytest.raises(FileNotFoundError) as absent:
+    # The two families must stay DISJOINT, which is what lets `ebook kindle remove`
+    # tell them apart by type alone: were `DeviceNotFound` ever made a
+    # `FileNotFoundError` subclass (as `mtp.MtpPathNotInCachedTree` deliberately is),
+    # every caller written to that contract would silently start reading an unplugged
+    # Kindle as a book that was already gone.
+    assert not issubclass(DeviceNotFound, FileNotFoundError)
+
+    # A path that really is absent still reports itself as absent.
+    with pytest.raises(FileNotFoundError):
         device.remove("documents/en/Never Existed.azw3")
-    assert not isinstance(absent.value, DeviceNotFound)
 
     monkeypatch.setattr(massstorage, "_device_id", lambda mount: device._device_id + 1)
     with pytest.raises(DeviceNotFound):
