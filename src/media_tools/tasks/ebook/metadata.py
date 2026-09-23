@@ -8,9 +8,10 @@ the result by path+size+mtime so a rebuild that touches no files is instant.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,25 +51,69 @@ def _load_cache(cache_file: Path | None) -> dict[str, dict]:
     return loaded if isinstance(loaded, dict) else {}
 
 
+@contextlib.contextmanager
+def _scratch_dir(cache_dir: Path | None) -> Iterator[Path]:
+    """A directory for Calibre's own scratch work (its isolated config, and the
+    throwaway `.opf` files `calibre.read_metadata` writes). With a real `cache_dir`
+    this simply is `cache_dir`. With none (what `--dry-run` passes) it must not be a
+    single fixed, predictable path like `tempfile.gettempdir()` itself — two
+    concurrent runs, or two users on one machine, would then share (and fight over)
+    the same `calibre-config`. A private `mkdtemp` directory, removed the moment this
+    call is done, keeps a dry run from writing anything that outlives the process."""
+    if cache_dir is not None:
+        yield Path(cache_dir)
+    else:
+        with tempfile.TemporaryDirectory(prefix="media-tools-ebook-") as scratch:
+            yield Path(scratch)
+
+
 def read_all(
     paths: list[Path],
     *,
     cache_dir: Path | None,
     workers: int = 8,
     on_progress: Callable[[int, int, Path], None] | None = None,
+    on_error: Callable[[Path, str], None] | None = None,
 ) -> list[BookFacts]:
     """Read metadata for every path, hitting Calibre only for the ones the cache
-    (keyed by resolved path + size + mtime_ns) doesn't already cover. `cache_dir=None`
-    (what `--dry-run` passes) still reads through Calibre — it just never persists a
-    cache file to disk, using a throwaway system temp dir for Calibre's own scratch
-    work instead."""
+    (keyed by resolved path + size + mtime_ns) doesn't already cover — a cache entry
+    that isn't itself a dict (schema drift, hand-editing, disk corruption) is treated
+    as a miss, so that one book is simply read again rather than crashing the batch.
+    `cache_dir=None` (what `--dry-run` passes) still reads through Calibre — it just
+    never persists a cache file to disk, using a private, removed-on-exit temp
+    directory for Calibre's own scratch work instead.
+
+    A path that vanishes, moves, or becomes unreadable between the scan that produced
+    `paths` and this call is skipped rather than raising out of the whole batch; each
+    one is reported at most once through `on_error(path, message)` so a caller (the
+    library build pipeline) can mark that book failed instead of silently losing it.
+    """
     cache_file = Path(cache_dir) / CACHE_FILENAME if cache_dir else None
     cache = _load_cache(cache_file)
 
-    todo = [path for path in paths if _key(path) not in cache]
+    dropped: set[Path] = set()
+
+    def _report(path: Path, error: OSError) -> None:
+        if path not in dropped:
+            dropped.add(path)
+            if on_error:
+                on_error(path, str(error))
+
+    todo = []
+    for path in paths:
+        try:
+            key = _key(path)
+        except OSError as error:
+            _report(path, error)
+            continue
+        if key not in cache or not isinstance(cache[key], dict):
+            todo.append(path)
+
     if todo:
-        scratch_dir = Path(cache_dir) if cache_dir else Path(tempfile.gettempdir())
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        with (
+            _scratch_dir(cache_dir) as scratch_dir,
+            ThreadPoolExecutor(max_workers=max(1, workers)) as pool,
+        ):
             futures = {
                 pool.submit(calibre.read_metadata, path, cache_dir=scratch_dir): path
                 for path in todo
@@ -79,13 +124,18 @@ def read_all(
                     meta = future.result()
                 except calibre.CalibreError:
                     meta = calibre.BookMetadata(None, None, None, None, False)
-                cache[_key(path)] = {
-                    "title": meta.title,
-                    "author": meta.author,
-                    "language": meta.language,
-                    "uuid": meta.uuid,
-                    "has_cover": meta.has_cover,
-                }
+                try:
+                    key = _key(path)
+                except OSError as error:
+                    _report(path, error)
+                else:
+                    cache[key] = {
+                        "title": meta.title,
+                        "author": meta.author,
+                        "language": meta.language,
+                        "uuid": meta.uuid,
+                        "has_cover": meta.has_cover,
+                    }
                 if on_progress:
                     on_progress(done, len(todo), path)
 
@@ -95,12 +145,22 @@ def read_all(
 
     facts = []
     for path in paths:
-        entry = cache.get(_key(path), {})
+        if path in dropped:
+            continue
+        try:
+            key = _key(path)
+            size = path.stat().st_size
+        except OSError as error:
+            _report(path, error)
+            continue
+        entry = cache.get(key, {})
+        if not isinstance(entry, dict):
+            entry = {}
         file_title, file_author = names.parse_filename(path)
         facts.append(
             BookFacts(
                 path=path,
-                size=path.stat().st_size,
+                size=size,
                 fmt=path.suffix.lower().lstrip("."),
                 meta_title=entry.get("title"),
                 meta_author=entry.get("author"),
