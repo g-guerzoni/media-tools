@@ -10,6 +10,7 @@ from __future__ import annotations
 import platform
 import plistlib
 import subprocess
+import xml.parsers.expat
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,7 +45,12 @@ def _list_usb_macos() -> list[dict]:
             timeout=30,
         )
         entries = plistlib.loads(raw.stdout) if raw.stdout else []
-    except (subprocess.SubprocessError, OSError, ValueError):
+    except (subprocess.SubprocessError, OSError, ValueError, xml.parsers.expat.ExpatError):
+        # `ExpatError` is NOT a `ValueError`: `plistlib` answers `InvalidFileException`
+        # (which is) for output that is empty or not a plist at all, and lets expat's
+        # own error through for XML that stops part-way — a truncated `ioreg`, i.e. the
+        # realistic failure. Without it, detection raised out of every `ebook kindle`
+        # command as `internal_error`/exit 1 instead of `device_not_found`/exit 3.
         return []
     found = []
     for entry in entries if isinstance(entries, list) else []:

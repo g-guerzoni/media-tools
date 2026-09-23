@@ -52,6 +52,7 @@ ERROR_CODES = frozenset(
         "device_not_found",
         "device_busy",
         "device_write_protected",
+        "eject_failed",
         "backup_failed",
         "interrupted",
         "output_not_writable",

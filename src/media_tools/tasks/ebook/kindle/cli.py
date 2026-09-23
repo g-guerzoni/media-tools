@@ -539,24 +539,30 @@ def resolve_device(
 
 def _error_code_for(error: BaseException) -> str:
     """The one mapping from whatever a backend raised to the closed registry's matching
-    code. Order matters: `DeviceBusy`/`DeviceWriteProtected`/`BackupFailed` are checked
-    before the broader `(DeviceNotFound, OSError)` pair so a more specific diagnosis is
-    never shadowed by a looser one. `OSError` (not just `FileNotFoundError`) is what
-    catches the other real unplug modes — `PermissionError`, `OSError(EIO)`,
-    `OSError(ENODEV)` — that `free_space()` (a bare `shutil.disk_usage`) and
-    `read`/`read_many` (copying bytes off a device that just went away) raise at least
-    as often as a plain "not found"."""
+    code. Order matters: `DeviceBusy`/`DeviceWriteProtected`/`EjectFailed`/
+    `BackupFailed` are checked before the broader `(DeviceNotFound, OSError)` pair so a
+    more specific diagnosis is never shadowed by a looser one. `OSError` (not just
+    `FileNotFoundError`) is what catches the other real unplug modes —
+    `PermissionError`, `OSError(EIO)`, `OSError(ENODEV)` — that `free_space()` (a bare
+    `shutil.disk_usage`) and `read`/`read_many` (copying bytes off a device that just
+    went away) raise at least as often as a plain "not found"."""
     if isinstance(error, DeviceBusy):
         return "device_busy"
     if isinstance(error, DeviceWriteProtected):
         return "device_write_protected"
+    if isinstance(error, massstorage.EjectFailed):
+        return "eject_failed"
     if isinstance(error, backup_module.BackupFailed):
         return "backup_failed"
     if isinstance(error, (DeviceNotFound, OSError)):
         return "device_not_found"
     # Anything else this subsystem raises (a bare `CalibreError`, e.g. calibre-debug
-    # itself going missing) is not about the device's presence/availability — Calibre
-    # failed to run at all, which is a dependency problem, not a device one.
+    # itself going missing; `massstorage._run`'s `RuntimeError` for a platform binary
+    # that could not be STARTED) is not about the device's presence/availability —
+    # something this tool needs failed to run at all, which is a dependency problem,
+    # not a device one. An eject tool that ran and REFUSED is a different thing and
+    # has its own code above, precisely so this catch-all stops telling the user to
+    # install a binary they already have.
     return "dependency_missing"
 
 
@@ -581,6 +587,7 @@ _EXIT_FOR_CODE = {
     "device_not_found": EXIT_DEPENDENCY,
     "device_busy": EXIT_DEPENDENCY,
     "device_write_protected": EXIT_DEPENDENCY,
+    "eject_failed": EXIT_DEPENDENCY,
     "dependency_missing": EXIT_DEPENDENCY,
     "backup_failed": EXIT_FAILED,
 }

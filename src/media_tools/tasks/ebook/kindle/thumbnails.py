@@ -297,10 +297,19 @@ def _read_cover_image(path: Path) -> bytes | None:
     (`0xFFFFFFFF`). Returns None for anything that does not parse as a MOBI file
     with a usable image at the resolved record, mirroring `exth.read_records`'s own
     "unreadable or not MOBI -> nothing" contract rather than raising.
+
+    The read below catches the SAME three families `exth.read_records_or_none` does,
+    and for the same reason: `ValueError` (a path with an embedded NUL, which `open()`
+    raises rather than `OSError`) and `MemoryError` (this reads the WHOLE book to reach
+    an image record) are both outside what `_install_guarded` catches, so either one
+    escaping here aborts every book still queued — after the device has already been
+    written to — and surfaces as `internal_error`/exit 1. The comment further down
+    names those two families and fixed them for the EXTH read it guards; this read
+    needed the same treatment and did not have it.
     """
     try:
         data = Path(path).read_bytes()
-    except OSError:
+    except (OSError, ValueError, MemoryError):
         return None
     try:
         count = struct.unpack(">H", data[76:78])[0]

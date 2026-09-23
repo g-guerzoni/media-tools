@@ -432,3 +432,28 @@ def test_read_cover_image_falls_back_to_thumb_offset_when_cover_offset_is_the_no
 def test_image_record_index_returns_none_for_the_no_cover_sentinel():
     records = {exth.TAG_COVER_OFFSET: struct.pack(">I", 0xFFFFFFFF)}
     assert thumbnails._image_record_index(records, exth.TAG_COVER_OFFSET, 5) is None
+
+
+def test_reading_a_cover_never_escapes_as_something_install_cannot_catch(tmp_path, monkeypatch):
+    """`_read_cover_image` reads the WHOLE book to reach an image record, guarded only
+    by `except OSError` — while the comment three lines below it names `ValueError` and
+    `MemoryError` as the families `read_records` does not absorb and `_install_guarded`
+    does not catch either, and fixes it for the callee but not for this read. An escape
+    from here breaks `install()`'s "no per-book fault aborts the batch", and surfaces
+    as `internal_error`/exit 1 AFTER the device has already been written to.
+    """
+    # The live arm, through the real function: `open()` raises `ValueError`, not
+    # `OSError`, for a path carrying an embedded NUL byte.
+    assert thumbnails._read_cover_image(Path("no\0pe")) is None
+
+    book = tmp_path / "Book.azw3"
+    book.write_bytes(b"\0" * 128)
+    real_read_bytes = Path.read_bytes
+
+    def out_of_memory(self):
+        if self.name == "Book.azw3":
+            raise MemoryError("cannot allocate")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", out_of_memory)
+    assert thumbnails._read_cover_image(book) is None

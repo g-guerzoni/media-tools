@@ -289,19 +289,24 @@ volume really did disappear, that the Kindle says it is safe to unplug, and — 
 MTP — that the device is in a clean state afterwards and nothing else on the host is
 still holding it.
 
-If it fails, the error code says which kind of failure it was, and `device_busy` means
-two different things depending on the mode:
+If it fails, the error code says which kind of failure it was. There are three, and
+`device_busy` means two different things depending on the mode:
 
-- **Mass storage** — the volume is still in use after the one retry. Close whatever is
-  reading it and run `eject` again.
-- **MTP** — Calibre's GUI is running, and an MTP device allows exactly one holder. That
-  check runs before *every* MTP invocation, not just this one, so the same code appears
-  for `status`, `scan` and everything else while Calibre is open. Close Calibre.
+- **`device_busy`, mass storage** — the volume is still in use after the one retry.
+  Close whatever is reading it and run `eject` again.
+- **`device_busy`, MTP** — Calibre's GUI is running, and an MTP device allows exactly
+  one holder. That check runs before *every* MTP invocation, not just this one, so the
+  same code appears for `status`, `scan` and everything else while Calibre is open.
+  Close Calibre.
+- **`eject_failed`** — the platform's eject tool ran and refused for a reason it did
+  not call "busy". The message carries what `diskutil`/`udisksctl` itself said; that
+  text is the actionable part. Record it here if you hit one.
+- **`dependency_missing`** — a platform binary (`diskutil`, `udisksctl` or `sync`) is
+  not there. This is the only one of the three that means "install something".
 
-`dependency_missing` is the other branch: a platform binary — `diskutil`, `udisksctl`
-or `sync` — is not there. Both exit 3, and the device is untouched either way. Worth
-deliberately provoking the busy case once, by leaving a file manager open on the volume
-(or Calibre open, over MTP), since neither branch has ever run for real.
+All three exit 3, and the device is untouched in every one of them. Worth deliberately
+provoking the busy case once, by leaving a file manager open on the volume (or Calibre
+open, over MTP), since none of these branches has ever run for real.
 
 ## When something does not match
 

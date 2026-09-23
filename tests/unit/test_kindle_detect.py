@@ -48,3 +48,19 @@ def test_a_non_kindle_usb_device_is_ignored():
     others = [{"vendor_id": 0x05AC, "product_id": 0x1234, "serial": "x"}]
     with pytest.raises(detect.DeviceNotFound):
         detect.find_device(usb_lister=lambda: others, mount_lister=lambda: [])
+
+
+def test_a_truncated_ioreg_plist_is_no_devices_not_an_internal_error(monkeypatch):
+    """Same missing guard as `massstorage._parent_disk_macos`, one step earlier and
+    one exit code worse: detection failing here reaches the user as
+    `internal_error`/exit 1 rather than `device_not_found`/exit 3, on every single
+    `ebook kindle` command."""
+    import subprocess
+
+    truncated = b'<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><array>'
+    monkeypatch.setattr(
+        detect.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=truncated, stderr=b""),
+    )
+    assert detect._list_usb_macos() == []

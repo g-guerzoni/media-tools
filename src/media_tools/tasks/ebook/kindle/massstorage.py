@@ -36,6 +36,7 @@ import platform
 import plistlib
 import shutil
 import subprocess
+import xml.parsers.expat
 from pathlib import Path
 
 from media_tools.core.paths import fsync_replace, temp_path
@@ -66,6 +67,17 @@ __all__ = [
     "is_volume_litter",
     "prefix_targets_a_forbidden_system_child",
 ]
+
+
+class EjectFailed(RuntimeError):
+    """The platform's eject tool RAN and refused, for a reason that is neither the
+    volume being busy nor the tool being absent — `eject_failed` in the registry.
+
+    Its own type because the two neighbouring answers are both actively misleading
+    here: `dependency_missing` (the bare `RuntimeError` this used to be) tells the
+    user to install a binary that just ran, and `device_busy` tells them to close a
+    program when the tool never said anything was holding the volume. Nothing was
+    written to the device either way — `eject` writes nothing at all."""
 
 
 class MassStorageBackend:
@@ -319,13 +331,22 @@ def _run_with_retry(argv: list[str]) -> None:
     """Run it, retry once if the volume reports itself busy, and raise the exception
     that says WHICH kind of failure it was.
 
-    `DeviceBusy` for a volume still in use after the retry, and only then: that is a
-    `RuntimeError` subclass, so a caller that only cares that this failed is unchanged,
-    while `cli._error_code_for` — which tests `DeviceBusy` before anything broader —
-    can report `device_busy` instead of `dependency_missing`. The difference is not
-    cosmetic: `dependency_missing` means "install something", and telling a user to
-    install something because a Finder window is open on their Kindle sends them after
-    the wrong problem entirely.
+    **Ejecting has THREE failure modes, not two**, and each one gets its own:
+
+    - the binary is not there at all — `_run` raises a bare `RuntimeError` for the
+      `OSError` of a subprocess that could not start, which reaches the user as
+      `dependency_missing`. That code means "install something", and that is the only
+      case where it is true;
+    - the volume is still in use after the retry — `DeviceBusy`, reported as
+      `device_busy`: close whatever is reading the volume and try again;
+    - the tool RAN and refused for some other reason — `EjectFailed`, reported as
+      `eject_failed`. This used to be a bare `RuntimeError` too, which fell through
+      `cli._error_code_for`'s catch-all into `dependency_missing`: the user was told
+      to install a binary that had just run, and the tool's own message about what
+      actually went wrong was buried under advice that could not help.
+
+    Both `DeviceBusy` and `EjectFailed` are `RuntimeError` subclasses, so a caller
+    that only cares that this failed is unaffected.
     """
     result = _run(argv)
     if _busy(result):
@@ -335,14 +356,20 @@ def _run_with_retry(argv: list[str]) -> None:
     message = f"{' '.join(argv)} failed: {(result.stderr or '').strip()}"
     if _busy(result):
         raise DeviceBusy(message)
-    raise RuntimeError(message)
+    raise EjectFailed(message)
 
 
 def _parent_disk_macos(mount: Path) -> str:
     result = _run(["diskutil", "info", "-plist", str(mount)], text=False)
     try:
         info = plistlib.loads(result.stdout) if result.stdout else {}
-    except (ValueError, TypeError):
+    except (ValueError, xml.parsers.expat.ExpatError):
+        # `ExpatError` is NOT a `ValueError`, so a TRUNCATED plist — the realistic
+        # failure, as opposed to the empty or garbage one `InvalidFileException`
+        # covers — escaped this and failed `eject` as `internal_error` instead of
+        # using the fallback on the next line. `TypeError` was in this tuple and is
+        # unreachable: `text=False` is hardcoded above, so `result.stdout` is always
+        # bytes or `None`, and `None` never reaches `loads`.
         info = {}
     return info.get("ParentWholeDisk") or str(mount)
 

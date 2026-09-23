@@ -237,13 +237,17 @@ Item statuses (`item.status`, and `run.json`'s per-item `status`):
 
 `usage`, `no_input_matched`, `batch_in_use`, `batch_task_mismatch`, `dependency_missing`,
 `config_missing`, `device_not_found`, `device_busy`, `device_write_protected`,
-`backup_failed`, `interrupted`, `output_not_writable`, `internal_error`,
-`extraction_failed`. `device_write_protected` is raised by both Kindle backends when
-the device refuses a write as read-only (locked, or mounted read-only), as distinct
-from `device_busy` (something else holds it) and `device_not_found` (it went away);
-`config_missing` is what
-`ebook build`/`normalize`/`dedup`/`covers`/`convert` (every subcommand but `scan`) raise
-when the LLM is enabled and no OpenRouter key resolves.
+`eject_failed`, `backup_failed`, `interrupted`, `output_not_writable`, `internal_error`,
+`extraction_failed`.
+
+`device_write_protected` is raised by both Kindle backends when the device refuses a
+write (or a delete) as read-only — mass storage classifies the `EROFS`/`EACCES`/`EPERM`
+its filesystem call answers with, MTP its helper's exit code 4 — as distinct from
+`device_busy` (something else holds it) and `device_not_found` (it went away).
+`eject_failed` is the platform's eject tool having RUN and refused, which is neither of
+those and is not `dependency_missing` either (see `eject` below). `config_missing` is
+what `ebook build`/`normalize`/`dedup`/`covers`/`convert` (every subcommand but `scan`)
+raise when the LLM is enabled and no OpenRouter key resolves.
 
 `warning` code (on an `item` event's `warnings`, or a standalone `warning` event):
 
@@ -334,7 +338,8 @@ work being asked for, so a failure there is "at least one item failed" and the r
 reports `counts.failed: 1` with a real `failed` entry; in a WRITE command the snapshot
 is a precondition that was never met, nothing the user asked for was attempted at all,
 and the run reports all-zero counts. Every other mapped device code — `device_not_found`,
-`device_busy`, `device_write_protected`, `dependency_missing` — is exit 3.
+`device_busy`, `device_write_protected`, `eject_failed`, `dependency_missing` — is
+exit 3.
 
 ### `run.json`
 
@@ -1064,14 +1069,22 @@ the state it had just recorded. One `item` per selected FILE, not per book.
 with no backup, because it has nothing to protect. Mass storage runs `sync` and then the
 platform eject (`diskutil eject` on the mount's parent whole disk on macOS, `udisksctl
 unmount` + `power-off` on Linux, retried once on a busy volume); MTP closes the session.
-A failure maps through the same table as every other command, and the two it actually
-has are told apart: a volume still busy after the retry is `device_busy`
-(`massstorage._run_with_retry` raises `DeviceBusy` for exactly that, and
-`_error_code_for` tests it before anything broader) — close whatever is reading the
-volume and run `eject` again. A missing `diskutil`, `udisksctl` **or `sync`** binary is
-`dependency_missing`, which is what that code means. Both exit 3, and the device is
-untouched either way. A `sync` that RUNS and returns non-zero is not a failure at all:
-its return code is deliberately unchecked, since it says nothing actionable.
+A failure maps through the same table as every other command, and it has **three**
+modes, each with its own code:
+
+- a volume still busy after the retry is `device_busy` (`massstorage._run_with_retry`
+  raises `DeviceBusy` for exactly that, and `_error_code_for` tests it before anything
+  broader) — close whatever is reading the volume and run `eject` again;
+- the eject tool RAN and refused for some other reason is `eject_failed`
+  (`massstorage.EjectFailed`) — its message carries what the tool itself said, which is
+  the only thing that can help;
+- a missing `diskutil`, `udisksctl` **or `sync`** binary is `dependency_missing`, which
+  is what that code means. Only this one means "install something", which is why the
+  middle case stopped sharing it.
+
+All three exit 3, and the device is untouched in every one of them — `eject` writes
+nothing at all. A `sync` that RUNS and returns non-zero is not a failure at all: its
+return code is deliberately unchecked, since it says nothing actionable.
 
 #### `scan`'s report, field by field
 

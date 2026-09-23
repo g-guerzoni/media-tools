@@ -1604,6 +1604,14 @@ class _FailingEjectBackend(_RecordingEjectBackend):
         raise RuntimeError("diskutil failed: No such file or directory")
 
 
+class _RefusedEjectBackend(_RecordingEjectBackend):
+    """The third mode: the platform tool RAN and returned non-zero for a reason that is
+    neither "busy" nor "not installed"."""
+
+    def eject(self) -> None:
+        raise massstorage.EjectFailed("diskutil eject disk9 failed: Unable to eject")
+
+
 class _BusyEjectBackend(_RecordingEjectBackend):
     def eject(self) -> None:
         raise DeviceBusy("diskutil eject disk9 failed: Resource busy")
@@ -1718,6 +1726,25 @@ def test_eject_reports_a_busy_volume_as_device_busy_not_a_missing_dependency(
     assert exit_code == EXIT_DEPENDENCY
     events = _events(capsys)
     assert [e["code"] for e in events if e["type"] == "error"] == ["device_busy"]
+    assert events[-1]["type"] == "result"
+
+
+def test_eject_has_three_failure_modes_and_a_refused_eject_is_its_own(
+    fake_kindle, tmp_path, capsys
+):
+    """`dependency_missing` means "install something". A `diskutil`/`udisksctl` that
+    RAN and refused is not that, and reporting it as that sends the user after a
+    binary they already have."""
+    backend = _RefusedEjectBackend(fake_kindle.mount)
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "eject", "--json", "-o", str(tmp_path / "media")]
+    )
+    exit_code = kindle_cli.run_eject(
+        args, device_finder=lambda: fake_kindle, backend_factory=lambda d, *, cache_dir: backend
+    )
+    assert exit_code == EXIT_DEPENDENCY
+    events = _events(capsys)
+    assert [e["code"] for e in events if e["type"] == "error"] == ["eject_failed"]
     assert events[-1]["type"] == "result"
 
 

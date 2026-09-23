@@ -513,3 +513,44 @@ def test_device_for_mount_falls_back_to_the_mount_path_when_not_listed(tmp_path)
         "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n", encoding="utf-8"
     )
     assert massstorage._device_for_mount(mount, mounts_file=mounts_file) == str(mount)
+
+
+def test_a_truncated_diskutil_plist_falls_back_instead_of_crashing_the_eject(
+    fake_kindle, monkeypatch
+):
+    """`plistlib.loads` raises `xml.parsers.expat.ExpatError` for XML that stops
+    part-way, and that is NOT a `ValueError` — so the `except (ValueError, TypeError)`
+    beside it caught the empty/garbage case and missed the truncated one. `eject` then
+    failed as `internal_error`/exit 1 instead of using the fallback sitting right
+    there."""
+    truncated = b'<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>'
+    monkeypatch.setattr(
+        massstorage,
+        "_run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout=truncated, stderr=b""),
+    )
+    assert massstorage._parent_disk_macos(fake_kindle.mount) == str(fake_kindle.mount)
+
+
+def test_an_eject_that_ran_and_refused_is_not_a_missing_dependency(fake_kindle, monkeypatch):
+    """The THIRD failure mode, which had no shape of its own: `_run_with_retry` raised
+    a bare `RuntimeError` for any non-busy failure, and `_error_code_for`'s catch-all
+    turns that into `dependency_missing` — telling the user to install a binary that
+    just ran."""
+
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["diskutil", "info"]:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=plistlib.dumps({"ParentWholeDisk": "disk9"}), stderr=b""
+            )
+        if argv[:2] == ["diskutil", "eject"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="Unable to eject")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(massstorage.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(massstorage.subprocess, "run", fake_run)
+
+    with pytest.raises(massstorage.EjectFailed) as caught:
+        massstorage.MassStorageBackend(fake_kindle.mount).eject()
+    assert not isinstance(caught.value, massstorage.DeviceBusy)
+    assert "Unable to eject" in str(caught.value)
