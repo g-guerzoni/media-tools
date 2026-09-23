@@ -3,11 +3,13 @@ operation is a filesystem call — no MTP session, no vendor protocol.
 
 `write()` follows this project's usual atomicity rule (`core.paths.temp_path` +
 `fsync_replace`, spec 7.1/7.5's "partial outputs never count as done"): a Kindle
-pulled mid-copy must never leave a truncated book sitting at its final name, and a
-copy that fails partway must leave no `.partial` file behind either. `list_files`
-skips the macOS/Linux volume litter every removable disk accumulates and never
-descends into `audible/` — that folder is Amazon's audiobook data, untouchable by
-this whole plan, not ordinary ebook content.
+pulled mid-copy must never leave a truncated book sitting at its final name, and any
+failure anywhere in that staged write — the copy itself or the final replace — must
+leave no `.partial` file behind either. `list_files` skips the macOS/Linux volume
+litter every removable disk accumulates, never descends into `audible/` (Amazon's
+audiobook data, untouchable by this whole plan), and only descends into `system/`
+as far as `system/thumbnails/` — the rest of `system/` is device internals (Wi-Fi
+credentials, logs, settings), not book content.
 """
 
 from __future__ import annotations
@@ -23,11 +25,20 @@ from media_tools.core.paths import fsync_replace, temp_path
 from media_tools.tasks.ebook.kindle.backend import DeviceFile
 
 _VOLUME_LITTER = {".Trashes", ".fseventsd", ".Spotlight-V100"}
+# Fully off-limits, at any depth: `audible/` is Amazon's audiobook data, untouchable
+# by this whole plan. `system/` is different — only `system/thumbnails/` is ordinary
+# cache data; everything else under `system/` is device internals, not book content.
 _PROTECTED_DIRS = {"audible"}
+_RESTRICTED_PARENT = "system"
+_RESTRICTED_EXCEPTION = "thumbnails"
 
 
 def _is_volume_litter(name: str) -> bool:
     return name.startswith("._") or name in _VOLUME_LITTER
+
+
+def _prefix_targets_a_forbidden_system_child(parts: tuple[str, ...]) -> bool:
+    return len(parts) >= 2 and parts[0] == _RESTRICTED_PARENT and parts[1] != _RESTRICTED_EXCEPTION
 
 
 class MassStorageBackend:
@@ -38,7 +49,8 @@ class MassStorageBackend:
         self.mount = mount
 
     def list_files(self, prefix: str = "") -> list[DeviceFile]:
-        if prefix and _PROTECTED_DIRS & set(Path(prefix).parts):
+        parts = Path(prefix).parts if prefix else ()
+        if _PROTECTED_DIRS & set(parts) or _prefix_targets_a_forbidden_system_child(parts):
             return []
         start = self.mount / prefix if prefix else self.mount
         if not start.is_dir():
@@ -51,8 +63,14 @@ class MassStorageBackend:
                 entries = sorted(it, key=lambda entry: entry.name)
         except OSError:
             return
+        # `system/` holds device internals (Wi-Fi credentials, logs, settings) that
+        # are none of this project's business — only its `thumbnails/` child is
+        # ordinary cache data worth listing.
+        restricted = directory.name == _RESTRICTED_PARENT
         for entry in entries:
             if _is_volume_litter(entry.name):
+                continue
+            if restricted and entry.name != _RESTRICTED_EXCEPTION:
                 continue
             if entry.is_dir(follow_symlinks=False):
                 if entry.name in _PROTECTED_DIRS:
@@ -72,10 +90,10 @@ class MassStorageBackend:
         temp = temp_path(target)
         try:
             shutil.copyfile(local, temp)
+            fsync_replace(temp, target)
         except Exception:
             temp.unlink(missing_ok=True)
             raise
-        fsync_replace(temp, target)
 
     def remove(self, path: str) -> None:
         (self.mount / path).unlink()
@@ -125,9 +143,9 @@ def _eject_macos(mount: Path) -> None:
     _run_with_retry(["diskutil", "eject", _parent_disk_macos(mount)])
 
 
-def _device_for_mount(mount: Path) -> str:
+def _device_for_mount(mount: Path, *, mounts_file: Path = Path("/proc/mounts")) -> str:
     try:
-        lines = Path("/proc/mounts").read_text(encoding="utf-8").splitlines()
+        lines = mounts_file.read_text(encoding="utf-8").splitlines()
     except OSError:
         return str(mount)
     for line in lines:
