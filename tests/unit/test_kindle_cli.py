@@ -18,6 +18,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from media_tools.cli import build_parser
 from media_tools.core.events import EXIT_DEPENDENCY, EXIT_FAILED, EXIT_INTERRUPTED, EXIT_OK
 from media_tools.core.paths import temp_path
@@ -25,7 +27,12 @@ from media_tools.tasks.ebook.covers import cache_path
 from media_tools.tasks.ebook.kindle import cli as kindle_cli
 from media_tools.tasks.ebook.kindle import massstorage, mtp
 from media_tools.tasks.ebook.kindle.backend import DeviceFile, DeviceWriteProtected
-from media_tools.tasks.ebook.kindle.detect import Device, DeviceBusy, DeviceNotFound
+from media_tools.tasks.ebook.kindle.detect import (
+    Device,
+    DeviceBusy,
+    DeviceNotFound,
+    find_device,
+)
 
 EN_PATH = "documents/en/A Book - An Author.azw3"
 EN_SDR_DIR = "documents/en/A Book - An Author.sdr"
@@ -1537,10 +1544,34 @@ def test_thumbnails_survives_one_device_book_whose_records_cannot_be_read(
     assert item_events[PT_PATH]["status"] == "done"
 
 
-# --- end-to-end (no real device in this environment) ---------------------------------
+# --- end-to-end (asserts the NO-device path; skipped when one is attached) -----------
+
+
+def _a_real_kindle_is_attached() -> bool:
+    """Whether this machine has a Kindle on it right now.
+
+    The test below asserts what the CLI does when there is NO device. That was an
+    unstated property of every machine the suite had ever run on -- stated only in a
+    section comment -- until a real Kindle was plugged into one and the assertion
+    inverted: `status` correctly exited 0, and the test read that success as a failure.
+    A suite selected with `-m "not device"` must not depend on what is plugged in, so
+    ask instead of assuming. `identify=False` answers "is one mounted" without going to
+    the USB bus. A device that is present but held (`DeviceBusy`) is still present.
+    """
+    try:
+        find_device(identify=False)
+    except DeviceNotFound:
+        return False
+    except DeviceBusy:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def test_ebook_kindle_status_cli_with_no_device_exits_3():
+    if _a_real_kindle_is_attached():
+        pytest.skip("a real Kindle is attached; this test asserts the no-device path")
     result = subprocess.run(
         [
             sys.executable,
