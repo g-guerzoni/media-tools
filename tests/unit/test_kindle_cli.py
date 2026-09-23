@@ -11,6 +11,7 @@ requires everywhere else.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import struct
 import subprocess
@@ -787,7 +788,9 @@ def test_scan_over_mtp_survives_one_unfetchable_book(tmp_path, capsys):
 
     item_events = {e["input"]: e for e in events if e["type"] == "item"}
     assert item_events[good]["warnings"] == []
-    assert item_events[gone]["warnings"] == ["book_id_missing"]
+    # The fetch FAILED for this one, which is not the same thing as a book that
+    # carries no EXTH 113 — the distinction R47 drew for `add`, applied here too.
+    assert item_events[gone]["warnings"] == ["book_id_unreadable"]
 
 
 def test_scan_over_mtp_fetches_every_new_book_in_one_read_many_call(tmp_path, capsys):
@@ -1458,53 +1461,51 @@ def test_thumbnails_match_also_matches_the_books_own_title_and_author(
 # --- one unreadable book never aborts a whole command --------------------------------
 
 
-def _explode_on(monkeypatch, name: str) -> list[str]:
-    """Make `exth.read_records` raise for one file, so a CALLER can be shown surviving
-    it.
+@contextlib.contextmanager
+def _read_explodes_for(monkeypatch, name: str):
+    """One book whose whole-file read runs out of memory, so a CALLER can be shown
+    surviving it.
 
-    The exception is an `OSError` purely because it is the cheapest thing to raise;
-    the real function cannot propagate one (its only I/O is inside `except OSError`),
-    and what the guard is actually for — a `ValueError` from a path with an embedded
-    NUL, a `MemoryError` — is pinned against the real function in
-    `tests/unit/test_exth.py`. These tests are about the CALLERS not aborting, which
-    is why stubbing is both necessary and sufficient here.
-
-    Returns the list the stub records its calls in, so a test can prove it was
-    actually reached rather than passing because the patch never applied.
+    These tests used to monkeypatch `exth.read_records` into raising `OSError` — an
+    exception the real function cannot propagate, since its only I/O sits inside its
+    own `except OSError`, so the guard was exercised by something the production path
+    could never hand it. `MemoryError` is one of the two families `read_records`
+    genuinely does NOT absorb (it reads the WHOLE file to reach a header in its first
+    hundred bytes, so a pathologically large book really can produce one), which is
+    why `read_records_or_none` catches it. Stubbing the READ rather than the parser
+    is what keeps the exception one the real call stack can raise.
     """
-    real = kindle_cli.exth.read_records
-    calls: list[str] = []
+    real = Path.read_bytes
 
-    def exploding(path):
-        if Path(path).name == name:
-            calls.append(str(path))
-            raise OSError(5, "Input/output error")
-        return real(path)
+    def exploding(self):
+        if self.name == name:
+            raise MemoryError("cannot allocate")
+        return real(self)
 
-    monkeypatch.setattr(kindle_cli.exth, "read_records", exploding)
-    return calls
+    monkeypatch.setattr(Path, "read_bytes", exploding)
+    yield
 
 
 def test_scan_survives_one_device_book_whose_records_cannot_be_read(
     fake_kindle, tmp_path, capsys, monkeypatch
 ):
     kindle = kindle_device(fake_kindle)
-    calls = _explode_on(monkeypatch, Path(EN_PATH).name)
 
     args = build_parser().parse_args(
         ["ebook", "kindle", "scan", "--json", "-o", str(tmp_path / "media")]
     )
-    exit_code = kindle_cli.run_scan(
-        args, device_finder=lambda: kindle, backend_factory=_mass_storage_factory
-    )
+    with _read_explodes_for(monkeypatch, Path(EN_PATH).name):
+        exit_code = kindle_cli.run_scan(
+            args, device_finder=lambda: kindle, backend_factory=_mass_storage_factory
+        )
     assert exit_code == EXIT_OK
-    assert calls, "the exploding read was never called"
 
     events = _events(capsys)
     items = {e["input"]: e for e in events if e["type"] == "item"}
-    # The unreadable book is reported as a book with no id, and every other book is
-    # still scanned normally.
-    assert items[EN_PATH]["warnings"] == ["book_id_missing"]
+    # `book_id_unreadable`, NOT `book_id_missing` — the same distinction R47 drew for
+    # `add`: one means the book legitimately carries no EXTH 113 (permanent), the
+    # other that the read failed (transient). Every other book is still scanned.
+    assert items[EN_PATH]["warnings"] == ["book_id_unreadable"]
     assert items[PT_PATH]["status"] == "done"
     books = {book["path"]: book for book in events[-1]["data"]["books"]}
     assert books[EN_PATH]["book_id"] is None
@@ -1518,14 +1519,13 @@ def test_thumbnails_survives_one_device_book_whose_records_cannot_be_read(
     kindle = kindle_device(fake_kindle)
     root = tmp_path / "media"
     _write_dummy_cover(cache_path(root / ".cache", PT_ID))
-    calls = _explode_on(monkeypatch, Path(EN_PATH).name)
 
     args = build_parser().parse_args(["ebook", "kindle", "thumbnails", "--json", "-o", str(root)])
-    exit_code = kindle_cli.run_thumbnails(
-        args, device_finder=lambda: kindle, backend_factory=_mass_storage_factory
-    )
+    with _read_explodes_for(monkeypatch, Path(EN_PATH).name):
+        exit_code = kindle_cli.run_thumbnails(
+            args, device_finder=lambda: kindle, backend_factory=_mass_storage_factory
+        )
     assert exit_code == EXIT_OK
-    assert calls, "the exploding read was never called"
 
     item_events = {e["input"]: e for e in _events(capsys) if e["type"] == "item"}
     # No id could be read for EN, so it is the one book that can never get a

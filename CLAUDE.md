@@ -252,11 +252,13 @@ when the LLM is enabled and no OpenRouter key resolves.
 `sidecar_not_removed`, `hash_from_previous`, `name_collision_suffixed`,
 `leftover_book`.
 
-(`book_id_unreadable` IS produced today, by `ebook kindle add`/`sync` — a device book
-whose EXTH 113 could not be READ AT ALL, which is a different thing from
-`book_id_missing` (a book that legitimately carries none): the first is transient and
-makes that book look absent to the "already on the device" check, the second is
-permanent. `sidecar_not_removed` IS produced today, by `ebook kindle remove`/`sync
+(`book_id_unreadable` IS produced today, by `ebook kindle add`/`sync` **and by `ebook
+kindle scan`** — a device book whose EXTH 113 could not be READ AT ALL, which is a
+different thing from `book_id_missing` (a book that legitimately carries none): the
+first is transient and makes that book look absent to the "already on the device"
+check, the second is permanent. On `add`/`sync` it is one aggregated `warning` event
+carrying the count and the first path; on `scan` it is per-item, on that book's own
+`warnings`. `sidecar_not_removed` IS produced today, by `ebook kindle remove`/`sync
 --delete-extras` — the book was removed but something that should have gone with it
 (its `.sdr` sidecar, its thumbnail) could not be, which over MTP is not a fault but a
 documented gap: Calibre 9.15 offers no delete-by-name and its cached device tree omits
@@ -272,7 +274,8 @@ it instead of being re-read (pass `--verify-hashes` to recompute every one inste
 described below (`leftover_book` is a standalone `warning` event, not attached to any
 one `item` — a leftover was never part of the plan to begin with; `book_id_missing` is
 also produced by `ebook kindle scan` and `ebook kindle thumbnails`, both for a device
-book with no EXTH 113 id). They're listed here regardless because the set is closed
+book with no EXTH 113 id — on `scan`, only when the book's records were READ and
+carried none, since a read that failed is `book_id_unreadable` there). They're listed here regardless because the set is closed
 and this is the authoritative source.)
 
 ### `detail`: the free-text field that NARROWS `reason`
@@ -956,7 +959,7 @@ primitive there. The short file is left where it is; this command never deletes.
 | path | holds | keyed by | invalidated by |
 | --- | --- | --- | --- |
 | `_kindle/<serial>/.cache/headers/` | whole books pulled off an MTP device so their EXTH can be read | device path + size + mtime | the file changing on the device. A superseded copy is pruned via the directory's own `index.json`; delete the directory to force a full re-fetch |
-| `_kindle/<serial>/.cache/book-ids.json` | `{device path: (size\|mtime, EXTH 113 id)}` for `add`/`sync` | device path + size + mtime | the same. **A read that RAISED is never cached** — only a book that parsed, id or no id |
+| `_kindle/<serial>/.cache/book-ids.json` | `{device path: (size\|mtime, EXTH 113 id)}` for `add`/`sync` | device path + size + mtime | the same. **A read that FAILED is never cached** — only a book whose bytes were read, id or no id. That covers a local copy an MTP fetch never landed, which is counted as unreadable before it is read rather than after |
 
 Both are best-effort: an unreadable or unwritable cache costs one re-read, never a
 failed command, and is never reported as if the DEVICE were the problem. Neither is a
@@ -1069,8 +1072,13 @@ its return code is deliberately unchecked, since it says nothing actionable.
 - **`has_sdr` means "has `.sdr` CONTENT".** It is computed from the listing, and a
   listing holds files, so an EMPTY `.sdr` directory reports `False`.
 - **A book with a readable id but an unreadable title is reported `done`, with
-  `title: null` and NO warning.** Only a missing `book_id` produces `book_id_missing`.
+  `title: null` and NO warning.** Only a missing `book_id` produces a warning at all.
   Do not treat a null title as an error.
+- **`book_id: null` comes with one of TWO warnings, and they mean opposite things.**
+  `book_id_missing` is a book whose records were read and carry no EXTH 113 — permanent.
+  `book_id_unreadable` is a book whose records could not be read at all (over MTP,
+  typically a fetch that did not land) — transient, and the same distinction Ruling R47
+  drew for `add`. Aggregating the two sums two populations.
 
 `scan --compare BATCH` adds `data.compare` with `device_only` / `library_only` / `both`,
 compared by book id against an `ebook build`/`ebook scan` batch's `run.json`. Items with

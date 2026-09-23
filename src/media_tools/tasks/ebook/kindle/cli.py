@@ -881,7 +881,7 @@ def run_scan(
             if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
         ]
 
-        records_by_path, _ = _records_for(
+        records_by_path, _, unreadable = _records_for(
             root, device, backend, books, backup_module.device_key(device)
         )
 
@@ -895,7 +895,16 @@ def run_scan(
             cdetype = exth.record_text(records, exth.TAG_CDETYPE) or thumbnails.DEFAULT_CDETYPE
             has_sdr = _has_sdr(book.path, all_paths)
             has_thumbnail = bool(book_id) and _has_thumbnail(book_id, cdetype, all_paths)
-            warnings = [] if book_id else ["book_id_missing"]
+            # The R47 distinction, which `scan` used to collapse: a book whose records
+            # could not be READ is not a book that carries no EXTH 113. The first is
+            # transient and makes the book look absent to every id comparison; the
+            # second is permanent. A consumer aggregating one must not be summing both.
+            if book_id:
+                warnings = []
+            elif book.path in unreadable:
+                warnings = ["book_id_unreadable"]
+            else:
+                warnings = ["book_id_missing"]
 
             reporter.item(
                 id=item_id,
@@ -957,9 +966,10 @@ def _records_for(
     backend: DeviceBackend,
     books: list[DeviceFile],
     key: str,
-) -> tuple[dict[str, dict[int, bytes]], dict[str, Path]]:
-    """`({device path: its EXTH records}, {device path: its local copy})` for whatever
-    subset of the device's books it is given.
+) -> tuple[dict[str, dict[int, bytes]], dict[str, Path], set[str]]:
+    """`({device path: its EXTH records}, {device path: its local copy}, {the paths
+    whose records could not be READ AT ALL})` for whatever subset of the device's books
+    it is given.
 
     The one place this subsystem turns device books into EXTH records: off the mount
     directly for mass storage, and over MTP through the per-book header cache
@@ -967,14 +977,33 @@ def _records_for(
     paths come back — `thumbnails` reuses them so a book is never fetched twice.
     `scan`, `thumbnails` and `remove`/`sync` all go through this rather than each
     repeating the mode check, which is exactly the kind of thing that drifts.
+
+    **The third value is the R47 distinction, at this layer.** A book whose read FAILED
+    and a book that parsed and carries no EXTH 113 both arrive as `{}` records, and
+    they are not the same thing: the first is transient and makes that book look absent
+    to every id comparison, the second is a permanent fact about the file. Over MTP a
+    fetch that never landed is the common case — `_materialize_for_scan` suppresses the
+    batch failure by design, so nothing else downstream could tell.
     """
+    unreadable: set[str] = set()
     if device.mode == "mass_storage":
-        return {book.path: exth.read_records_safe(device.mount / book.path) for book in books}, {}
+        records: dict[str, dict[int, bytes]] = {}
+        for book in books:
+            found = exth.read_records_or_none(device.mount / book.path)
+            if found is None:
+                unreadable.add(book.path)
+            records[book.path] = found or {}
+        return records, {}, unreadable
     cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
-    local_paths = _materialize_for_scan(backend, books, cache_dir)
-    return {
-        book.path: exth.read_records_safe(local_paths[book.path]) for book in books
-    }, local_paths
+    local_paths, not_fetched = _materialize_for_scan(backend, books, cache_dir)
+    unreadable |= not_fetched
+    records = {}
+    for book in books:
+        found = exth.read_records_or_none(local_paths[book.path])
+        if found is None:
+            unreadable.add(book.path)
+        records[book.path] = found or {}
+    return records, local_paths, unreadable
 
 
 def _has_sdr(book_path: str, all_paths: set[str]) -> bool:
@@ -999,8 +1028,9 @@ def _cache_key(path: str, size: int, mtime: float) -> str:
 
 def _materialize_for_scan(
     backend: DeviceBackend, books: list[DeviceFile], cache_dir: Path
-) -> dict[str, Path]:
-    """Local copies of every book, keyed by device path — MTP has no local path at all,
+) -> tuple[dict[str, Path], set[str]]:
+    """`({device path: its local copy}, {the paths whose copy is NOT there})` — MTP has
+    no local path at all,
     so this is what lets `scan` read EXTH off it. Keyed by device path + size + mtime
     (`_cache_key`): an unchanged book is never re-pulled on a later scan, and every
     book that IS missing from the cache is fetched in ONE `read_many` batch rather than
@@ -1010,10 +1040,13 @@ def _materialize_for_scan(
 
     - A book deleted or renamed on the device between `list_files()` and this fetch
       makes `read_many` raise (it is all-or-nothing per its own contract). That must
-      not abort the whole scan — caught below, and whatever DID transfer is simply used;
-      whatever did not is not at `local`, which `exth.read_records` already treats as
-      "no records" (never re-raising is what keeps `scan` matching mass storage's own
-      graceful behaviour for a vanished path).
+      not abort the whole scan — caught below, and whatever DID transfer is simply used.
+      **Whatever did not is NAMED in the second return value**, not left to be inferred
+      from a missing file: the suppressed families are `RuntimeError` and `OSError`, and
+      both `DeviceBusy` and `CalibreError` are `RuntimeError`, so Calibre's GUI being
+      opened mid-run means not one copy lands and EVERY book in the batch is affected
+      at once. Silently reading that as "these books carry no id" is how a whole
+      library gets written to the device a second time (Rulings R46/R47).
     - An edited book gets a NEW cache key (its size/mtime changed), which would
       otherwise leave the OLD cached copy sitting here forever — this directory is a
       cache of whole books, not headers. A small on-disk index (`_CACHE_INDEX_NAME`)
@@ -1064,7 +1097,7 @@ def _materialize_for_scan(
     if index_changed:
         _write_cache_index(index_path, index)
 
-    return mapping
+    return mapping, {book.path for book in books if not mapping[book.path].is_file()}
 
 
 def _is_safe_cache_key(value: object) -> bool:
@@ -1444,7 +1477,7 @@ def run_thumbnails(
         # for every `--match` call — do not "optimise" this back without also
         # reading `TAG_TITLE`/`TAG_AUTHOR` before it.
 
-        records_by_path, local_paths = _records_for(root, device, backend, book_entries, key)
+        records_by_path, local_paths, _ = _records_for(root, device, backend, book_entries, key)
 
         # One (book, already_covered) pair per MATCHED device book, decided up
         # front: a book already carrying its exact thumbnail name is never handed
@@ -2019,13 +2052,22 @@ def _device_book_ids(
 
     unreadable: list[str] = []
     if unknown:
+        not_fetched: set[str] = set()
         if device.mode == "mass_storage":
             local_paths = {book.path: device.mount / book.path for book in unknown}
         else:
             cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
-            local_paths = _materialize_for_scan(backend, unknown, cache_dir)
+            local_paths, not_fetched = _materialize_for_scan(backend, unknown, cache_dir)
         for book in unknown:
-            book_id = _book_id_of(local_paths[book.path])
+            local = local_paths[book.path]
+            # A local copy that is NOT THERE is the MTP shape of "could not read", and
+            # the one that used to be lost: `_materialize_for_scan` suppresses its
+            # batch failure by design (one unfetchable book must not abort a run), and
+            # both `DeviceBusy` and `CalibreError` are `RuntimeError`, so Calibre being
+            # opened mid-run leaves no copy for ANY book in the batch. Asked before the
+            # read rather than inferred from it, so the answer does not depend on which
+            # exception an absent file happens to raise.
+            book_id = None if book.path in not_fetched else _book_id_of(local)
             if book_id is None:
                 unreadable.append(book.path)
                 ids[book.path] = ""  # unknown to THIS run; never written to the index
@@ -2046,14 +2088,19 @@ def _device_book_ids(
 
 
 def _book_id_of(path: Path) -> str | None:
-    """`""` for a book that parsed and carries no EXTH 113 id; `None` when reading it
-    RAISED, which is a different thing and must not be cached as if it were the first
-    (see `_device_book_ids`). The guard itself lives in `exth.read_records_or_none`,
-    beside the function it guards, so that every EXTH read in this subsystem shares
-    one — including `backup.py`'s, which imports `read_records` directly and therefore
-    could never have been covered by a helper living here. That read is on the RESTORE
-    path (`_companions_of`, reached only from `restore(only=...)`), not in `snapshot()`
-    — the mandatory pre-write backup never reaches it."""
+    """`""` for a book that parsed and carries no EXTH 113 id; `None` when READING it
+    failed, which is a different thing and must not be cached as if it were the first
+    (see `_device_book_ids`).
+
+    That distinction is `exth.read_records_or_none`'s, and it is real rather than
+    nominal only because that function performs its OWN read: `read_records` absorbs
+    the `OSError` of a file it cannot open into the same `{}` it answers for a file
+    that carries no records, so a wrapper merely delegating to it returned `""` for
+    both — the wrong answer, cached forever under a size|mtime key a device file never
+    changes. The guard lives beside the function it guards so every EXTH read in this
+    subsystem shares one, `backup.py`'s included (`_companions_of`, reached only from
+    `restore(only=...)`, never from `snapshot()` — the mandatory pre-write backup does
+    not read records at all)."""
     records = exth.read_records_or_none(path)
     if records is None:
         return None
@@ -3620,7 +3667,7 @@ def run_remove(
             ]
         else:
             to_read = [entry for entry in books if entry.path.casefold() in wanted]
-        records_by_path, _ = _records_for(root, device, backend, to_read, key)
+        records_by_path, _, _ = _records_for(root, device, backend, to_read, key)
 
         folded_asin = asin.casefold() if asin else None
         selected: list[str] = []
@@ -3851,7 +3898,7 @@ def run_sync(
             # Only the extras are read, not the library: their own title/author are
             # what `--match` narrows on and what the report names them by, and their
             # content type is what a thumbnail's name needs.
-            extra_records, _ = _records_for(root, device, backend, extra_entries, key)
+            extra_records, _, _ = _records_for(root, device, backend, extra_entries, key)
             if needle is not None:
                 extra_entries = [
                     entry

@@ -17,7 +17,6 @@ import pytest
 
 from media_tools.core.events import ERROR_CODES, WARNING_CODES
 from media_tools.integrations.calibre import CalibreError
-from media_tools.tasks.ebook import exth
 from media_tools.tasks.ebook.kindle import backup, massstorage, mtp
 from media_tools.tasks.ebook.kindle.detect import Device
 
@@ -734,14 +733,20 @@ def test_restore_survives_a_stored_book_whose_records_cannot_be_read(mass, tmp_p
         (mass.mount / path).unlink()
 
     calls: list[str] = []
+    real_read_bytes = Path.read_bytes
 
-    def exploding_read_records(path):
-        calls.append(str(path))
-        raise MemoryError("cannot allocate")
+    # The READ is stubbed, not the parser: `read_records_safe` reads the file itself,
+    # and `MemoryError` is one of the two families that read genuinely does not absorb
+    # (the whole file is read to reach a header in its first hundred bytes).
+    def out_of_memory(self):
+        if self.suffix == ".azw3":
+            calls.append(str(self))
+            raise MemoryError("cannot allocate")
+        return real_read_bytes(self)
 
-    monkeypatch.setattr(exth, "read_records", exploding_read_records)
-
+    monkeypatch.setattr(Path, "read_bytes", out_of_memory)
     report = backup.restore(mass, snap.path, only=[BOOK], dry_run=False)
+    monkeypatch.undo()
 
     assert calls, "the exploding read was never called"
     assert set(report.paths) == {BOOK, SDR}

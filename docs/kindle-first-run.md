@@ -128,8 +128,11 @@ What to check:
 - **Titles come from the books, not their filenames.** A book whose filename and
   embedded title disagree must report the embedded one.
 - A book with no EXTH 113 id reports `book_id: null` *and* a `book_id_missing`
-  warning on its item. A book with an id but no readable title reports `title: null`
-  and **no** warning — that is not an error.
+  warning on its item. A book whose records could not be READ at all reports
+  `book_id: null` with `book_id_unreadable` instead — permanent versus transient, and
+  worth telling apart: the second means that book looks absent to every id comparison.
+  A book with an id but no readable title reports `title: null` and **no** warning —
+  that is not an error.
 - `has_sdr` means the book has `.sdr` *content*; an empty `.sdr` directory reports
   `false`.
 - Over MTP, this is the first command that pulls whole books across. It caches each

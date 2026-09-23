@@ -13,6 +13,7 @@ which is the half of `add` a mocked resize cannot prove.
 from __future__ import annotations
 
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -28,7 +29,7 @@ from media_tools.tasks.ebook.kindle import backup as backup_module
 from media_tools.tasks.ebook.kindle import cli as kindle_cli
 from media_tools.tasks.ebook.kindle import massstorage
 from media_tools.tasks.ebook.kindle.backend import DeviceFile, validate_writable_path
-from media_tools.tasks.ebook.kindle.detect import Device
+from media_tools.tasks.ebook.kindle.detect import Device, DeviceBusy
 
 BLADE_ID = "BLADEITSELF00001"
 LIVRO_ID = "UMLIVRO000000001"
@@ -1375,6 +1376,74 @@ def test_add_over_mtp_skips_a_book_already_there_by_its_id(tmp_path, capsys):
     assert "documents/en/Some Book.azw3" not in backend.files
 
 
+def test_a_batch_fetch_calibre_interrupted_is_unreadable_for_every_book_not_id_less(
+    tmp_path, capsys, ffmpeg_path
+):
+    """The MTP shape of the same defect, and the worst one in the subsystem.
+
+    `_materialize_for_scan` suppresses `(RuntimeError, OSError)` around its one
+    `read_many` batch so a single unfetchable book cannot abort a scan — and both
+    `DeviceBusy` and `CalibreError` are `RuntimeError`, so Calibre's GUI being opened
+    mid-run means NO local copy lands for ANY book in the batch. Every one of them then
+    read as "carries no id", which is indistinguishable from absent: the next
+    `add --batch`/`sync` copies the whole library a second time, and the id cache
+    served that answer forever because its key (size|mtime) never changes.
+    """
+    root = tmp_path / "media"
+    backend = _FakeMtpBackend(
+        {
+            "documents/en/One.azw3": _mobi_bytes(book_id="DEVICEONE0000001", language="en"),
+            "documents/en/Two.azw3": _mobi_bytes(book_id="DEVICETWO0000001", language="en"),
+        }
+    )
+
+    # The mandatory backup pulls the whole device first and must succeed, so this is
+    # Calibre being opened DURING the run — the moment `_preflight` starts refusing,
+    # which is every invocation after the backup's own.
+    real_read_many = backend.read_many
+
+    def calibre_grabs_the_device_mid_run(items):
+        if backend.read_many_calls:
+            raise DeviceBusy("Calibre's GUI is running and an MTP device allows one holder")
+        return real_read_many(items)
+
+    backend.read_many = calibre_grabs_the_device_mid_run
+
+    source = _plant_source(
+        tmp_path / "books",
+        "Brand New.azw3",
+        book_id="BRANDNEW00000001",
+        title="Brand New",
+        author="A",
+        language="en",
+    )
+    _plant_cover(root, "BRANDNEW00000001", ffmpeg_path)
+
+    exit_code = kindle_cli.run_add(
+        _add_args(root, str(source)),
+        device_finder=lambda: _mtp_device(),
+        backend_factory=lambda d, *, cache_dir: backend,
+    )
+    assert exit_code == EXIT_OK
+
+    events = _events(capsys)
+    assert events[-1]["data"]["device_books_unreadable"] == 2
+    warned = [
+        e["message"] for e in events if e["type"] == "warning" and e["code"] == "book_id_unreadable"
+    ]
+    assert warned and "2 book(s)" in warned[0] and "One.azw3" in warned[0]
+
+    # Not one of them was written to the index, so the next run asks again rather than
+    # being told forever that the whole library carries no ids.
+    index = json.loads(
+        (root / "_kindle" / "MTPTESTSERIAL01" / ".cache" / "book-ids.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "documents/en/One.azw3" not in index
+    assert "documents/en/Two.azw3" not in index
+
+
 def test_add_over_mtp_reads_each_device_book_once_not_once_per_run(tmp_path, capsys, ffmpeg_path):
     """`exth.read_records` needs a book's header but reads the WHOLE file to reach it,
     so collecting the device's ids the naive way re-fetches the entire library over MTP
@@ -1755,32 +1824,40 @@ def test_a_genuinely_corrupt_device_book_is_id_less_not_an_abort(
     assert _events(capsys)[-1]["data"]["device_books_unreadable"] == 0
 
 
-def test_a_device_book_whose_read_raises_is_counted_warned_about_and_never_cached(
-    fake_kindle, tmp_path, capsys, monkeypatch, ffmpeg_path
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="a chmod 0 file is still readable by root",
+)
+def test_a_device_book_whose_read_FAILS_is_counted_warned_about_and_never_cached(
+    fake_kindle, tmp_path, capsys, ffmpeg_path
 ):
-    """`exth.read_records` absorbs its own parse failures, so what this guards is the
-    narrow set it does NOT: an `OSError` reaching it, a `ValueError` from a path with
-    an embedded NUL, a `MemoryError`. Such a read must (a) not abort the run, (b) not
-    be cached as "this book has no id" — the index key is size+mtime and a device file
-    does not change, so the wrong answer would be served forever — and (c) be visible,
-    because a book that looks id-less looks ABSENT, which is how a systemic failure
-    silently writes a whole library twice."""
-    (fake_kindle.mount / "documents" / "en" / "Unreadable.azw3").write_bytes(
+    """A read the host refuses must (a) not abort the run, (b) not be cached as "this
+    book has no id" — the index key is size+mtime and a device file does not change, so
+    the wrong answer would be served forever — and (c) be visible, because a book that
+    looks id-less looks ABSENT, which is how a systemic failure silently writes a whole
+    library a second time.
+
+    The failure here is a REAL one: a book on the device whose bytes this process is
+    not allowed to read. The previous version of this test monkeypatched
+    `exth.read_records` to raise `OSError` — which the real function catches itself and
+    answers `{}` to, so the guard was only ever exercised by an exception the
+    production path could not produce.
+
+    Getting there needs the shape the defect actually has on mass storage: the
+    mandatory backup runs FIRST and copies anything it has not seen before, so a book
+    that is unreadable from the start fails the backup instead (correctly — exit 3,
+    nothing attempted). What reaches `_device_book_ids` is a book the snapshot already
+    holds, which this run therefore hard-links without reading, whose id is not in the
+    host-side index — the documented state after clearing `.cache/`, and the state any
+    run whose index write was refused leaves behind.
+    """
+    unreadable = fake_kindle.mount / "documents" / "en" / "Unreadable.azw3"
+    unreadable.write_bytes(
         _mobi_bytes(book_id="UNREADABLE000001", title="Unreadable", language="en")
     )
-    real_read_records = kindle_cli.exth.read_records
-    calls: list[str] = []
-
-    def exploding_read_records(path):
-        if Path(path).name == "Unreadable.azw3":
-            calls.append(str(path))
-            raise OSError(5, "Input/output error")
-        return real_read_records(path)
-
-    monkeypatch.setattr(kindle_cli.exth, "read_records", exploding_read_records)
 
     root = tmp_path / "media"
-    source = _plant_source(
+    first_source = _plant_source(
         tmp_path / "books",
         "Fine Book.azw3",
         book_id="FINEBOOK00000001",
@@ -1789,19 +1866,43 @@ def test_a_device_book_whose_read_raises_is_counted_warned_about_and_never_cache
         language="en",
     )
     _plant_cover(root, "FINEBOOK00000001", ffmpeg_path)
-
     assert (
         kindle_cli.run_add(
-            _add_args(root, str(source)),
+            _add_args(root, str(first_source)),
             device_finder=lambda: fake_kindle,
             backend_factory=_mass_storage_factory,
         )
         == EXIT_OK
     )
-    # The stub really was reached — without this the test would pass even if the
-    # monkeypatch never applied.
-    assert calls, "the exploding read was never called"
-    assert (fake_kindle.mount / "documents" / "en" / "Fine Book.azw3").is_file()
+    capsys.readouterr()
+
+    index_path = root / "_kindle" / fake_kindle.serial / ".cache" / "book-ids.json"
+    index_path.unlink()
+
+    second_source = _plant_source(
+        tmp_path / "books",
+        "Another Book.azw3",
+        book_id="ANOTHERBOOK00001",
+        title="Another",
+        author="A",
+        language="en",
+    )
+    _plant_cover(root, "ANOTHERBOOK00001", ffmpeg_path)
+
+    unreadable.chmod(0o000)
+    try:
+        assert (
+            kindle_cli.run_add(
+                _add_args(root, str(second_source)),
+                device_finder=lambda: fake_kindle,
+                backend_factory=_mass_storage_factory,
+            )
+            == EXIT_OK
+        )
+    finally:
+        unreadable.chmod(0o644)
+
+    assert (fake_kindle.mount / "documents" / "en" / "Another Book.azw3").is_file()
 
     events = _events(capsys)
     assert events[-1]["data"]["device_books_unreadable"] == 1
@@ -1815,18 +1916,14 @@ def test_a_device_book_whose_read_raises_is_counted_warned_about_and_never_cache
 
     # Nothing about that book was written to the id cache, so a later run (with the
     # cause gone) reads it again instead of serving the wrong answer forever.
-    index = json.loads(
-        (root / "_kindle" / fake_kindle.serial / ".cache" / "book-ids.json").read_text(
-            encoding="utf-8"
-        )
-    )
+    index = json.loads(index_path.read_text(encoding="utf-8"))
     assert "documents/en/Unreadable.azw3" not in index
+    assert index["documents/en/Fine Book.azw3"]["book_id"] == "FINEBOOK00000001"
     capsys.readouterr()
 
-    monkeypatch.undo()
     assert (
         kindle_cli.run_add(
-            _add_args(root, str(source)),
+            _add_args(root, str(second_source)),
             device_finder=lambda: fake_kindle,
             backend_factory=_mass_storage_factory,
         )
@@ -1834,11 +1931,7 @@ def test_a_device_book_whose_read_raises_is_counted_warned_about_and_never_cache
     )
     second = _events(capsys)[-1]
     assert second["data"]["device_books_unreadable"] == 0
-    index = json.loads(
-        (root / "_kindle" / fake_kindle.serial / ".cache" / "book-ids.json").read_text(
-            encoding="utf-8"
-        )
-    )
+    index = json.loads(index_path.read_text(encoding="utf-8"))
     assert index["documents/en/Unreadable.azw3"]["book_id"] == "UNREADABLE000001"
 
 
@@ -1903,16 +1996,20 @@ def test_a_source_whose_records_cannot_be_read_is_added_as_an_id_less_book(
         books, "Good.azw3", book_id="GOODBOOK00000001", title="Good", author="B", language="en"
     )
 
-    real_read_records = kindle_cli.exth.read_records
+    real_read_bytes = Path.read_bytes
     calls: list[str] = []
 
-    def exploding_read_records(path):
-        if Path(path).name == "Bad.azw3":
-            calls.append(str(path))
-            raise OSError(5, "Input/output error")
-        return real_read_records(path)
+    # `MemoryError` from the READ, not `OSError` from the parser: `read_records`
+    # absorbs `OSError` itself, so a stub raising one exercised a path the real
+    # function cannot produce. The whole file IS read to reach a header in its first
+    # hundred bytes, which is where a real `MemoryError` comes from.
+    def out_of_memory(self):
+        if self.name == "Bad.azw3":
+            calls.append(str(self))
+            raise MemoryError("cannot allocate")
+        return real_read_bytes(self)
 
-    monkeypatch.setattr(kindle_cli.exth, "read_records", exploding_read_records)
+    monkeypatch.setattr(Path, "read_bytes", out_of_memory)
     exit_code = kindle_cli.run_add(
         _add_args(root, str(bad), str(good)),
         device_finder=lambda: fake_kindle,

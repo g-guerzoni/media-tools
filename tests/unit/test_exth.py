@@ -62,6 +62,23 @@ def test_read_records_or_none_answers_none_for_a_path_open_itself_refuses():
     assert exth.read_records_safe(Path("no\0pe")) == {}
 
 
+def test_read_records_or_none_answers_none_for_a_file_it_cannot_OPEN(tmp_path):
+    """The `OSError` arm, which was live all along and answered WRONGLY. `read_records`
+    absorbs that error into `{}` itself, so a wrapper that merely delegated to it could
+    never tell a file it could not open from one that parsed as carrying no records.
+    `kindle.cli._book_id_of` is built on exactly that distinction: it must not CACHE a
+    failure as if it were an answer, under a key (size|mtime) a device file never
+    changes."""
+    missing = tmp_path / "never-fetched.azw3"
+    assert exth.read_records(missing) == {}, "read_records keeps its own contract"
+    assert exth.read_records_or_none(missing) is None
+    assert exth.read_records_safe(missing) == {}
+
+    directory = tmp_path / "a-directory.azw3"
+    directory.mkdir()
+    assert exth.read_records_or_none(directory) is None
+
+
 def test_read_records_or_none_answers_none_for_a_memory_error(monkeypatch):
     """The other live arm. `MemoryError` cannot be provoked deterministically, so this
     one IS a stub — of the whole-file read `read_records` performs to reach a header in
@@ -79,12 +96,12 @@ def test_a_bug_in_this_module_is_not_disguised_as_a_book_with_no_records(monkeyp
     a future refactor here is this project's own bug, and the convention is that those
     escape as an honest `internal_error` rather than reading as an unparseable book."""
 
-    def refactored_away(path):
-        raise AttributeError("read_records no longer has that attribute")
+    def refactored_away(data):
+        raise AttributeError("_records_from no longer has that attribute")
 
-    monkeypatch.setattr(exth, "read_records", refactored_away)
+    monkeypatch.setattr(exth, "_records_from", refactored_away)
     with pytest.raises(AttributeError):
-        exth.read_records_or_none(Path("anything.azw3"))
+        exth.read_records_or_none(Path(__file__))
 
 
 def test_a_malformed_mobi_still_reads_as_empty_rather_than_as_a_failure(tmp_path):
