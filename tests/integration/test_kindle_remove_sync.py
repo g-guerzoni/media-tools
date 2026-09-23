@@ -11,6 +11,7 @@ are never removed, and a journalled removal can be undone.
 from __future__ import annotations
 
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -503,6 +504,40 @@ def test_a_match_that_would_hit_a_purchased_kfx_is_refused(fake_kindle, tmp_path
     assert (mount / KFX_SDR / "assets" / "resource.res").is_file()
     result = events[-1]
     assert result["data"]["removed"] == []
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="a chmod 0 directory is still readable by root",
+)
+def test_a_purchased_kfx_whose_assets_cannot_be_LISTED_is_never_deleted(
+    fake_kindle, tmp_path, capsys
+):
+    """`_protection_refusal`'s KFX rule is a question asked of the LISTING: is there an
+    `assets/` marker beside this book? A `.sdr` folder this process cannot open used to
+    drop out of the walk silently, so the marker was simply absent — and "absent" reads
+    as "sideloaded, delete away" for exactly the books that rule exists to protect.
+
+    The listing now refuses to answer at all, which stops the run before the mandatory
+    backup even completes: nothing is attempted, and the purchase is still there."""
+    device = prepare_device(fake_kindle, purchased=True)
+    mount = device.mount
+    (mount / KFX_SDR).chmod(0o000)
+    try:
+        exit_code = kindle_cli.run_remove(
+            _remove_args(tmp_path / "media", KFX_PATH, "--yes"),
+            device_finder=lambda: device,
+            backend_factory=_mass_storage_factory,
+        )
+    finally:
+        (mount / KFX_SDR).chmod(0o755)
+
+    assert exit_code == EXIT_DEPENDENCY
+    assert (mount / KFX_PATH).is_file()
+    assert (mount / KFX_SDR / "assets" / "resource.res").is_file()
+    events = _events(capsys)
+    assert any(e["type"] == "error" for e in events)
+    assert events[-1]["data"].get("removed", []) == []
 
 
 def test_a_sidecar_two_books_share_is_kept_for_the_one_that_stays(fake_kindle, tmp_path, capsys):

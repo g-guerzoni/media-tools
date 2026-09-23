@@ -68,9 +68,11 @@ class DeviceBackend(Protocol):
     - **Paths** are device-relative and POSIX-style, never absolute host paths.
     - **`list_files(prefix)`** returns FILES only, never directories, depth-first with
       each directory's entries in name order. A prefix that is not on the device — or
-      one inside the excluded areas below — returns `[]` rather than raising. **The
-      DEVICE being unreachable is not that case and raises**: a mass-storage mount that
-      is no longer a directory, or an MTP listing the helper could not complete. An
+      one inside the excluded areas below — returns `[]` rather than raising. **A
+      listing that could not be COMPLETED is not that case and raises**: a mass-storage
+      mount that is no longer a directory, any directory under it that the walk cannot
+      open (a permissions change, an I/O error), or an MTP listing the helper could not
+      complete. An
       empty list therefore always means "nothing is there", never "I could not look",
       which is what lets a backup treat a listing failure as a failure instead of
       writing an empty snapshot and calling it a success. **The exception TYPE is

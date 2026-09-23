@@ -8,9 +8,10 @@ sitting at its final name — on the device or on the host — and any failure a
 either staged copy, including a `KeyboardInterrupt`, must leave no `.partial` file
 behind either. `list_files` AND `exists` both refuse to answer at all once the
 device is gone — a missing directory, or a mountpoint whose `st_dev` no longer matches
-the one recorded at construction — because an empty listing (or a bare `False` from
-`exists`) must mean "nothing is there", never "I could not look": a caller verifying a
-just-written file needs to tell "verified absent" from "the device vanished
+the one recorded at construction — and `list_files` refuses just as flatly for a
+directory it cannot READ, rather than walking past it, because an empty listing (or a
+bare `False` from `exists`) must mean "nothing is there", never "I could not look":
+a caller verifying a just-written file needs to tell "verified absent" from "the device vanished
 mid-check" apart, and a `Path.is_file()` that silently swallows the `OSError` an
 unmounted volume raises cannot make that distinction on its own. It skips the
 macOS/Linux volume litter every removable disk accumulates, never descends into
@@ -104,11 +105,23 @@ class MassStorageBackend:
         return list(self._walk(start))
 
     def _walk(self, directory: Path):
-        try:
-            with os.scandir(directory) as it:
-                entries = sorted(it, key=lambda entry: entry.name)
-        except OSError:
-            return
+        """Every file under `directory`, depth-first, name-ordered — and NOTHING is
+        swallowed on the way.
+
+        `os.scandir` raises for a directory this process cannot open (a permissions
+        change, an I/O error, a volume pulled mid-walk), and that used to be caught
+        here with a bare `return`. In a GENERATOR a bare return ends the listing, so
+        an unreadable directory contributed nothing and no exception reached anyone:
+        `list_files` answered short, and neither `backup._listing` nor
+        `_protection_refusal` could tell that walk from a complete one. The same
+        failure one line further down — `entry.stat()`, which was never inside that
+        handler — already raised, so the function disagreed with itself.
+
+        Letting it out is what makes this module's own promise true: an empty listing
+        means "nothing is there", never "I could not look" (`backend.DeviceBackend`).
+        """
+        with os.scandir(directory) as it:
+            entries = sorted(it, key=lambda entry: entry.name)
         # `system/` holds device internals (Wi-Fi credentials, logs, settings) that
         # are none of this project's business — only its `thumbnails/` child is
         # ordinary cache data worth listing.

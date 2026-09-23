@@ -529,6 +529,35 @@ def test_a_failed_listing_aborts_the_backup_instead_of_writing_an_empty_snapshot
     assert not backups.exists() or list(backups.iterdir()) == []
 
 
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="a chmod 0 directory is still readable by root",
+)
+def test_a_mount_that_cannot_be_READ_aborts_the_backup_too(mass, kindle, tmp_path):
+    """The belt-and-braces guard behind `_listing` asks `free_space()` when a listing
+    comes back empty — but `free_space` is `shutil.disk_usage`, i.e. `statvfs`, which a
+    directory's permissions do not touch. So a mount this process cannot OPEN used to
+    produce a listing of `[]`, a device that cheerfully reported 20 GB free, and a
+    green snapshot holding zero bytes of the user's library. The guard could not see
+    it because the listing never admitted it had failed."""
+    root = tmp_path / "out"
+    kindle.mount.chmod(0o000)
+    try:
+        with pytest.raises(backup.BackupFailed):
+            backup.snapshot(mass, root=root, serial="S")
+    finally:
+        kindle.mount.chmod(0o755)
+
+    assert backup.latest(root, "S") is None
+    backups = backup.backup_root(root, "S") / "backups"
+    complete = (
+        []
+        if not backups.exists()
+        else [p for p in backups.iterdir() if p.is_dir() and not p.name.endswith(".partial")]
+    )
+    assert complete == []
+
+
 def test_a_failed_mtp_listing_aborts_the_backup(kindle, tmp_path):
     def failing(ops):
         return {

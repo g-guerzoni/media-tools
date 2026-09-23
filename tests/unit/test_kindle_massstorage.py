@@ -1,3 +1,4 @@
+import os
 import plistlib
 import subprocess
 from pathlib import Path
@@ -46,6 +47,53 @@ def test_an_unmounted_volume_is_not_a_kindle_with_nothing_on_it(fake_kindle, mon
         device.list_files()
     with pytest.raises(FileNotFoundError):
         device.list_files("documents")
+
+
+#: A directory chmod'd to 0 is still readable by root, so the two permission tests
+#: below would silently assert nothing in a container that runs as root.
+skip_as_root = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="a chmod 0 directory is still readable by root",
+)
+
+
+@skip_as_root
+def test_a_directory_that_cannot_be_read_raises_rather_than_listing_short(fake_kindle):
+    """The last hole in "an empty listing means nothing is there, never I could not
+    look": `_walk` used to swallow the `OSError` `os.scandir` raises for a directory
+    it cannot open, and — being a generator — its bare `return` ENDED the listing
+    there, silently. Nothing downstream could tell that walk from a complete one.
+
+    Note that `entry.stat()`, one line further in, was never inside that handler: the
+    same failure one line later already raised. This pins the whole function on the
+    raising side of that line.
+    """
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    assert device.list_files("documents"), "the device answers while everything is readable"
+
+    unreadable = fake_kindle.mount / "documents" / "pt"
+    unreadable.chmod(0o000)
+    try:
+        with pytest.raises(OSError):
+            device.list_files()
+        with pytest.raises(OSError):
+            device.list_files("documents")
+    finally:
+        unreadable.chmod(0o755)
+
+
+@skip_as_root
+def test_an_unreadable_mount_root_raises_rather_than_answering_empty(fake_kindle):
+    """The worst shape of the same defect: the mount itself is there and is a
+    directory (so neither of `list_files`' own guards fires) but cannot be opened, and
+    the walk answered `[]` — which `backup._listing` reads as a factory-reset Kindle."""
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    fake_kindle.mount.chmod(0o000)
+    try:
+        with pytest.raises(OSError):
+            device.list_files()
+    finally:
+        fake_kindle.mount.chmod(0o755)
 
 
 def test_read_leaves_nothing_behind_when_the_copy_dies_part_way(fake_kindle, tmp_path, monkeypatch):
