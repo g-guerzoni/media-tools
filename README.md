@@ -17,6 +17,7 @@ language-sorted, deduplicated library — see "Building an ebook library" below 
 git clone https://github.com/g-guerzoni/media-tools.git
 cd media-tools
 python3 -m venv .venv
+.venv/bin/pip install -U pip
 .venv/bin/pip install -e . --group dev
 .venv/bin/media-tools doctor
 ```
@@ -25,12 +26,19 @@ Any Python >= 3.11 works. On macOS, install one with Homebrew (`brew install pyt
 if the system Python is older; no particular minor version is required, and this file
 deliberately names none, because a pinned one goes stale the moment Homebrew moves.
 
-`--group dev` needs pip >= 25.1. On an older pip, install the dev tools directly
-instead:
+The `pip install -U pip` line is not ceremony. `--group` is PEP 735 and needs
+pip >= 25.1, but a fresh venv inherits whatever pip the system Python bundles:
+Ubuntu 24.04 bundles 24.0, which rejects the flag with `no such option: --group`
+and nothing to suggest that pip itself is what is out of date. CI upgrades pip
+first for the same reason. Where you cannot upgrade pip, install the dev tools
+directly instead:
 
 ```bash
 .venv/bin/pip install -e . pytest ruff
 ```
+
+On Debian and Ubuntu the venv is not optional either: they mark the system Python
+externally managed (PEP 668), so `pip install` outside a venv refuses to run at all.
 
 ### pipx
 
