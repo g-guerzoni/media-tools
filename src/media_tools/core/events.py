@@ -50,6 +50,7 @@ ERROR_CODES = frozenset(
         "config_missing",
         "device_not_found",
         "device_busy",
+        "device_write_protected",
         "backup_failed",
         "interrupted",
         "output_not_writable",

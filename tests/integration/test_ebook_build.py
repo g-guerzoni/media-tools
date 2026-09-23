@@ -693,3 +693,103 @@ def test_a_kept_file_that_keeps_failing_repair_is_reported_with_its_real_path(
     assert target.is_file()
     unchanged = calibre.read_metadata(target, cache_dir=tmp_path / "verify-cache-2")
     assert unchanged.title == "Stranded Old Title"
+
+
+# -- RB24: a non-CalibreError from update_metadata must fail only that book ---------
+
+
+def test_a_non_calibre_error_during_repair_fails_only_that_book(
+    make_epub, tmp_path, monkeypatch, capsys
+):
+    """Both `update_metadata` call sites in `build.py` (the rename rewrite in
+    `_plan_and_reconcile`, and the self-heal repair in `_finalize_group`) used to
+    catch `calibre.CalibreError` only — an `OSError` from `ebook-meta` (a full
+    disk, a read-only mount) escaped both handlers and killed the whole batch,
+    contradicting the guarantee every other stage keeps (C2 already fixed the same
+    class of bug for `ebook-convert` itself). Four books; only one is stranded
+    with a stale title and its repair forced to raise `OSError` — the other three
+    must still complete, and the run must still end with a `result`."""
+    from media_tools.cli import build_parser
+    from media_tools.tasks.ebook import build as build_mod
+
+    titles = ["Alpha", "Beta", "Gamma", "Delta"]
+    books_dir = None
+    for title in titles:
+        book = make_epub(title=title, author="Author", language="en", name=f"{title} - Author")
+        books_dir = book.parent
+
+    out = tmp_path / "media"
+    _cli(
+        "ebook",
+        "build",
+        str(books_dir),
+        "--no-llm",
+        "-o",
+        str(out),
+        "-b",
+        "rb24",
+        "--no-cover-fetch",
+    )
+    beta_target = out / "rb24" / "en" / "Beta - Author.azw3"
+    assert beta_target.is_file()
+
+    # Strand Beta the same way the RB23 tests do: correct path, stale title.
+    calibre.update_metadata(
+        beta_target,
+        title="Stranded Beta",
+        author="Author",
+        language="en",
+        cache_dir=tmp_path / "strand-cache",
+    )
+
+    real_update_metadata = calibre.update_metadata
+
+    def flaky_update_metadata(path, **kwargs):
+        if "Beta" in str(path):
+            raise OSError(28, "No space left on device")
+        return real_update_metadata(path, **kwargs)
+
+    monkeypatch.setattr(build_mod.calibre, "update_metadata", flaky_update_metadata)
+
+    args = build_parser().parse_args(
+        [
+            "ebook",
+            "build",
+            str(books_dir),
+            "--no-llm",
+            "-o",
+            str(out),
+            "-b",
+            "rb24",
+            "--no-cover-fetch",
+            "--json",
+        ]
+    )
+    exit_code = build_mod.run(args)
+    assert exit_code == 1  # one item failed; the batch itself still finishes cleanly
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert events[-1]["type"] == "result"
+    items = [e for e in events if e["type"] == "item"]
+    assert len(items) == 4
+
+    def title_of(item):
+        return Path(item["input"]).stem.split(" - ")[0]
+
+    statuses = {title_of(i): i["status"] for i in items}
+    assert statuses["Beta"] == "failed"
+    for title in ("Alpha", "Gamma", "Delta"):
+        assert statuses[title] == "skipped"
+
+    run_data = json.loads((out / "rb24" / "run.json").read_text())
+    assert run_data["status"] == "failed"
+    assert all(i["status"] != "pending" for i in run_data["items"])
+    beta_item = next(i for i in run_data["items"] if "Beta" in i["input"])
+    assert beta_item["reason"] == "engine_error"
+    assert "OSError" in beta_item["data"]["error"]
+    assert "No space left" in beta_item["data"]["error"]
+
+    # the file was neither moved nor corrupted by the failed repair attempt.
+    assert beta_target.is_file()
+    unchanged = calibre.read_metadata(beta_target, cache_dir=tmp_path / "verify-cache-rb24")
+    assert unchanged.title == "Stranded Beta"

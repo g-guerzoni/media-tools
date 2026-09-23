@@ -882,8 +882,14 @@ def _plan_and_reconcile(plan: _Plan, *, batch_dir: Path, to: str, force: bool, c
                 language=verdict.language,
                 cache_dir=cache_dir,
             )
-        except calibre.CalibreError as error:
-            rename_errors[source] = str(error)
+        except Exception as error:
+            # RB24: a plain `calibre.CalibreError` catch here let anything else
+            # (an OSError from a full disk or a read-only mount) escape straight
+            # past this per-book hook and take the whole batch down with it — the
+            # same defect class C2 already fixed for `_convert_one`. Widened to
+            # `Exception` so this book is recorded as failed and the rest of the
+            # batch still runs.
+            rename_errors[source] = f"{type(error).__name__}: {error}"
             return False
         return True
 
@@ -1002,9 +1008,13 @@ def _finalize_group(
                     language=verdict.language,
                     cache_dir=cache_dir,
                 )
-            except calibre.CalibreError as error:
+            except Exception as error:
+                # RB24: same widening as `_rewrite_before_rename` above — this
+                # self-heal rewrite used to catch `calibre.CalibreError` only, so
+                # an OSError here still killed the whole batch instead of failing
+                # just this one book.
                 data = _item_data(group, plan, reaches_covers=reaches_covers, output=target)
-                data["error"] = str(error)
+                data["error"] = f"{type(error).__name__}: {error}"
                 return {
                     "status": "failed",
                     "reason": "engine_error",
