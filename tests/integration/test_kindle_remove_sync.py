@@ -679,6 +679,84 @@ def test_a_failed_mandatory_backup_aborts_the_remove_and_deletes_nothing(
     assert backup_module.journal_read(root, device.serial) == []
 
 
+def test_a_failed_mandatory_backup_aborts_the_sync_and_changes_nothing(
+    fake_kindle, tmp_path, capsys
+):
+    """`backup_failed` was pinned for `backup`, `thumbnails`, `add` and `remove` — but
+    not for the two commands with the largest blast radius. `sync` writes AND deletes
+    in one run, so a snapshot that was never taken is the precondition that matters
+    most here."""
+    device = prepare_device(fake_kindle)
+    root = tmp_path / "media"
+    mount = device.mount
+
+    new_book = tmp_path / "library" / "A Brand New Book.azw3"
+    new_book.parent.mkdir(parents=True)
+    new_book.write_bytes(
+        mobi_bytes(book_id=NEW_ID, title="A Brand New Book", author="An Author", language="en")
+    )
+    plant_library_batch(root, "library", [(NEW_ID, new_book, "en")])
+
+    exit_code = kindle_cli.run_sync(
+        _sync_args(root, "--batch", "library", "--delete-extras", "--yes"),
+        device_finder=lambda: device,
+        backend_factory=lambda d, *, cache_dir: _BrokenListingBackend(d.mount),
+    )
+    assert exit_code == EXIT_DEPENDENCY
+
+    events = _events(capsys)
+    results = [e for e in events if e["type"] == "result"]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert results[0]["counts"] == {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0}
+    assert any(e["code"] == "backup_failed" for e in events if e["type"] == "error")
+    assert [e for e in events if e["type"] == "item"] == []
+
+    # Neither half ran: nothing added, nothing deleted, nothing journalled.
+    assert not (mount / "documents" / "en" / "A Brand New Book.azw3").exists()
+    assert (mount / EN_PATH).is_file()
+    assert (mount / PT_PATH).is_file()
+    assert backup_module.journal_read(root, device.serial) == []
+
+
+def test_a_failed_mandatory_backup_aborts_the_restore_and_writes_nothing(
+    fake_kindle, tmp_path, capsys
+):
+    """The other unpinned one, and the one a user reaches while already recovering:
+    `restore --yes` overwrites files they still have, so the snapshot taken first is
+    the only thing standing behind that."""
+    device = prepare_device(fake_kindle)
+    root = tmp_path / "media"
+    mount = device.mount
+
+    kindle_cli.run_remove(
+        _remove_args(root, "--match", EN_AUTHOR, "--yes"),
+        device_finder=lambda: device,
+        backend_factory=_mass_storage_factory,
+    )
+    operation_id = _events(capsys)[-1]["data"]["operation"]
+    journalled_before = len(backup_module.journal_read(root, device.serial))
+
+    exit_code = kindle_cli.run_restore(
+        _restore_args(root, "--op", operation_id, "--yes"),
+        device_finder=lambda: device,
+        backend_factory=lambda d, *, cache_dir: _BrokenListingBackend(d.mount),
+    )
+    assert exit_code == EXIT_DEPENDENCY
+
+    events = _events(capsys)
+    results = [e for e in events if e["type"] == "result"]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert results[0]["counts"] == {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0}
+    assert any(e["code"] == "backup_failed" for e in events if e["type"] == "error")
+    assert [e for e in events if e["type"] == "item"] == []
+
+    # Nothing was put back, and the run recorded no operation of its own.
+    assert not (mount / EN_PATH).exists()
+    assert len(backup_module.journal_read(root, device.serial)) == journalled_before
+
+
 # --- sync ------------------------------------------------------------------------------------
 
 
