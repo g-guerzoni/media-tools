@@ -118,9 +118,16 @@ def prepare_device(fake_kindle, *, purchased: bool = False, mode: str = "mass_st
     )
 
 
-def plant_library_batch(root: Path, name: str, books: list[tuple[str, Path | str, str]]) -> None:
+def plant_library_batch(
+    root: Path, name: str, books: list[tuple[str, Path | str, str]], *, status: str = "done"
+) -> None:
     """A minimal `ebook build` batch `run.json`: `(book id, output path, language)`
-    per surviving item, which is all `--batch`/`--compare` ever read back out of one."""
+    per surviving item, which is all `--batch`/`--compare` ever read back out of one.
+
+    `status` is what `ebook build` recorded for those items. `"done"` is a book it
+    converted this run; `"skipped"` (with `reason: "exists"`) is one it did not have to
+    — the ordinary shape of nearly every item of a SECOND build of the same batch, and
+    a book the library still has."""
     batch_dir = root / name
     batch_dir.mkdir(parents=True, exist_ok=True)
     (batch_dir / "run.json").write_text(
@@ -130,7 +137,8 @@ def plant_library_batch(root: Path, name: str, books: list[tuple[str, Path | str
                 "items": [
                     {
                         "id": index,
-                        "status": "done",
+                        "status": status,
+                        "reason": "exists" if status == "skipped" else None,
                         "data": {"book_id": book_id, "language": language, "output": str(output)},
                     }
                     for index, (book_id, output, language) in enumerate(books, start=1)
@@ -1237,7 +1245,7 @@ def test_delete_extras_is_refused_for_a_batch_that_never_finished(fake_kindle, t
         encoding="utf-8",
     )
 
-    with pytest.raises(UsageError):
+    with pytest.raises(UsageError, match="1 item"):
         kindle_cli.run_sync(
             _sync_args(root, "--batch", "library", "--delete-extras", "--yes"),
             device_finder=lambda: fake_kindle,
@@ -1373,3 +1381,144 @@ def test_sync_keeps_a_thumbnail_another_surviving_book_still_uses(fake_kindle, t
     )
     assert row["kept"] == [f"system/thumbnails/thumbnail_{shared_id}_EBOK_portrait.jpg"]
     assert row["shared_with"] == ["Books/Novel.azw3"]
+
+
+# --- a second build's own batch, and the other sidecar owners -----------------------------
+
+
+class _VanishedBookBackend:
+    """The book is gone between the listing and the delete — and only the book: its
+    sidecar and its thumbnail are still there, orphaned."""
+
+    def __init__(self, mount: Path, *, vanished: str) -> None:
+        self._inner = massstorage.MassStorageBackend(mount)
+        self._vanished = vanished
+
+    def list_files(self, prefix: str = ""):
+        return self._inner.list_files(prefix)
+
+    def read(self, path: str, dest: Path) -> None:
+        self._inner.read(path, dest)
+
+    def read_many(self, items) -> None:
+        self._inner.read_many(items)
+
+    def write(self, local: Path, path: str) -> None:
+        self._inner.write(local, path)
+
+    def remove(self, path: str) -> None:
+        if path == self._vanished:
+            raise FileNotFoundError(f"{path} is not on the device (simulated)")
+        self._inner.remove(path)
+
+    def exists(self, path: str) -> bool:
+        return self._inner.exists(path)
+
+    def free_space(self) -> int:
+        return self._inner.free_space()
+
+    def eject(self) -> None:
+        self._inner.eject()
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def test_a_second_builds_skipped_items_are_still_the_library(fake_kindle, tmp_path, capsys):
+    """The defect this closes: `ebook build` records `skipped`/`exists` for every book
+    it did not have to reconvert, which on a re-build is nearly all of them. Reading
+    only `done` items would empty the library's ids and make the device's copy of an
+    unchanged library one big pile of extras."""
+    device = prepare_device(fake_kindle)
+    root = tmp_path / "media"
+    new_book = tmp_path / "library" / "A Brand New Book.azw3"
+    new_book.parent.mkdir(parents=True)
+    new_book.write_bytes(mobi_bytes(book_id=NEW_ID, title="A Brand New Book", language="en"))
+    # Exactly what a second build of this batch writes: nothing was reconverted.
+    plant_library_batch(
+        root,
+        "library",
+        [(NEW_ID, new_book, "en"), (EN_ID, new_book, "en"), (PT_ID, new_book, "pt")],
+        status="skipped",
+    )
+
+    exit_code = kindle_cli.run_sync(
+        _sync_args(root, "--batch", "library", "--delete-extras", "--yes"),
+        device_finder=lambda: device,
+        backend_factory=_mass_storage_factory,
+    )
+    assert exit_code == EXIT_OK
+
+    # Both device books are in that library, so neither is an extra...
+    assert (device.mount / EN_PATH).is_file()
+    assert (device.mount / PT_PATH).is_file()
+    result = _events(capsys)[-1]
+    assert result["data"]["extras"] == []
+    assert result["data"]["removed"] == []
+    # ...and the one book the device lacks is still added from the same batch.
+    assert (device.mount / "documents" / "en" / "A Brand New Book.azw3").is_file()
+
+
+def test_a_surviving_pdf_keeps_the_sidecar_it_shares_with_a_removed_book(
+    fake_kindle, tmp_path, capsys
+):
+    """A `.pdf` owns a `.sdr` exactly as an `.azw3` does, whether or not this project
+    can read its metadata."""
+    device = prepare_device(fake_kindle)
+    mount = device.mount
+    pdf = mount / "documents" / "en" / "A Book - An Author.pdf"
+    pdf.write_bytes(b"%PDF-1.4 not really a pdf")
+
+    args = _remove_args(tmp_path / "media", EN_PATH, "--yes")
+    assert (
+        kindle_cli.run_remove(
+            args, device_finder=lambda: device, backend_factory=_mass_storage_factory
+        )
+        == EXIT_OK
+    )
+
+    assert not (mount / EN_PATH).exists()
+    assert pdf.is_file()
+    assert (mount / EN_SDR / "position.mbp").is_file()
+    book = _events(capsys)[-1]["data"]["books"][0]
+    assert book["kept"] == [f"{EN_SDR}/position.mbp"]
+    assert book["shared_with"] == ["documents/en/A Book - An Author.pdf"]
+
+
+def test_asin_for_a_book_outside_the_backed_up_area_says_why(fake_kindle, tmp_path, capsys):
+    """An identity selector names ONE book, so it earns the refusal and its reason —
+    unlike `--match`, which is a net and simply does not reach there."""
+    device = prepare_device(fake_kindle)
+    outside = device.mount / "Books" / "Novel.azw3"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(mobi_bytes(book_id="OUTSIDEBOOK00001", title="Novel"))
+
+    exit_code = kindle_cli.run_remove(
+        _remove_args(tmp_path / "media", "--asin", "OUTSIDEBOOK00001", "--yes"),
+        device_finder=lambda: device,
+        backend_factory=_mass_storage_factory,
+    )
+    assert exit_code == EXIT_FAILED
+    item = next(e for e in _events(capsys) if e["type"] == "item")
+    assert item["input"] == "Books/Novel.azw3"
+    assert item["detail"].startswith(f"{kindle_cli.DETAIL_PROTECTED}: ")
+    assert outside.is_file()
+
+
+def test_a_book_that_vanished_still_has_its_orphans_cleaned_up(fake_kindle, tmp_path, capsys):
+    device = prepare_device(fake_kindle)
+    mount = device.mount
+
+    exit_code = kindle_cli.run_remove(
+        _remove_args(tmp_path / "media", "--match", EN_AUTHOR, "--yes"),
+        device_finder=lambda: device,
+        backend_factory=lambda d, *, cache_dir: _VanishedBookBackend(d.mount, vanished=EN_PATH),
+    )
+    assert exit_code == EXIT_OK
+
+    item = next(e for e in _events(capsys) if e["type"] == "item")
+    assert item["status"] == "skipped"
+    assert item["reason"] == "source_missing"
+    # The book was already gone; its sidecar and cover were not, and they were its.
+    assert not (mount / EN_SDR).exists()
+    assert not (mount / "system" / "thumbnails" / f"thumbnail_{EN_ID}_EBOK_portrait.jpg").exists()

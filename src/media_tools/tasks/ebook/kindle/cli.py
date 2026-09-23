@@ -150,6 +150,13 @@ BOOK_SUFFIXES = frozenset({".azw", ".azw3", ".azw8", ".kfx", ".mobi", ".prc", ".
 # recognised as already on the device and always reports `book_id_missing` — see
 # `run_add`'s own docstring.
 ADDABLE_SUFFIXES = BOOK_SUFFIXES | {".epub", ".pdf"}
+# What can OWN a `.sdr` sidecar on the device: everything a Kindle opens, not just the
+# formats whose EXTH records this project can parse. The device pairs a document with
+# its reading position by stem, and it does that for a `.pdf` or a `.txt` exactly as it
+# does for an `.azw3` — so a `Book.pdf` sitting beside a `Book.azw3` being removed is a
+# surviving owner of `Book.sdr/`, and deciding otherwise silently costs it its reading
+# position (`_books_sharing_sidecar`).
+SIDECAR_OWNER_SUFFIXES = ADDABLE_SUFFIXES | {".txt"}
 _CACHE_INDEX_NAME = "index.json"
 
 DOCUMENTS_DIR = "documents"
@@ -180,6 +187,14 @@ _LANGUAGE_CODE = re.compile(r"[a-z]{2,3}")
 # pass over the library — off USB, or over MTP into the header cache — every time a
 # single book is added. Scanning a library is `scan`'s job, not `add`'s.
 _BOOK_ID_INDEX_NAME = "book-ids.json"
+
+# Which `ebook build` item statuses describe a book that IS in the library. `done` is
+# one this run converted; `skipped` is one it did not have to (`reason: "exists"` —
+# already at its target, or renamed into place), which is the ordinary outcome for
+# nearly every book of a second build. Both carry the same `data.book_id` and
+# `data.output`; only reading the first is how `sync --delete-extras` would come to
+# treat an unchanged library as extras.
+LIBRARY_ITEM_STATUSES = frozenset({"done", "skipped"})
 
 # --- `detail`'s prefix vocabulary ---------------------------------------------------
 #
@@ -1107,11 +1122,14 @@ def _read_library_items(root: Path, batch_name: str, *, flag: str) -> list[dict]
 
 
 def _read_library_index(root: Path, batch_name: str) -> dict[str, dict]:
-    """book id -> {title, author, language, output} for every surviving (`status ==
-    "done"`) item in an `ebook build`/`ebook scan` batch's `run.json`."""
+    """book id -> {title, author, language, output} for every surviving item in an
+    `ebook build`/`ebook scan` batch's `run.json` — `done` or `skipped`, per
+    `LIBRARY_ITEM_STATUSES`: a book the build did not have to reconvert is still a
+    book the library has, and reading only `done` would make a second build's compare
+    report call almost the whole device `device_only`."""
     index: dict[str, dict] = {}
     for item in _read_library_items(root, batch_name, flag="--compare"):
-        if not isinstance(item, dict) or item.get("status") != "done":
+        if not isinstance(item, dict) or item.get("status") not in LIBRARY_ITEM_STATUSES:
             continue
         book_data = item.get("data") if isinstance(item.get("data"), dict) else {}
         book_id = book_data.get("book_id")
@@ -1838,8 +1856,16 @@ def _sources_from_paths(paths: list[Path]) -> list[_SourceBook]:
 
 def _library_batch(root: Path, batch: str, *, flag: str) -> tuple[list[_SourceBook], set[str], int]:
     """`(every book an `ebook build` run placed, every book id it recorded, how many
-    of its items are still pending or failed)`, from ONE read of that batch's
-    `run.json`.
+    of its items describe neither)`, from ONE read of that batch's `run.json`.
+
+    **A book in the library is one whose item is `done` OR `skipped`, never `done`
+    alone.** `ebook build` writes `skipped`/`exists` for every book it did not have to
+    reconvert (`build.py`'s `reused` branch) — which, on the second build of the same
+    batch, is nearly all of them — and those items carry exactly the same `data`, with
+    the same `book_id` and the same `output`, as the ones it converted this run. Taking
+    only `done` here would mean an ordinary re-build empties `ids`, so the device's
+    copies of an unchanged library match nothing, and `sync --delete-extras --yes`
+    deletes almost the whole thing. `LIBRARY_ITEM_STATUSES` is that rule, in one place.
 
     The SOURCES are filtered by `ADDABLE_SUFFIXES`, exactly as a FOLDER given on the
     command line is: a batch is a scan result, not a file the user pointed at, so an
@@ -1854,6 +1880,11 @@ def _library_batch(root: Path, batch: str, *, flag: str) -> tuple[list[_SourceBo
     only question — "does the library have this book at all" — and a library book
     whose output happens to be a format this tool would not ADD is still a book the
     library has, so deleting the device's copy of it would be wrong.
+
+    The THIRD value counts items that are NEITHER (`pending`, `failed`, anything a
+    future version invents): a batch holding any of them is not a complete statement
+    about the library, and `sync --delete-extras` refuses it rather than reading every
+    book behind them as "the library does not have this".
     """
     sources: list[_SourceBook] = []
     ids: set[str] = set()
@@ -1862,9 +1893,8 @@ def _library_batch(root: Path, batch: str, *, flag: str) -> tuple[list[_SourceBo
     for item in _read_library_items(root, batch, flag=flag):
         if not isinstance(item, dict):
             continue
-        if item.get("status") in ("pending", "failed"):
+        if item.get("status") not in LIBRARY_ITEM_STATUSES:
             unfinished += 1
-        if item.get("status") != "done":
             continue
         data = item.get("data") if isinstance(item.get("data"), dict) else {}
         book_id = data.get("book_id")
@@ -2983,8 +3013,10 @@ def _books_sharing_sidecar(book_path: str, all_paths: set[str], removing: set[st
     """Other books on the device that the firmware pairs with the SAME `.sdr` folder
     and that this run is NOT removing.
 
-    The device pairs a book with its sidecar by stem, so `Book.azw3` and `Book.mobi`
-    in one folder share `Book.sdr/` — and taking it with one of them would delete the
+    The device pairs a book with its sidecar by stem, so `Book.azw3` and `Book.mobi` —
+    or `Book.pdf`, or `Book.txt`, whether or not this project can read their metadata
+    (`SIDECAR_OWNER_SUFFIXES`, deliberately wider than `BOOK_SUFFIXES`) — in one folder
+    share `Book.sdr/` — and taking it with one of them would delete the
     reading position, highlights and page numbers of a book the user is KEEPING. That
     is the one case where a removal must leave the sidecar exactly where it is; it is
     reported as `kept` on the item rather than passed over in silence.
@@ -3003,7 +3035,7 @@ def _books_sharing_sidecar(book_path: str, all_paths: set[str], removing: set[st
         for path in all_paths
         if path.casefold() != book_path.casefold()
         and path.casefold() not in removing
-        and PurePosixPath(path).suffix.lower() in BOOK_SUFFIXES
+        and PurePosixPath(path).suffix.lower() in SIDECAR_OWNER_SUFFIXES
         and _sidecar_prefix(path) == prefix
     )
 
@@ -3264,12 +3296,15 @@ def _remove_one(
         )
         return
     except FileNotFoundError:
+        # Gone between the listing and now. The companions are NOT skipped with it:
+        # they are this book's sidecar and cover, and with the book itself absent they
+        # are exactly the orphans this command exists to clean up. Nothing is recorded
+        # as removed for the book — because nothing was.
         row.skip(
             "source_missing",
             DETAIL_SOURCE_MISSING,
             f"{row.device_path} is no longer on the device",
         )
-        return
     except (RuntimeError, OSError) as error:
         # Per book, never fatal to the run: a write-protected device, a yanked cable,
         # an MTP `CalibreError`. The books after this one still deserve their turn.
@@ -3279,17 +3314,21 @@ def _remove_one(
             f"the device refused the deletion: {error}",
         )
         return
-    row.removed.append(row.device_path)
+    else:
+        row.removed.append(row.device_path)
 
-    companions = row.companions
     still_there = [sibling.device_path for sibling in siblings if not sibling.is_off_the_device]
     if row.sidecar and still_there:
+        # The plan handed this row the shared sidecar because every book sharing it
+        # was going to go; one of them did not. `row.sidecar` is cleared rather than
+        # only filtered out of a local copy, so `would_remove` and `kept` cannot
+        # disagree about the same files afterwards.
         row.kept.extend(row.sidecar)
         row.shared_with.extend(still_there)
-        companions = [path for path in companions if path not in row.sidecar]
+        row.sidecar = []
         row.sidecar_dir = None
 
-    for companion in companions:
+    for companion in row.companions:
         try:
             _guarded_remove(backend, companion)
         except mtp.MtpPathNotInCachedTree:
@@ -3315,7 +3354,11 @@ def _remove_one(
 
     if row.not_removed:
         row.warnings.append(SIDECAR_NOT_REMOVED_WARNING)
-    row.succeed()
+    if row.status == "pending":
+        # ...and not over a `skip()` already recorded above: a book that was already
+        # gone stays `skipped`/`source_missing` even though its orphaned companions
+        # were cleaned up after it.
+        row.succeed()
 
 
 def _journal_remove(
@@ -3511,13 +3554,7 @@ def run_remove(
         sizes = {entry.path: entry.size for entry in entries}
         all_paths = set(sizes)
         books = [
-            entry
-            for entry in entries
-            if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
-            # Only what the mandatory backup holds is selectable at all, so a
-            # `--match` can never sweep in a book nothing could put back. A path
-            # NAMED explicitly still reaches `_protection_refusal`, which says why.
-            and backup_module.DEFAULT_SCOPE.includes(entry.path)
+            entry for entry in entries if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
         ]
 
         # `--match` needs every book's own title/author and `--asin` needs every
@@ -3539,7 +3576,13 @@ def run_remove(
             if not hit and folded_asin is not None:
                 book_id = exth.record_text(records or {}, exth.TAG_UUID) or ""
                 hit = book_id.casefold() == folded_asin
-            if not hit and needle is not None:
+            if not hit and needle is not None and backup_module.DEFAULT_SCOPE.includes(entry.path):
+                # `--match` is a NET, so it never sweeps in a book outside the area
+                # every backup covers — there would be nothing to put back if it did.
+                # The two IDENTITY selectors are different: a path or an id names one
+                # specific book, and the user deserves the refusal and its reason
+                # (`_protection_refusal`, via `_plan_removals`) rather than a run that
+                # reports nothing at all and exits 0.
                 hit = _matches(needle, entry.path, records)
             if hit:
                 selected.append(entry.path)
@@ -3676,10 +3719,10 @@ def run_sync(
         # the device's copy of it an EXTRA and delete it. The batch has to describe
         # the whole library before it can be used to decide what the library is not.
         raise UsageError(
-            f"batch {batch!r} has {unfinished} item(s) still pending or failed, so it "
-            "does not describe the whole library yet — --delete-extras would treat "
-            "every book it never placed as an extra. Finish the build (or re-run it) "
-            "first, or sync without --delete-extras."
+            f"batch {batch!r} has {unfinished} item(s) that are neither done nor "
+            "skipped, so it does not describe the whole library yet — "
+            "--delete-extras would treat every book behind them as an extra. Finish "
+            "the build (or re-run it) first, or sync without --delete-extras."
         )
 
     deletions_armed = delete_extras and bool(args.yes) and not dry_run
@@ -3850,8 +3893,8 @@ def run_sync(
 @dataclass
 class _RestoredFile:
     """One file a restore selected, with the outcome `backup.restore` reported for
-    it. `pending` is what a `--dry-run` reports (it WOULD go back); every other
-    status is a real verdict."""
+    it. `pending` is what a run WITHOUT `--yes` reports (it WOULD go back); every
+    other status is a real verdict."""
 
     id: int
     device_path: str
