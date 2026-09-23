@@ -12,13 +12,22 @@ complete, and three rules exist to make that trust honest:
    against a cold cache, would both let a FAILED listing pass as an empty device: the
    backup would write an empty snapshot, report success, and clear a destructive
    command to run. Anything the listing raises becomes `BackupFailed`, never an empty
-   snapshot. The one remaining hole — a mount that vanished, where a filesystem walk
-   legitimately returns nothing — is closed by asking the backend for its free space
-   before a zero-file listing is believed.
+   snapshot. The remaining hole — a device that is simply gone, where a filesystem
+   walk returns nothing rather than raising — is NARROWED, not closed, from both
+   ends: `MassStorageBackend.list_files` raises when its mount is not a directory,
+   and a zero-file listing here is believed only after the backend answers a second
+   question (`free_space`). Neither catches a stale mountpoint whose directory is
+   still there and empty, so a genuinely empty device and a vanished one are not
+   perfectly distinguishable — only much harder to confuse.
 2. **A snapshot directory is built under a `.partial` name** (`core.paths.temp_path`)
    and renamed only once it is complete, and the `latest` pointer moves only after
    that rename. A killed process can therefore leave an incomplete snapshot behind,
-   but never one that looks finished.
+   but never one that looks finished. **This is a guarantee against a killed process,
+   not against power loss**: the manifest and the `latest` pointer are fsynced, but
+   the transferred files themselves are not, so a power cut just after the rename can
+   leave a complete-looking snapshot holding bytes that never reached the platter.
+   Fsyncing every book would cost more than that risk is worth on a backup that is
+   itself a second copy — but the guarantee should not be read as more than it is.
 3. **Snapshots are never pruned.** This tool does not delete the user's backups. The
    only directory it ever removes is its own `.partial` staging area, and only after a
    failure it caught and converted into `BackupFailed`.
@@ -36,12 +45,20 @@ Layout, under the output root every other task resolves through
 
 **Incremental via hard links.** The device is listed once. A file whose path and size
 match the previous manifest and whose mtime differs by at most two seconds — or by a
-whole number of hours — is hard-linked from the previous snapshot instead of being
-transferred again. The whole-hour rule is not slack: FAT stores local time, so a DST
-change shifts every mtime on the device by exactly an hour, and treating that as
-"changed" would re-copy the entire library twice a year. Everything else is fetched
-through `read_many` (one batch, never one `calibre-debug` spawn per file) and hashed
-from the bytes that landed.
+whole number of hours, at most `MAX_DST_HOURS` of them — is hard-linked from the
+previous snapshot instead of being transferred again. The whole-hour clause is not
+slack: FAT stores local time, so a DST change shifts every mtime on a mass-storage
+Kindle by exactly an hour, and treating that as "changed" would re-copy the entire
+library twice a year. It is bounded, and `.sdr/` sidecar content is exempt from it
+entirely — see `_mtime_matches`. Everything else is fetched through `read_many` (one
+batch, never one `calibre-debug` spawn per file) and hashed from the bytes that landed.
+
+**The two flags that modify all of the above.** `full` ignores the previous snapshot
+entirely: every file is transferred and nothing is linked. `verify_hashes` recomputes
+every hash from the bytes now in the snapshot and fails if one disagrees with the hash
+the previous snapshot recorded for that path — so it detects damage to the BACKUP, and
+**it does not re-read the device, so it cannot tell you the snapshot still matches the
+Kindle**. Only `full` does that.
 """
 
 from __future__ import annotations
@@ -86,6 +103,11 @@ MANIFEST_VERSION = 1
 # which is where the tolerance itself comes from.
 MTIME_TOLERANCE_S = 2.0
 HOUR_S = 3600.0
+# How many whole-hour shifts the DST clause will forgive. The phenomenon it exists for
+# never needs more than one; two covers a double shift (a backup that spans both ends
+# of summer time) or a timezone change, and refuses everything beyond — an unbounded
+# rule would forgive a 24-hour or a year-long gap, which has nothing to do with DST.
+MAX_DST_HOURS = 2
 
 # Files per `read_many` call. One call for the whole library would be the cheapest
 # possible MTP run but would report no progress for hours; one call per file is the
@@ -156,8 +178,16 @@ class Scope:
 # sideloaded fonts. At the device root, Calibre's own `*.calibre` bookkeeping files —
 # and `My Clippings.txt` by name, because firmware has put it in both places.
 DEFAULT_SCOPE = Scope(
-    directories=("documents", "system/thumbnails", "amazon-cover-bug", "fonts"),
+    directories=(
+        "documents",
+        "system/thumbnails",
+        "amazon-cover-bug",
+        "fonts",  # unverified against hardware: the documented user-font folder
+    ),
     root_suffixes=(".calibre",),
+    # unverified against hardware: the only witness for a ROOT copy of this file is
+    # this repo's own `fake_kindle` fixture, not firmware. It is kept because
+    # over-collecting one small text file is cheaper than missing the user's clippings.
     root_names=frozenset({"My Clippings.txt"}),
 )
 
@@ -187,15 +217,26 @@ class Snapshot:
 class RestoreReport:
     """What `restore` put back (or, under `dry_run`, would have).
 
-    `missing` names manifest entries whose stored file is gone from the snapshot —
-    they are reported rather than silently dropped, because a restore that quietly
-    skips a book is the same class of lie as a backup that quietly skips one.
+    Three lists say what did NOT go back, and why. They are reported rather than
+    silently dropped, because a restore that quietly skips a book is the same class of
+    lie as a backup that quietly skips one:
+
+    - `missing` — the manifest names it, but its stored file is gone from the snapshot.
+    - `corrupt` — the stored file is there but no longer hashes to what the manifest
+      recorded, so it was NOT written to the device. Recovery is exactly where a
+      corrupt snapshot does the most damage: this is the one path that overwrites a
+      book the user still has with bytes from a backup.
+    - `no_thumbnail` — a book restored without a thumbnail because it carries no EXTH
+      113 id, so there was nothing to pair a thumbnail against. Its own bytes and its
+      `.sdr` sidecar still went back.
     """
 
     files: int
     bytes: int
     paths: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
+    corrupt: list[str] = field(default_factory=list)
+    no_thumbnail: list[str] = field(default_factory=list)
     dry_run: bool = False
 
 
@@ -261,11 +302,16 @@ def snapshot(
 ) -> Snapshot:
     """Back the device up into a new snapshot under `root`, and return it.
 
-    `full` ignores the previous snapshot entirely: every file is transferred, nothing
-    is linked. `verify_hashes` never carries a hash over from the previous manifest —
-    every hash is computed from the bytes now in the snapshot — but still links rather
-    than re-fetching, because the bytes it needs to hash are already local; the two
-    flags are therefore not the same thing.
+    `full` ignores the previous snapshot entirely: every file is transferred and
+    nothing is linked — the only way to re-read what is actually on the device.
+
+    `verify_hashes` recomputes every hash from the bytes now in the snapshot and raises
+    `BackupFailed` if one disagrees with the hash the previous snapshot recorded for
+    that path. It still hard-links rather than re-fetching, because the bytes it needs
+    are already local. So it detects damage to the BACKUP — bit rot, a truncated
+    earlier transfer, a bad disk — and **it does not re-read the device, so it cannot
+    tell you the snapshot still matches the Kindle.** That is `full`'s job, not this
+    flag's.
 
     `on_progress(done, total, phase)` fires as `covers.resolve`'s does, with `phase`
     either `"link"` or `"transfer"`. `on_warning(code, message)` fires at most once per
@@ -287,9 +333,14 @@ def snapshot(
     name = _free_snapshot_name(backups)
     final = backups / name
     partial = temp_path(final)
-    partial.mkdir(parents=True)  # creates `backups/` itself on a first-ever backup
 
     try:
+        # Inside the try on purpose: a read-only or full output root raises here, and
+        # `snapshot` promises `BackupFailed` for anything that stops the snapshot from
+        # completing — a caller catching that to emit `backup_failed` must not get a
+        # raw OSError instead. `_discard` uses `ignore_errors`, so unwinding a
+        # directory that was never created is harmless.
+        partial.mkdir(parents=True)  # creates `backups/` itself on a first-ever backup
         planned = [_plan_one(entry, previous, previous_dir, partial) for entry in entries]
         _link_phase(planned, previous_dir, on_progress)
         _transfer_phase(device_backend, planned, on_progress)
@@ -338,9 +389,13 @@ def _listing(device_backend, scope: Scope) -> list[DeviceFile]:
             error
         )
     if not found:
-        # A mounted volume that has gone away lists as empty rather than raising, so
-        # the one case where "nothing at all" is indistinguishable from a failure gets
-        # a second question the backend cannot answer from a stale cache.
+        # Belt and braces behind `MassStorageBackend.list_files`, which now raises when
+        # its mount is not a directory at all: a zero-file listing is the one case where
+        # "empty" and "failed" look alike, so it gets a second question the backend
+        # cannot answer from a stale cache. This NARROWS the hole rather than closing
+        # it — a stale mountpoint whose directory is still there and empty passes both
+        # checks — and a factory-reset Kindle really does list zero files, so an empty
+        # listing from a device that answers is a successful, empty snapshot.
         _confirm_the_device_answered(device_backend)
     return sorted(
         (entry for entry in found if scope.includes(entry.path)), key=lambda entry: entry.path
@@ -380,16 +435,42 @@ def _is_unchanged(entry: DeviceFile, previous: dict) -> bool:
         mtime = float(previous.get("mtime"))
     except (TypeError, ValueError):
         return False
-    return entry.size == size and _mtime_matches(entry.mtime, mtime)
+    return entry.size == size and _mtime_matches(
+        entry.mtime, mtime, allow_hour_shift=not _is_sdr_content(entry.path)
+    )
 
 
-def _mtime_matches(now: float, before: float) -> bool:
-    """Same file? Within two seconds (FAT's own granularity), or off by a whole number
-    of hours — FAT stores LOCAL time, so a DST change shifts every mtime on the device
-    by exactly an hour and would otherwise re-copy the entire library twice a year."""
+def _is_sdr_content(path: str) -> bool:
+    """Is this a file INSIDE a book's `.sdr` sidecar folder (`.mbp`, `.apnx`, `.han`)?"""
+    return any(part.lower().endswith(".sdr") for part in path.split("/")[:-1])
+
+
+def _mtime_matches(now: float, before: float, *, allow_hour_shift: bool = True) -> bool:
+    """Same file? Within two seconds — FAT's own granularity — or, unless the caller
+    refuses it, off by up to `MAX_DST_HOURS` whole hours.
+
+    The whole-hour clause exists for one phenomenon only: FAT stores LOCAL time, so a
+    DST change shifts every mtime on a MASS-STORAGE Kindle by exactly an hour, and
+    treating that as "changed" would re-copy the entire library twice a year. (An MTP
+    listing's mtimes come from a timezone-aware datetime and never shift, so the clause
+    is mass-storage-only in origin — it is applied uniformly because the backup must
+    not branch on the backend.)
+
+    Two things keep it from becoming a blanket tolerance. It is BOUNDED: an unbounded
+    `N x 3600` would forgive a 24-hour or a year-long gap. And callers pass
+    `allow_hour_shift=False` for `.sdr/` content — a false link needs the same path, a
+    byte-identical size and an edit within two seconds of an hour boundary, which is
+    effectively impossible for a book but entirely possible for a sidecar, since those
+    are rewritten in place as you read, often at an identical size, and people read at
+    roughly the same time each day. A sidecar carries the reading position and
+    highlights that make a restored book the same book, and they are tiny, so re-reading
+    them costs nothing next to getting one wrong.
+    """
     delta = abs(float(now) - float(before))
     if delta <= MTIME_TOLERANCE_S:
         return True
+    if not allow_hour_shift or delta > MAX_DST_HOURS * HOUR_S + MTIME_TOLERANCE_S:
+        return False
     remainder = delta % HOUR_S
     return min(remainder, HOUR_S - remainder) <= MTIME_TOLERANCE_S
 
@@ -453,12 +534,26 @@ def _finish(
         # the next run compares the device against this manifest, so a size that
         # describes anything but the stored bytes would corrupt every later decision.
         size = item.target.stat().st_size
-        carry = item.previous.get("sha256") if (item.previous and not verify_hashes) else None
-        if isinstance(carry, str) and len(carry) == 64:
-            digest, hash_from = carry, "previous"
+        recorded = item.previous.get("sha256") if item.previous else None
+        recorded = recorded if isinstance(recorded, str) and len(recorded) == 64 else None
+        if recorded is not None and not verify_hashes:
+            digest, hash_from = recorded, "previous"
             carried += 1
         else:
             digest, hash_from = _sha256(item.target), "computed"
+            if recorded is not None and digest != recorded:
+                # This is the whole point of `verify_hashes`. A reused file is usually a
+                # HARD LINK to the previous snapshot's inode, so recomputing its digest
+                # and throwing the recorded one away would re-read the same bytes and
+                # write down whatever they now produce — rot included, recorded as
+                # `"computed"` and reported as a success. Comparing is what turns the
+                # flag from a no-op into a check.
+                raise BackupFailed(
+                    f"{item.entry.path} no longer hashes to what snapshot "
+                    f"{previous_dir.name if previous_dir else '?'} recorded for it "
+                    f"({digest[:12]}... vs {recorded[:12]}...), so that earlier snapshot "
+                    "is damaged. This backup was discarded; the device was not touched."
+                )
         if item.previous is None:
             bytes_copied += size
         else:
@@ -552,7 +647,10 @@ def restore(
     snapshot's copy of it, never from its filename. An entry that names a directory
     selects everything beneath it.
 
-    `dry_run` computes the same report and writes nothing at all.
+    Every file's hash is checked against the manifest before a single byte is written,
+    and one that disagrees is refused rather than restored — see `RestoreReport`.
+
+    `dry_run` computes the same report, hashes included, and writes nothing at all.
     """
     directory = Path(snapshot)
     data = _read_json(directory / MANIFEST_NAME)
@@ -567,27 +665,53 @@ def restore(
         for entry in data["files"]
         if isinstance(entry, dict) and entry.get("path")
     }
-    wanted = set(index) if only is None else _expand(directory, index, only)
+    if only is None:
+        wanted, no_thumbnail = set(index), []
+    else:
+        wanted, no_thumbnail = _expand(directory, index, only)
 
     restored: list[str] = []
     missing: list[str] = []
+    corrupt: list[str] = []
     total = 0
     for path in sorted(wanted):
         stored = directory / FILES_DIR / _stored_of(index[path])
         if not stored.is_file():
             missing.append(path)
             continue
+        if not _hash_agrees(stored, index[path]):
+            corrupt.append(path)
+            continue
         total += stored.stat().st_size
         if not dry_run:
             device_backend.write(stored, path)
         restored.append(path)
     return RestoreReport(
-        files=len(restored), bytes=total, paths=restored, missing=missing, dry_run=dry_run
+        files=len(restored),
+        bytes=total,
+        paths=restored,
+        missing=missing,
+        corrupt=sorted(corrupt),
+        no_thumbnail=sorted(set(no_thumbnail)),  # two `only` entries can reach one book
+        dry_run=dry_run,
     )
 
 
-def _expand(directory: Path, index: dict[str, dict], only: list[str]) -> set[str]:
+def _hash_agrees(stored: Path, entry: dict) -> bool:
+    """Does the stored file still hash to what the manifest recorded? An entry with no
+    usable hash cannot be checked and is taken at face value rather than refused —
+    refusing it would make a manifest this tool wrote before hashes existed unusable
+    for recovery, which is worse than the risk."""
+    recorded = entry.get("sha256")
+    if not isinstance(recorded, str) or len(recorded) != 64:
+        return True
+    return _sha256(stored) == recorded
+
+
+def _expand(directory: Path, index: dict[str, dict], only: list[str]) -> tuple[set[str], list[str]]:
+    """`(paths to restore, books that could not be paired with a thumbnail)`."""
     wanted: set[str] = set()
+    unpaired: list[str] = []
     for request in only:
         cleaned = str(request).strip("/")
         if not cleaned:
@@ -595,29 +719,40 @@ def _expand(directory: Path, index: dict[str, dict], only: list[str]) -> set[str
         direct = [p for p in index if p == cleaned or p.startswith(f"{cleaned}/")]
         wanted.update(direct)
         for path in direct:
-            wanted.update(_companions_of(directory, index, path))
-    return wanted
+            companions, paired = _companions_of(directory, index, path)
+            wanted.update(companions)
+            if not paired and PurePath(path).suffix.lower() in _BOOK_SUFFIXES:
+                unpaired.append(path)
+    return wanted, unpaired
 
 
-def _companions_of(directory: Path, index: dict[str, dict], path: str) -> set[str]:
+def _companions_of(directory: Path, index: dict[str, dict], path: str) -> tuple[set[str], bool]:
     """A book's `.sdr` sidecar and its thumbnail — the two things that make a restored
-    book the same book rather than a fresh copy of it."""
+    book the same book rather than a fresh copy of it.
+
+    The bool is whether a thumbnail could be LOOKED FOR at all, i.e. whether the book
+    carries an EXTH 113 id. A book without one goes back with no thumbnail, and the
+    caller records that rather than letting it pass in silence.
+    """
     found: set[str] = set()
     book = PurePath(path)
     if book.suffix.lower() not in _BOOK_SUFFIXES:
-        return found
+        return found, True
     sidecar = f"{path[: -len(book.suffix)]}.sdr/"
     found.update(p for p in index if p.startswith(sidecar))
 
     stored = directory / FILES_DIR / _stored_of(index[path])
     book_id = record_text(read_records(stored), TAG_UUID) if stored.is_file() else None
-    if book_id:
-        # Matched by the id INSIDE the name rather than by rebuilding the filename:
-        # the CDE type and the suffix vary by firmware, the id does not.
-        found.update(
-            p for p in index if p.startswith("system/thumbnails/") and book_id in PurePath(p).name
-        )
-    return found
+    if not book_id:
+        return found, False
+    # TODO(task-6): replace this substring match with `thumbnails.thumbnail_name(
+    # book_id, cdetype)` once Task 6 lands the canonical name. Matching the id INSIDE
+    # the name is deliberate until then — the CDE type and the suffix vary by firmware
+    # while the id does not — but it is looser than an exact name.
+    found.update(
+        p for p in index if p.startswith("system/thumbnails/") and book_id in PurePath(p).name
+    )
+    return found, True
 
 
 # --- the journal ----------------------------------------------------------------
