@@ -187,6 +187,9 @@ class _RaisingBackend:
     def list_files(self, prefix: str = ""):
         raise self._error
 
+    def eject(self) -> None:
+        raise self._error
+
     def close(self) -> None:
         pass
 
@@ -1556,3 +1559,178 @@ def test_ebook_kindle_status_cli_with_no_device_exits_3():
     assert len(result_events) == 1
     assert result_events[0]["exit_code"] == EXIT_DEPENDENCY
     assert any(e.get("code") == "device_not_found" for e in events if e["type"] == "error")
+
+
+# --- eject (Task 9) ------------------------------------------------------------------
+
+
+class _RecordingEjectBackend:
+    """A real `MassStorageBackend` whose `eject()` is recorded instead of actually
+    unmounting anything — the platform eject itself (`diskutil`/`udisksctl`) is pinned
+    in `test_kindle_massstorage.py`; what matters here is that the CLI calls it exactly
+    once and writes nothing while doing so."""
+
+    def __init__(self, mount: Path) -> None:
+        self._inner = massstorage.MassStorageBackend(mount)
+        self.ejects = 0
+        self.closes = 0
+
+    def list_files(self, prefix: str = ""):
+        return self._inner.list_files(prefix)
+
+    def free_space(self) -> int:
+        return self._inner.free_space()
+
+    def write(self, local: Path, path: str) -> None:  # pragma: no cover - must not run
+        raise AssertionError("eject must never write to the device")
+
+    def remove(self, path: str) -> None:  # pragma: no cover - must not run
+        raise AssertionError("eject must never delete from the device")
+
+    def eject(self) -> None:
+        self.ejects += 1
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+class _FailingEjectBackend(_RecordingEjectBackend):
+    def eject(self) -> None:
+        raise RuntimeError("diskutil eject disk9 failed: Resource busy")
+
+
+def test_eject_is_registered_as_a_kindle_subcommand():
+    args = build_parser().parse_args(["ebook", "kindle", "eject", "--json"])
+    assert args.kindle_command == "eject"
+
+
+def test_eject_calls_the_backend_once_and_reports_the_mode(
+    fake_kindle, tmp_path, capsys, monkeypatch
+):
+    # The REAL `MassStorageBackend` (so `data.device.backend` reports its own stable
+    # literal), with only the platform eject itself stubbed out — `diskutil`/
+    # `udisksctl` are pinned in `test_kindle_massstorage.py`.
+    ejects = []
+    monkeypatch.setattr(
+        massstorage.MassStorageBackend, "eject", lambda self: ejects.append(self.mount)
+    )
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "eject", "--json", "-o", str(tmp_path / "media")]
+    )
+    exit_code = kindle_cli.run_eject(
+        args, device_finder=lambda: fake_kindle, backend_factory=_mass_storage_factory
+    )
+    assert exit_code == EXIT_OK
+    assert ejects == [fake_kindle.mount]
+
+    events = _events(capsys)
+    assert events[0]["type"] == "start"
+    assert events[0]["stages"] == ["detect", "eject"]
+    result = events[-1]
+    assert result["type"] == "result"
+    assert result["ok"] is True
+    assert result["data"]["device"]["mode"] == "mass_storage"
+    assert result["data"]["device"]["backend"] == "mass_storage"
+
+
+def test_eject_takes_no_backup_and_writes_nothing(fake_kindle, tmp_path, capsys):
+    # `eject` is the one device command with no mandatory snapshot, because it puts
+    # nothing new on the device: no `backup` stage, and no `_kindle/<serial>/backups`
+    # directory brought into being by running it.
+    root = tmp_path / "media"
+    backend = _RecordingEjectBackend(fake_kindle.mount)
+    args = build_parser().parse_args(["ebook", "kindle", "eject", "--json", "-o", str(root)])
+    assert (
+        kindle_cli.run_eject(
+            args,
+            device_finder=lambda: fake_kindle,
+            backend_factory=lambda d, *, cache_dir: backend,
+        )
+        == EXIT_OK
+    )
+    events = _events(capsys)
+    assert [e["stage"] for e in events if e["type"] == "stage"] == ["detect", "eject"]
+    assert not (root / "_kindle" / fake_kindle.serial / "backups").exists()
+
+
+def test_eject_emits_exactly_one_result_and_no_items(fake_kindle, tmp_path, capsys):
+    backend = _RecordingEjectBackend(fake_kindle.mount)
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "eject", "--json", "-o", str(tmp_path / "media")]
+    )
+    kindle_cli.run_eject(
+        args, device_finder=lambda: fake_kindle, backend_factory=lambda d, *, cache_dir: backend
+    )
+    events = _events(capsys)
+    assert len([e for e in events if e["type"] == "result"]) == 1
+    assert not [e for e in events if e["type"] == "item"]
+    assert events[-1]["counts"] == {
+        "total": 0,
+        "done": 0,
+        "skipped": 0,
+        "failed": 0,
+        "pending": 0,
+    }
+
+
+def test_eject_reports_a_failed_eject_as_an_error_and_still_ends_in_a_result(
+    fake_kindle, tmp_path, capsys
+):
+    backend = _FailingEjectBackend(fake_kindle.mount)
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "eject", "--json", "-o", str(tmp_path / "media")]
+    )
+    exit_code = kindle_cli.run_eject(
+        args, device_finder=lambda: fake_kindle, backend_factory=lambda d, *, cache_dir: backend
+    )
+    assert exit_code == EXIT_DEPENDENCY
+    events = _events(capsys)
+    assert events[-1]["type"] == "result"
+    assert events[-1]["ok"] is False
+    # The closed registry has no code for "the volume is still busy", so a plain
+    # RuntimeError out of the platform eject lands on `dependency_missing` — the
+    # device itself is untouched either way. Documented in CLAUDE.md.
+    assert [e["code"] for e in events if e["type"] == "error"] == ["dependency_missing"]
+
+
+def test_eject_maps_a_vanished_device_to_device_not_found(fake_kindle, tmp_path, capsys):
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "eject", "--json", "-o", str(tmp_path / "media")]
+    )
+    exit_code = kindle_cli.run_eject(
+        args,
+        device_finder=lambda: fake_kindle,
+        backend_factory=lambda d, *, cache_dir: _RaisingBackend(
+            FileNotFoundError("the Kindle is no longer mounted")
+        ),
+    )
+    assert exit_code == EXIT_DEPENDENCY
+    events = _events(capsys)
+    assert [e["code"] for e in events if e["type"] == "error"] == ["device_not_found"]
+
+
+def test_eject_over_mtp_reports_the_mtp_backend(tmp_path, capsys):
+    class _FakeMtpEject(_FakeMtpBackend):
+        def __init__(self):
+            super().__init__({})
+            self.ejects = 0
+
+        def eject(self) -> None:
+            self.ejects += 1
+
+    backend = _FakeMtpEject()
+    args = build_parser().parse_args(
+        ["ebook", "kindle", "eject", "--json", "-o", str(tmp_path / "media")]
+    )
+    exit_code = kindle_cli.run_eject(
+        args,
+        device_finder=_mtp_device,
+        backend_factory=lambda d, *, cache_dir: backend,
+    )
+    assert exit_code == EXIT_OK
+    assert backend.ejects == 1
+    result = _events(capsys)[-1]
+    assert result["data"]["device"]["mode"] == "mtp"
+    # A backend this module does not recognise reports "unknown" rather than leaking a
+    # Python class name into the JSON contract.
+    assert result["data"]["device"]["backend"] == "unknown"

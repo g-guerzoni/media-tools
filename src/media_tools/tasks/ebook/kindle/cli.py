@@ -1,13 +1,18 @@
-"""`media-tools ebook kindle status|scan|backup|thumbnails|add|remove|sync|restore`,
-and the one place every later command (`eject`) resolves a device through.
+"""`media-tools ebook kindle
+status|scan|backup|thumbnails|add|remove|sync|restore|eject`.
 
-`status`/`scan` never write anywhere; `backup` writes only to the host. `thumbnails`,
-`add`, `sync` and `restore` write to the DEVICE, and `remove`/`sync --delete-extras`
-DELETE from it — see their own docstrings (`run_thumbnails`, `run_add`, `run_remove`,
-`run_sync`, `run_restore`) for what that means for the mandatory pre-write backup and
-per-book failure handling. Do not read this module's name or this docstring's history
-as a promise that nothing here writes: that was true through Task 5 and is no longer
-true of anything below `run_backup`.
+`status`/`scan`/`eject` never write anywhere; `backup` writes only to the host.
+`thumbnails`, `add`, `sync` and `restore` write to the DEVICE, and `remove`/`sync
+--delete-extras` DELETE from it — see their own docstrings (`run_thumbnails`,
+`run_add`, `run_remove`, `run_sync`, `run_restore`) for what that means for the
+mandatory pre-write backup and per-book failure handling. Do not read this module's
+name or this docstring's history as a promise that nothing here writes: that was true
+through Task 5 and is no longer true of anything below `run_backup`.
+
+`eject` is the exception that proves the rule: it touches the device and takes NO
+backup, because it writes nothing — a mass-storage eject flushes bytes the host
+already owed the device and then unmounts it, and an MTP eject only closes the
+session. See `run_eject`.
 
 **Nothing is ever deleted without `--yes`.** For `remove` and `restore` that covers
 the whole run: without `--yes` they report what they would take (or put back), write
@@ -141,7 +146,7 @@ from media_tools.tasks.ebook.kindle.detect import Device, DeviceBusy, DeviceNotF
 from media_tools.tasks.ebook.normalize import IGNORED_LANGUAGE_TAGS
 
 NAME = "kindle"
-HELP = "Report on, scan, back up, add to, remove from, sync or restore a connected Kindle."
+HELP = "Report on, scan, back up, add to, remove from, sync, restore or eject a connected Kindle."
 
 # The formats `exth.read_records` can actually parse (MOBI-family containers).
 BOOK_SUFFIXES = frozenset({".azw", ".azw3", ".azw8", ".kfx", ".mobi", ".prc", ".pdb"})
@@ -459,6 +464,13 @@ def register_subparsers(kindle_parser) -> None:
         "one. Refused without it.",
     )
 
+    eject_help = (
+        "Release the connected Kindle so the cable can come out. Writes nothing to "
+        "the device, and therefore takes no backup."
+    )
+    eject_parser = subparsers.add_parser("eject", help=eject_help, description=eject_help)
+    _add_kindle_flags(eject_parser)
+
 
 def _add_kindle_flags(parser) -> None:
     parser.add_argument(
@@ -491,6 +503,8 @@ def run(args) -> int:
         return run_sync(args)
     if args.kindle_command == "restore":
         return run_restore(args)
+    if args.kindle_command == "eject":
+        return run_eject(args)
     raise UsageError(f"unknown kindle subcommand: {args.kindle_command!r}")  # pragma: no cover
 
 
@@ -4212,6 +4226,72 @@ def run_restore(
         kindle_command="restore",
         stages=stages,
         options=options,
+        device_finder=device_finder or detect.find_device,
+        backend_factory=backend_factory or default_backend_factory,
+        body=body,
+    )
+
+
+# --- eject -----------------------------------------------------------------------------
+
+
+def run_eject(
+    args,
+    *,
+    device_finder: Callable[[], Device] | None = None,
+    backend_factory: Callable[..., DeviceBackend] | None = None,
+) -> int:
+    """Release the device so the cable can come out — the one command here that
+    touches a Kindle and writes NOTHING to it, and therefore the one that takes no
+    backup.
+
+    **What each backend does is different, and both are `backend.eject()`'s own
+    business, not this function's.** Mass storage flushes the host's pending writes
+    (`sync`) and then asks the platform to eject the whole disk the mount sits on
+    (`diskutil eject` on macOS, `udisksctl unmount` + `power-off` on Linux), retrying
+    once if the first attempt reports the volume busy. MTP has nothing to eject at
+    all: the helper simply closes the session (`shutdown()`), and the op exists so a
+    caller can treat the two backends identically rather than branching on the mode
+    itself.
+
+    **Nothing is deleted, written or backed up.** The `sync` a mass-storage eject runs
+    is a flush of bytes the host already owed the device, not new content — so there is
+    nothing for a snapshot to protect, and `eject` is the one device command with no
+    `_mandatory_backup` call in it. Run it before unplugging, especially after `add`,
+    `sync`, `thumbnails` or `restore`: those commands' writes are the ones the flush is
+    for.
+
+    **A failed eject is reported through the same mapping every other command uses**
+    (`_error_code_for`, via `_run`). Worth reading precisely: a missing `diskutil` or
+    `udisksctl` surfaces as `dependency_missing`, and so does a volume that is still
+    busy after the retry — both reach `_run` as a plain `RuntimeError` from
+    `massstorage`, which the closed registry has no narrower code for. The device is
+    untouched either way; the fix for a busy volume is to close whatever is reading it
+    and run `eject` again.
+    """
+    stages = ["detect", "eject"]
+
+    def body(reporter: Reporter, root: Path, device: Device, backend: DeviceBackend) -> dict:
+        reporter.stage(stage="eject", index=2, count=len(stages))
+        backend.eject()
+        return {
+            "counts": {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0},
+            "failed": [],
+            "pending": [],
+            "outputs": [],
+            "run_file": None,
+            # The same two fields `status`'s own `data.device` leads with, so one
+            # parser reads both. No serial: `eject` needs no identity beyond "the
+            # device that was just detected", and `status` is where a user asks for
+            # that deliberately.
+            "data": {"device": {"mode": device.mode, "backend": _backend_label(backend)}},
+        }
+
+    return _run(
+        args,
+        kindle_command="eject",
+        stages=stages,
+        options={"kindle_command": "eject"},
         device_finder=device_finder or detect.find_device,
         backend_factory=backend_factory or default_backend_factory,
         body=body,
