@@ -1,11 +1,15 @@
 """The mass-storage Kindle backend: the device mounts as an ordinary disk, so every
 operation is a filesystem call — no MTP session, no vendor protocol.
 
-`write()` follows this project's usual atomicity rule (`core.paths.temp_path` +
-`fsync_replace`, spec 7.1/7.5's "partial outputs never count as done"): a Kindle
-pulled mid-copy must never leave a truncated book sitting at its final name, and any
-failure anywhere in that staged write — the copy itself or the final replace — must
-leave no `.partial` file behind either. `list_files` skips the macOS/Linux volume
+`write()` and `read()` both follow this project's usual atomicity rule
+(`core.paths.temp_path` + `fsync_replace`/`replace`, spec 7.1/7.5's "partial outputs
+never count as done"): a Kindle pulled mid-copy must never leave a truncated book
+sitting at its final name — on the device or on the host — and any failure anywhere in
+either staged copy, including a `KeyboardInterrupt`, must leave no `.partial` file
+behind either. `list_files` refuses to answer at all once the
+device is gone — a missing directory, or a mountpoint whose `st_dev` no longer matches
+the one recorded at construction — because an empty listing must mean "nothing is
+there", never "I could not look". It skips the macOS/Linux volume
 litter every removable disk accumulates, never descends into `audible/` (Amazon's
 audiobook data, untouchable by this whole plan), and only descends into `system/`
 as far as `system/thumbnails/` — the rest of `system/` is device internals (Wi-Fi
@@ -50,6 +54,19 @@ class MassStorageBackend:
 
     def __init__(self, mount: Path) -> None:
         self.mount = mount
+        # The filesystem the mount sat on when detection handed it over, i.e. when this
+        # really was the device. Unmounting a volume leaves its mountpoint DIRECTORY
+        # behind, empty and on the PARENT filesystem, so `is_dir()` still says yes and
+        # a walk still returns nothing — the one remaining way an empty listing could
+        # mean "I could not look". A changed `st_dev` catches exactly that.
+        #
+        # Recorded-vs-now, deliberately, rather than the usual "is this a mountpoint?"
+        # test (comparing `mount` against `mount.parent`): that would call every
+        # folder-backed Kindle a non-device — every fixture here, and any legitimate
+        # "treat this directory as a Kindle" use. Comparing against what was recorded
+        # at construction does not care whether the path was ever a real mountpoint,
+        # only whether it changed underneath us.
+        self._device_id = _device_id(self.mount)
 
     def list_files(self, prefix: str = "") -> list[DeviceFile]:
         parts = Path(prefix).parts if prefix else ()
@@ -62,6 +79,12 @@ class MassStorageBackend:
             # command to run. `[]` keeps its meaning for a prefix that is genuinely not
             # on the device (below), per `backend.DeviceBackend`.
             raise FileNotFoundError(f"the Kindle is no longer mounted at {self.mount}")
+        if self._device_id is not None and _device_id(self.mount) != self._device_id:
+            raise FileNotFoundError(
+                f"{self.mount} is no longer the filesystem it was when this device was "
+                "detected: the volume was unmounted and what is left is an empty "
+                "mountpoint directory, not a Kindle with nothing on it."
+            )
         start = self.mount / prefix if prefix else self.mount
         if not start.is_dir():
             return []
@@ -92,32 +115,34 @@ class MassStorageBackend:
                 yield DeviceFile(path=relative, size=stat.st_size, mtime=stat.st_mtime)
 
     def read(self, path: str, dest: Path) -> None:
-        shutil.copyfile(self.mount / path, dest)
+        """Copy one file off the device, staged so a failure leaves NOTHING at `dest`.
+
+        MTP's helper removes a half-fetched local file itself
+        (`integrations/kindle_mtp.py:_op_get`), so writing straight to `dest` here made
+        the two backends diverge in exactly the situation a backup exists for: a full
+        disk or a yanked cable would leave mass storage holding a TRUNCATED file at the
+        final name and MTP holding none. `read_many` inherits this rather than staging
+        a second time — one guarantee is easier to keep than two.
+        """
+        dest = Path(dest)
+        temp = temp_path(dest)
+        try:
+            shutil.copyfile(self.mount / path, temp)
+            temp.replace(dest)
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
 
     def read_many(self, items: list[tuple[str, Path]]) -> None:
         """`read` for a whole batch — see `backend.DeviceBackend`. A mounted disk has
-        no round trip to save, so this is the loop the MTP backend cannot afford; what
-        it adds over calling `read` directly is the contract's two guarantees, neither
-        of which a bare `shutil.copyfile` makes: the destination's parent directory is
-        created, and a pair that fails leaves NO file at its destination.
-
-        The second one is why the copy is staged through `temp_path` rather than
-        written straight to `dest`. MTP's helper already deletes a half-fetched local
-        file; without staging here, a mid-copy failure (a full disk, a device yanked
-        between two books) would leave mass storage holding a TRUNCATED file at the
-        final name while MTP held none — a parity gap that only shows up in the one
-        situation the backup exists for.
+        no round trip to save, so this is the loop the MTP backend cannot afford. What
+        it adds over calling `read` directly is the parent directory: the no-partial
+        guarantee comes from `read` itself, which stages every copy.
         """
         for path, dest in items:
             dest = Path(dest)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            temp = temp_path(dest)
-            try:
-                self.read(path, temp)
-                temp.replace(dest)
-            except BaseException:
-                temp.unlink(missing_ok=True)
-                raise
+            self.read(path, dest)
 
     def write(self, local: Path, path: str) -> None:
         target = self.mount / path
@@ -126,7 +151,10 @@ class MassStorageBackend:
         try:
             shutil.copyfile(local, temp)
             fsync_replace(temp, target)
-        except Exception:
+        except BaseException:
+            # BaseException, not Exception: a Ctrl+C mid-copy is exactly when a
+            # `.partial` would be left sitting ON THE DEVICE, which is what this
+            # module's own docstring promises never happens.
             temp.unlink(missing_ok=True)
             raise
 
@@ -151,6 +179,15 @@ class MassStorageBackend:
 
     def close(self) -> None:
         pass
+
+
+def _device_id(mount: Path) -> int | None:
+    """`st_dev` for the mount, or None when it cannot be read — in which case
+    `list_files`' own `is_dir()` check is what refuses the listing anyway."""
+    try:
+        return mount.stat().st_dev
+    except OSError:
+        return None
 
 
 def _run(argv: list[str], *, text: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:

@@ -228,7 +228,9 @@ class RestoreReport:
       book the user still has with bytes from a backup.
     - `no_thumbnail` — a book restored without a thumbnail because it carries no EXTH
       113 id, so there was nothing to pair a thumbnail against. Its own bytes and its
-      `.sdr` sidecar still went back.
+      `.sdr` sidecar still went back. **Only ever populated when `only` was given**:
+      pairing is what `only` needs and a whole-snapshot restore does not, since that
+      puts every thumbnail back regardless.
     """
 
     files: int

@@ -51,7 +51,14 @@ class DeviceBackend(Protocol):
       is no longer a directory, or an MTP listing the helper could not complete. An
       empty list therefore always means "nothing is there", never "I could not look",
       which is what lets a backup treat a listing failure as a failure instead of
-      writing an empty snapshot and calling it a success.
+      writing an empty snapshot and calling it a success. **The exception TYPE is
+      deliberately unspecified.** Mass storage raises `FileNotFoundError`; MTP raises
+      `DeviceNotFound`, `DeviceBusy` or `CalibreError` depending on what the helper
+      reported, and collapsing those into one family would throw away the difference
+      between "gone", "held by something else" and "the call itself broke" — which is
+      what a user needs to act on. A caller that must not proceed on a failed listing
+      catches `Exception`; a caller that wants to tell the cases apart catches the
+      backend-specific types it knows about.
     - **Excluded from every listing**, on both backends: `audible/` at any depth
       (Amazon's audiobook data, untouchable by this whole plan) and everything under a
       `system/` directory except its `thumbnails/` child (device internals — Wi-Fi
@@ -59,15 +66,17 @@ class DeviceBackend(Protocol):
       constants live in `massstorage.py` and the MTP backend imports them, so the two
       cannot drift apart.
     - **`read(path, dest)`** and **`remove(path)`** raise `FileNotFoundError` when
-      `path` is not on the device.
+      `path` is not on the device. A `read` that fails part-way leaves **no file at
+      `dest`** on either backend: mass storage stages the copy, MTP's helper removes
+      the half-fetched local file itself.
     - **`read_many(items)`** is `read` for a whole batch: every `(device path, local
       destination)` pair in ONE round trip where the backend has one (mass storage
       loops; MTP sends a single `run_ops` batch, because per-file `calibre-debug`
       spawns are unusable on a real library). It is observably equivalent to calling
-      `read` for each pair in the order given, with three guarantees `read` alone does
-      not make: **each destination's parent directory is created**, **a pair that fails
-      leaves no file at its destination** (no truncated local copy on either backend),
-      and an empty list touches the device not at all. It raises what `read` would
+      `read` for each pair in the order given, with two guarantees `read` alone does
+      not make: **each destination's parent directory is created**, and an empty list
+      touches the device not at all. (The no-partial guarantee above is `read`'s own,
+      inherited here rather than restated in a second place.) It raises what `read` would
       raise for the first pair that fails — `FileNotFoundError` for an absent path —
       and leaves whatever already transferred in place, so a caller that needs
       all-or-nothing stages into a directory it can discard.

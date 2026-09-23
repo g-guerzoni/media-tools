@@ -1,5 +1,6 @@
 import plistlib
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +29,85 @@ def test_listing_a_prefix_that_is_not_there_is_empty_but_a_missing_mount_raises(
         device.list_files()
     with pytest.raises(FileNotFoundError):
         device.list_files("documents")
+
+
+def test_an_unmounted_volume_is_not_a_kindle_with_nothing_on_it(fake_kindle, monkeypatch):
+    """Unmounting leaves the mountpoint DIRECTORY behind, empty and on the parent
+    filesystem, so `is_dir()` still says yes and a walk returns nothing — the last way
+    an empty listing could have meant "I could not look"."""
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    assert device._device_id == fake_kindle.mount.stat().st_dev, "recorded from a real stat"
+    assert device.list_files("documents"), "the device answers while it is still mounted"
+
+    # The directory is still there and still non-empty; only the filesystem under it
+    # changed, which is exactly what an unmount looks like.
+    monkeypatch.setattr(massstorage, "_device_id", lambda mount: device._device_id + 1)
+    with pytest.raises(FileNotFoundError):
+        device.list_files()
+    with pytest.raises(FileNotFoundError):
+        device.list_files("documents")
+
+
+def test_read_leaves_nothing_behind_when_the_copy_dies_part_way(fake_kindle, tmp_path, monkeypatch):
+    """The same guarantee `write` makes for the device, in the other direction — and
+    the one MTP's helper already made by removing its half-fetched local file."""
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    dest = tmp_path / "book.azw3"
+
+    def die_part_way(source, target):
+        Path(target).write_bytes(b"half")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(massstorage.shutil, "copyfile", die_part_way)
+    with pytest.raises(OSError):
+        device.read("documents/en/A Book - An Author.azw3", dest)
+
+    assert not dest.exists()
+    assert list(tmp_path.glob("*.partial")) == []
+
+
+def test_a_read_interrupted_by_ctrl_c_leaves_no_partial_on_the_host(
+    fake_kindle, tmp_path, monkeypatch
+):
+    """The same `BaseException` rule `write` follows. A Ctrl+C during a library-sized
+    backup is not exotic — it is the most likely way a long transfer ends — and it must
+    not strand a `.partial` beside every file it had reached."""
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    dest = tmp_path / "book.azw3"
+
+    def interrupt(source, target):
+        Path(target).write_bytes(b"half")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(massstorage.shutil, "copyfile", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        device.read("documents/en/A Book - An Author.azw3", dest)
+    monkeypatch.undo()
+
+    assert not dest.exists()
+    assert list(tmp_path.glob("*.partial")) == []
+
+
+def test_a_write_interrupted_by_ctrl_c_leaves_no_partial_on_the_device(
+    fake_kindle, tmp_path, monkeypatch
+):
+    """`except Exception` let a KeyboardInterrupt strand a `.partial` ON THE DEVICE —
+    the one failure this module's own docstring promises cannot happen."""
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    source = tmp_path / "New.azw3"
+    source.write_bytes(b"a new book")
+
+    def interrupt(local, temp):
+        Path(temp).write_bytes(b"a new")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(massstorage.shutil, "copyfile", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        device.write(source, "documents/en/New.azw3")
+    monkeypatch.undo()
+
+    assert not device.exists("documents/en/New.azw3")
+    assert list((fake_kindle.mount / "documents" / "en").glob("*.partial")) == []
 
 
 def test_write_then_read_round_trips(fake_kindle, tmp_path):

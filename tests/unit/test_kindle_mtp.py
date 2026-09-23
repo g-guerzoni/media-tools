@@ -830,12 +830,24 @@ class StubDevice:
 
     _main_id = "main"
 
-    def __init__(self, tree, *, free=4096, fail_listing=None, cached_hidden=(), short_write=None):
+    def __init__(
+        self,
+        tree,
+        *,
+        free=4096,
+        fail_listing=None,
+        cached_hidden=(),
+        short_write=None,
+        fail_fetch=None,
+    ):
         self.tree = tree
         self.free = free
         self.fail_listing = fail_listing
         self.cached_hidden = set(cached_hidden)
         self.short_write = short_write
+        # A fetch that dies with bytes ALREADY WRITTEN — the only shape in which
+        # `_op_get`'s removal of the local file is load-bearing rather than tidy.
+        self.fail_fetch = fail_fetch
         self.deleted: list[str] = []
         self.shutdown_called = False
         device = self
@@ -866,9 +878,13 @@ class StubDevice:
         return sorted(entries, key=lambda entry: entry.name, reverse=True)
 
     def get_file_by_name(self, outfile, parent, *names):
+        joined = "/".join(names)
         node = self.node(list(names))
         if not isinstance(node, bytes):
-            raise RuntimeError(f"no such file: {'/'.join(names)!r}")
+            raise RuntimeError(f"no such file: {joined!r}")
+        if self.fail_fetch == joined:
+            outfile.write(node[:3])
+            raise RuntimeError(f"the transfer of {joined!r} died part-way")
         outfile.write(node)
 
     def ensure_parent(self, storage, parts):
@@ -1009,6 +1025,20 @@ def test_getting_an_absent_file_is_reported_as_not_found(helper, tree, tmp_path)
     assert result["ok"] is False
     assert result["code"] == "not_found"
     assert not dest.exists(), "the empty local file must not be left behind"
+
+
+def test_a_fetch_that_dies_part_way_removes_the_half_written_local_file(helper, tree, tmp_path):
+    """The file IS on the device, so this is not the `not_found` path: the fetch itself
+    died with bytes already on disk. The helper removes them and re-raises, which is
+    what lets the mass-storage backend promise the same thing by staging its copies."""
+    dest = tmp_path / "out" / "book.azw3"
+    device = StubDevice(tree, fail_fetch="documents/en/A Book.azw3")
+
+    with pytest.raises(RuntimeError):
+        helper._op_get(
+            device, {"op": "get", "path": "documents/en/A Book.azw3", "local": str(dest)}
+        )
+    assert not dest.exists(), "a truncated local file must never survive a failed fetch"
 
 
 def test_the_helper_puts_a_file_and_reports_the_size_the_device_gives_back(helper, tree, tmp_path):
