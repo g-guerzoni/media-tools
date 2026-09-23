@@ -46,7 +46,12 @@ class DeviceBackend(Protocol):
     - **Paths** are device-relative and POSIX-style, never absolute host paths.
     - **`list_files(prefix)`** returns FILES only, never directories, depth-first with
       each directory's entries in name order. A prefix that is not on the device — or
-      one inside the excluded areas below — returns `[]` rather than raising.
+      one inside the excluded areas below — returns `[]` rather than raising. **The
+      DEVICE being unreachable is not that case and raises**: a mass-storage mount that
+      is no longer a directory, or an MTP listing the helper could not complete. An
+      empty list therefore always means "nothing is there", never "I could not look",
+      which is what lets a backup treat a listing failure as a failure instead of
+      writing an empty snapshot and calling it a success.
     - **Excluded from every listing**, on both backends: `audible/` at any depth
       (Amazon's audiobook data, untouchable by this whole plan) and everything under a
       `system/` directory except its `thumbnails/` child (device internals — Wi-Fi
@@ -59,12 +64,13 @@ class DeviceBackend(Protocol):
       destination)` pair in ONE round trip where the backend has one (mass storage
       loops; MTP sends a single `run_ops` batch, because per-file `calibre-debug`
       spawns are unusable on a real library). It is observably equivalent to calling
-      `read` for each pair in the order given, with two guarantees `read` alone does
-      not make: **each destination's parent directory is created**, and an empty list
-      touches the device not at all. It raises what `read` would raise for the first
-      pair that fails — `FileNotFoundError` for an absent path — and leaves whatever
-      already transferred in place, so a caller that needs all-or-nothing stages into
-      a directory it can discard.
+      `read` for each pair in the order given, with three guarantees `read` alone does
+      not make: **each destination's parent directory is created**, **a pair that fails
+      leaves no file at its destination** (no truncated local copy on either backend),
+      and an empty list touches the device not at all. It raises what `read` would
+      raise for the first pair that fails — `FileNotFoundError` for an absent path —
+      and leaves whatever already transferred in place, so a caller that needs
+      all-or-nothing stages into a directory it can discard.
     - **`exists(path)`** answers for FILES only: a directory is not "there".
     - **`write(local, path)`** creates any missing parent directories.
     - **`free_space()`** is bytes free on the device's main storage.

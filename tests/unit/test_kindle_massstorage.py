@@ -14,6 +14,22 @@ def test_lists_only_files_under_the_prefix(fake_kindle):
     assert any(f.path.endswith(".azw3") for f in documents)
 
 
+def test_listing_a_prefix_that_is_not_there_is_empty_but_a_missing_mount_raises(fake_kindle):
+    """`[]` must mean "nothing is there", never "I could not look". A prefix that is
+    not on the device is the first; a mount that is gone is the second, and answering
+    `[]` for it is how a backup writes an empty snapshot and calls itself a success."""
+    import shutil as _shutil
+
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    assert device.list_files("documents/de") == []
+
+    _shutil.rmtree(fake_kindle.mount)
+    with pytest.raises(FileNotFoundError):
+        device.list_files()
+    with pytest.raises(FileNotFoundError):
+        device.list_files("documents")
+
+
 def test_write_then_read_round_trips(fake_kindle, tmp_path):
     device = massstorage.MassStorageBackend(fake_kindle.mount)
     source = tmp_path / "New Book.azw3"

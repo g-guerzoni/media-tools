@@ -55,6 +55,13 @@ class MassStorageBackend:
         parts = Path(prefix).parts if prefix else ()
         if PROTECTED_DIRS & set(parts) or prefix_targets_a_forbidden_system_child(parts):
             return []
+        if not self.mount.is_dir():
+            # A missing MOUNT is not a missing prefix. Unmounted, ejected or never
+            # there, the device itself is unreachable, and answering `[]` is how a
+            # backup writes an empty snapshot, reports success and clears a destructive
+            # command to run. `[]` keeps its meaning for a prefix that is genuinely not
+            # on the device (below), per `backend.DeviceBackend`.
+            raise FileNotFoundError(f"the Kindle is no longer mounted at {self.mount}")
         start = self.mount / prefix if prefix else self.mount
         if not start.is_dir():
             return []
@@ -90,12 +97,27 @@ class MassStorageBackend:
     def read_many(self, items: list[tuple[str, Path]]) -> None:
         """`read` for a whole batch — see `backend.DeviceBackend`. A mounted disk has
         no round trip to save, so this is the loop the MTP backend cannot afford; what
-        it adds over calling `read` directly is the contract's parent-directory
-        guarantee, which MTP's helper already makes and mass storage did not."""
+        it adds over calling `read` directly is the contract's two guarantees, neither
+        of which a bare `shutil.copyfile` makes: the destination's parent directory is
+        created, and a pair that fails leaves NO file at its destination.
+
+        The second one is why the copy is staged through `temp_path` rather than
+        written straight to `dest`. MTP's helper already deletes a half-fetched local
+        file; without staging here, a mid-copy failure (a full disk, a device yanked
+        between two books) would leave mass storage holding a TRUNCATED file at the
+        final name while MTP held none — a parity gap that only shows up in the one
+        situation the backup exists for.
+        """
         for path, dest in items:
             dest = Path(dest)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            self.read(path, dest)
+            temp = temp_path(dest)
+            try:
+                self.read(path, temp)
+                temp.replace(dest)
+            except BaseException:
+                temp.unlink(missing_ok=True)
+                raise
 
     def write(self, local: Path, path: str) -> None:
         target = self.mount / path
