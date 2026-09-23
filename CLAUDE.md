@@ -99,7 +99,7 @@ the `Reporter` class (`core/events.py`) actually emits:
 | `item` | once per item, when it finishes | `id`, `status`, `input`, `outputs`, `bytes_in`, `bytes_out`, `reason`, `warnings` |
 | `warning` | rarely, for a warning not tied to one item | `code`, `message` |
 | `error` | on a hard failure | `code`, `message`, `hint`, `retryable` |
-| `result` | once, at the very end of a run that started | `ok`, `exit_code`, `counts`, `failed`, `pending`, `outputs`, `run_file`, `elapsed_s`, optionally `data` (`ebook` only: `{"llm": {...}}`, its LLM cost summary — see "`run.json`" below) |
+| `result` | once, at the very end of a run that started | `ok`, `exit_code`, `counts`, `failed`, `pending`, `outputs`, `run_file`, `elapsed_s`, optionally `data` (`ebook` only: `{"llm": {...}}`, its LLM cost summary, plus `{"placement": {"kept", "renamed", "leftover"}}` once the run reached the convert stage — see "`run.json`" below) |
 
 `stage`'s own `stage` field is distinct both from `progress`'s `stage` field (which
 names the sub-step an individual item is in, e.g. `"encode"`) and from the `stages` list
@@ -107,13 +107,23 @@ in `start` (which only declares the names up front). For `compress`/`convert`/`s
 (`core.runner.run_items`), `stage` events walk through that list as the run actually
 progresses: the first two ("scan", then per-item processing) fire before any `item`,
 and any further one (only `split`'s "verify") fires once every item is done. **`ebook`
-is the exception**: every stage in `start`'s `stages` list is announced immediately
-after `start`, all before the first `item` — the eight (or fewer, for a subcommand that
-stops early) `stage` events are the pipeline's fixed plan, not a live per-stage
-progress marker the way `split`'s "verify" is. `--dry-run` never emits `stage` for the
-`run_items`-based tasks (nothing is actually processed, so there is no "processing
-phase" to announce) — `ebook --dry-run` is again the exception, since its `stage`
-events describe the plan itself rather than real work.
+used to be an exception** (every stage in `start`'s `stages` list announced immediately
+after `start`, all before the first `item` or any real work) — as of the I5 fix this is
+no longer true: each of the eight (or fewer, for a subcommand that stops early) `stage`
+events now fires when that stage's own work actually begins (`tasks/ebook/build.py`'s
+`_build_plan`/`_run_pipeline`), the same live-progress-marker role `stage` plays for
+every other task. The three sub-stages that can take real, unbounded time on a large
+library — **metadata**, **normalize** (only when the LLM is enabled), and **covers** —
+also now emit `progress` events between their own `stage` announcement and the next
+one, wired to the `on_progress` callback each of those modules already accepted (and,
+before this fix, nobody ever passed): `metadata.read_all` reports one book at a time,
+`normalize.classify` reports one LLM batch at a time, `covers.resolve` reports its
+extract and fetch phases separately (see "Caches..."/the covers row below — combining
+them into one counter used to let progress walk past 100%). `--dry-run` never emits
+`stage` for the `run_items`-based tasks (nothing is actually processed, so there is no
+"processing phase" to announce) — `ebook --dry-run` is again the exception, since its
+`stage` events describe the plan itself (still fired live, as each planning phase
+begins) rather than real work.
 
 **Two contract details that are easy to get wrong:**
 
@@ -192,13 +202,15 @@ when the LLM is enabled and no OpenRouter key resolves.
 
 `no_gain`, `no_audio_only_format`, `cover_not_embedded`, `book_id_missing`,
 `extension_filter_bypassed`, `device_rejected_thumbnail`, `hash_from_previous`,
-`name_collision_suffixed`.
+`name_collision_suffixed`, `leftover_book`.
 
 (`device_*`, `hash_from_previous` and the `llm_unavailable` reason above are reserved
 for the future Kindle-device path and not produced by anything today; `book_id_missing`,
-`cover_not_embedded`, `already_target_format`, `source_missing` and
-`name_collision_suffixed` are all produced by the `ebook` task described below. They're
-listed here regardless because the set is closed and this is the authoritative source.)
+`cover_not_embedded`, `already_target_format`, `source_missing`,
+`name_collision_suffixed` and `leftover_book` are all produced by the `ebook` task
+described below (`leftover_book` is a standalone `warning` event, not attached to any
+one `item` — a leftover was never part of the plan to begin with). They're listed here
+regardless because the set is closed and this is the authoritative source.)
 
 `-e/--extensions` only filters a **folder** scan. A file named directly on the command
 line is still processed as long as some engine accepts it, even when its extension is
@@ -265,6 +277,7 @@ surviving item's `data` describes the winning book:
   "author": "Joe Abercrombie",
   "language": "en",
   "origin": "llm",
+  "language_origin": "llm",
   "duplicates": ["/path/to/input/blade-itself-copy.mobi"],
   "cover_source": "embedded",
   "output": "/path/to/output-root/<batch>/en/The Blade Itself - Joe Abercrombie.azw3"
@@ -274,8 +287,15 @@ surviving item's `data` describes the winning book:
 `meta.*` is the raw embedded metadata Calibre read (before cleanup); `title`/`author`/
 `language` are the resolved verdict actually used to place and name the file.
 `origin` is one of `"heuristic"` (offline), `"llm"`, `"cache"` (an LLM answer reused
-from `.cache/ebook-llm.json`), or `"list"` (a `--list` override). `duplicates` lists
-every other source path this item's group absorbed — never converted themselves.
+from `.cache/ebook-llm.json`), or `"list"` (a `--list` override) — it covers title,
+author and language jointly. `language_origin` (RB22) tracks the language field
+*specifically*, since it can come from a different step than the title/author did:
+`"embedded_tag"` (the book's own `<dc:language>`, trusted before the title heuristic
+even runs), `"title_heuristic"`, `"llm"`, `"cache"`, `"list"`, or `"unknown"`. It exists
+separately from `origin` because the tool writes its own guess back into the OUTPUT's
+`<dc:language>` field — without a separate field, a re-ingested output's embedded tag
+would silently outrank a fresher answer the next time around. `duplicates` lists every
+other source path this item's group absorbed — never converted themselves.
 `cover_source` is `"embedded"`, `"fetched"`, or `"none"`. A dropped source (vanished
 between scan and processing) instead gets `"reason": "source_missing"` and
 `data: {"error": "<message>"}`, with no `output`.
@@ -293,6 +313,19 @@ non-ebook task, and all-zero for `--no-llm`/`--dry-run`:
 back to the offline heuristic — the one thing worth noticing even when `requests` and
 `cache_hits` are both 0 (a total outage still produces usable output, just not
 LLM-cleaned).
+
+Whenever the run reached the convert stage, `data` also carries a `placement` object —
+the organize stage's own `kept`/`renamed`/`leftover` counts, previously computed by
+`library.reconcile()` and never surfaced anywhere:
+
+```json
+{"placement": {"kept": 340, "renamed": 2, "leftover": 1}}
+```
+
+Each leftover is additionally called out as its own `leftover_book` `warning` event
+during the run (named individually, or one warning summarising the count past a
+handful) — `run.json` itself gets no per-leftover entry, since a leftover was never
+part of the plan to begin with (no book id, no verdict, nothing an `item` expects).
 
 Rather than parsing this file yourself, use:
 
@@ -395,6 +428,15 @@ useful for inspecting one stage before committing to a full build:
 | `convert` | convert | ...through conversion — books land in their final folder |
 | `build` | organize | the full pipeline |
 
+**Known limitation: a subcommand cannot resume a `--batch` from its sources alone.**
+Every subcommand — including one that only continues an existing batch — still requires
+positional sources (or `--list`) on the command line; there is no way to say "run
+`covers` again against `--batch NAME`" and have it re-read that batch's own already-
+recorded `inputs` from `run.json` instead of being told the sources again. This is a
+real gap (an agent that only has a batch name, not the original file list, cannot
+resume it), left alone deliberately rather than folded into this fix round — not a
+free change to make alongside everything else here.
+
 **The eight stages** (`tasks/ebook/build.py:STAGE_ORDER`): `scan` (expand inputs) ->
 `metadata` (read every book's embedded title/author/language/cover once, cached) ->
 `normalize` (clean title/author/language — offline heuristic, or LLM) -> `dedup` (group
@@ -409,31 +451,56 @@ as part of `convert`, not a second pass — see "Placement" below).
 **Placement — where a converted book ends up**, under the batch directory:
 
 - `<language>/Title - Author.<ext>` — a clean title with a determined language (a
-  two-letter code). Two sources feed `verdict.language`, in order: `language.detect`
-  on the title (scores seven languages: `en`, `pt`, `es`, `it`, `fr`, `de`, `pl`), then
-  — only when that returns `None` — the book's own embedded `<dc:language>` tag,
-  whatever two-letter code it holds (`_apply_language_fallback` in `build.py`; this is
-  how a language outside the scored seven, e.g. `nl`, can still appear as a folder).
+  two-letter code). `verdict.language`'s precedence (RB22 — supersedes an earlier
+  ruling and the code that implemented it): `--list` override > the LLM's own answer >
+  the book's own embedded `<dc:language>` tag (accepted only when it is exactly two
+  alphabetic characters, and never `und`/`mul`/`zxx`) > `language.detect` on the title
+  (scores seven languages: `en`, `pt`, `es`, `it`, `fr`, `de`, `pl`) > unknown. All of
+  this (below the `--list`/LLM layers in `build.py`) now lives inside
+  `normalize.heuristic()`/`_verdict_from()` — there is no separate fallback pass in
+  `build.py` any more. The embedded tag is checked *before* the title heuristic runs,
+  not only consulted afterward when the heuristic finds nothing — see "Language
+  detection" below for why that ordering was the actual bug. `run.json`'s
+  `language_origin` field (distinct from `origin`) records which of these actually
+  produced the language.
 - `_review/<status>/` — a book the LLM flagged `invalid`/`irrelevant`/`unidentified`
   (still converted and placed, never dropped — just somewhere a human should look).
-- `_review/unknown-language/` — a book with no title-based signal *and* no embedded
-  language tag either (see "Language detection is conservative" below).
+- `_review/unknown-language/` — a book with no usable embedded tag *and* no title-based
+  signal either (see "Language detection" below).
 - `_leftover/` — a file already in the batch directory that matches nothing in the
   current plan (e.g. dropped from a later `--list`, or the batch was reused for
-  different sources).
+  different sources), mirroring its own path relative to the batch directory rather
+  than flattening to `_leftover/<name>` (RB21 — the old flattened form silently
+  destroyed one of two same-named files from different language folders, e.g.
+  `en/Title.azw3` and `pt/Title.azw3`). Each leftover is called out as a
+  `leftover_book` warning during the run (or one summarising warning past a handful —
+  see the JSON event contract above), and the run's `kept`/`renamed`/`leftover` counts
+  land in the final `result.data.placement` — none of this was surfaced anywhere
+  before (I4): a book moved to `_leftover/` used to produce no item, no warning, and no
+  `run.json` entry at all.
 
 Two books whose titles sanitise to the identical filename get a numeric suffix
 (` (2)`, ` (3)`, ...) instead of overwriting each other, flagged with the
-`name_collision_suffixed` warning.
+`name_collision_suffixed` warning. `ebook build --dry-run`'s own preview uses the same
+`library.plan_placement()` the real run does (not a per-book `target_path()` call in
+isolation), so a collision's suffix actually shows up in the preview too.
 
 **A rebuild converts nothing already on disk; a title fix renames instead of
-reconverting.** `build` first plans where every source *should* end up, then reconciles
-that plan against what already exists: a file already sitting at its planned target is
-left alone; a file elsewhere in the batch whose embedded book id (EXTH 113, stable
-across conversions) matches is *renamed* into place instead of reconverted. This is what
-makes an LLM title correction — which changes the target filename — free instead of a
-full reconversion: only a book genuinely new to the plan gets an actual `ebook-convert`
-call.
+reconverting — and the rename is honest, not just a filename change (RB20/C1).** `build`
+first plans where every source *should* end up, then reconciles that plan against what
+already exists: a file already sitting at its planned target is left alone; a file
+elsewhere in the batch whose embedded book id (EXTH 113, stable across conversions)
+matches is *renamed* into place instead of reconverted, and its embedded title/authors/
+language are rewritten (`calibre.update_metadata`, via `ebook-meta --title/--authors/
+--language`) to match the plan. Before this fix, only the filename changed — the file's
+own embedded title still held whatever it was converted with, so the verify stage
+(which compares the file's embedded title against the plan) failed it as
+`engine_error` forever, on every single rerun, no matter how many times it was "fixed".
+This is what makes an LLM title correction — which changes the target filename — free
+instead of a full reconversion: only a book genuinely new to the plan gets an actual
+`ebook-convert` call. `--force` skips the book-id lookup entirely (not just the
+already-at-target check) — a book it could otherwise find and rename under an old name
+is reconverted instead, matching what `--force` means everywhere else.
 
 **`--list FILE`** reads sources from a JSON file instead of positional paths (mutually
 exclusive with positional sources — pass one or the other). A plain array of path
@@ -461,6 +528,12 @@ needs a key, resolved in this order:
    CLI must be installed and signed in).
 3. `--op-item NAME` — a named 1Password item; its `credential`/`password`/`api key`/
    `apikey`/`key`/`token` field is tried in that order via `op item get ... --reveal`.
+   A named item that never resolves can cost up to ~3 minutes here (six field labels,
+   30s each) — `media-tools doctor --op-item NAME` uses a much shorter (~5s) per-call
+   timeout for this one check and stops after the first call that TIMES OUT (as
+   opposed to one that simply returns nothing, which still tries the next label), so
+   the health check itself never hangs anywhere near that long; a real `ebook build`
+   still uses the full timeout and tries every label.
 
 Pass `--no-llm` to skip all of this and use the offline heuristic only — no key needed,
 no network calls, no cost. Every subcommand except `scan` treats a missing key as a
@@ -478,19 +551,28 @@ survive as two separate books, whatever their titles have in common.
 **Language detection is deliberately conservative — but only up to the point where it
 finds a marker at all.** The offline detector (`tasks/ebook/language.py`) only trusts
 stopwords and diacritics exclusive to one of the seven scored languages; a title with
-no decisive marker returns `None` rather than a guess, which is what sends a book to
-`_review/unknown-language/` (once the embedded-tag fallback above also comes up empty)
-instead of a wrong shelf. **Once it does find a marker, though, it is not conservative
-at all**, and a short, common word can produce a wrong, confident classification that
-then *overrides* an already-correct embedded language tag (the fallback above only
-ever runs when the title step returns `None`). Confirmed against a real ~3,600-book
-library (Task 12's rehearsal): "Die Trying" (an English Lee Child novel) was shelved
-under `de/` because "Die" is one of German's exclusive marker words, and "Death Du
-Jour" (English, Kathy Reichs) landed under `fr/` because of "Du" — both books' own
-embedded `<dc:language>` was already `en`. This is a real limitation of the current
-heuristic, not a placement bug; a book under a shelf that looks wrong is worth checking
-against `tasks/ebook/language.py`'s marker lists before assuming the file itself, or
-the placement logic, is broken.
+no decisive marker returns `None` rather than a guess. **Once it does find a marker,
+though, it is not conservative at all**, and a short, common word can produce a wrong,
+confident classification: "Die Trying" (an English Lee Child novel) reads as German
+purely from the title, because "Die" is one of German's exclusive marker words, and
+"Death Du Jour" (English, Kathy Reichs) reads as French because of "Du" — confirmed
+against a real ~3,600-book library (Task 12's rehearsal).
+
+**RB22 fixed what this actually broke: the title heuristic used to run BEFORE the
+embedded tag was ever consulted**, so a wrong heuristic guess could *override* an
+already-correct tag — both "Die Trying" and "Death Du Jour" have their own embedded
+`<dc:language>` set to `en`, and both were shelved on the heuristic's wrong guess
+anyway, because the tag was only ever checked as a fallback for when the heuristic
+found *nothing*, never as a check the heuristic's own answer could lose to. The fix
+(see "Placement" above) checks the tag *first*: a book whose tag is present and looks
+like a genuine two-letter code never even reaches `language.detect`. The heuristic's
+own blind spot (a short marker word producing a wrong guess) is therefore now
+UNREACHABLE for a book with a valid tag — it only still applies to a book with no tag
+at all, or an invalid one (`und`/`mul`/`zxx`, or anything not exactly two letters). A
+book under a shelf that looks wrong is worth checking `run.json`'s `language_origin`
+for that book (`embedded_tag` means the file's own tag put it there — check the file;
+`title_heuristic` means the title did — check `tasks/ebook/language.py`'s marker
+lists) before assuming the file itself, or the placement logic, is broken.
 
 **Caches, all under `<output-root>/.cache/`, shared across every ebook batch** (not
 per-batch — re-scanning the same library into a new batch should reuse them):
@@ -500,6 +582,12 @@ per-batch — re-scanning the same library into a new batch should reuse them):
 | `ebook-meta.json` | resolved path + file size + mtime | the file itself changing on disk; moving/renaming the *library* does not invalidate this, since the path is part of the key — a moved file just re-reads once |
 | `ebook-llm.json` | filename + embedded title/author + `--model` + the prompt version (never the path) | the filename, embedded metadata, `--model`, or the prompt changing — moving/reorganising the library on disk never invalidates it |
 | `covers/<book-id>.jpg` | the book's stable EXTH 113 id | nothing automatically; delete the file to force re-resolution |
+
+Both `ebook-meta.json` and `ebook-llm.json` are written through the project's own
+temp+fsync+rename helper (`core.paths.fsync_replace`, via a `.partial` name), not a
+bare `write_text` (I7) — both files are shared across every batch and are written from
+OUTSIDE any single batch's lock, so a concurrent run or a Ctrl+C mid-write must not
+truncate one and silently discard everything cached in it.
 
 `--dry-run` never writes to any of these — metadata is still read (through a private,
 auto-removed scratch directory so concurrent dry runs never fight over Calibre's
@@ -698,9 +786,14 @@ its own declared outputs (only truly temporary files it created outside that lis
 - **Calibre is external and runs with an isolated config.** Every call
   (`integrations/calibre.py`) sets its own `CALIBRE_CONFIG_DIRECTORY` — never assume or
   touch the user's own Calibre library/settings. `doctor`'s `calibre` check looks for
-  all three CLI tools it uses on PATH: `ebook-convert`, `ebook-meta`, and
-  `fetch-ebook-metadata` (the last one only for `ebook build`'s online cover lookup,
-  skipped entirely by `--no-cover-fetch`).
+  all three CLI tools it uses: `ebook-convert`, `ebook-meta`, and `fetch-ebook-metadata`
+  (the last one only for `ebook build`'s online cover lookup, skipped entirely by
+  `--no-cover-fetch`) — via `calibre.find_tool` (I6), the same lookup `ebook build`/
+  `convert` themselves use, not a bare `shutil.which`. `find_tool` also searches e.g.
+  `/Applications/calibre.app/Contents/MacOS` on macOS, so a .dmg/App-bundle install
+  that isn't on PATH is still found; before this fix `doctor` alone used `shutil.which`
+  and could warn "not found" while every other command worked fine (same defect class
+  RB2 already fixed for the OpenRouter key check).
 - **Split's parts overlap at keyframes by design.** `MediaSplitEngine._split`
   (`tasks/split/media.py`) starts each next part slightly *before* the previous part's
   measured end (`duration * (1 - MARGIN_RATIO)`), guaranteeing overlap rather than ever

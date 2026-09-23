@@ -187,40 +187,52 @@ committing to a full `build`.
 **Where books end up**, under the batch folder `media-tools ebook build` creates:
 
 - `<language>/Title - Author.<ext>` — the normal case: a two-letter language code and
-  a clean title/author. The code usually comes from the title itself (offline
-  detection scores seven languages: `en`, `pt`, `es`, `it`, `fr`, `de`, `pl`); when the
-  title gives no clear signal, the book's own embedded language tag is used instead —
-  which can be any code, and, on a library with messy metadata, can be wrong (see
-  "a heads-up from the real-library rehearsal" below).
+  a clean title/author. The language comes from, in order: a `--list` override, the
+  LLM's own answer, the book's own embedded language tag (accepted only when it looks
+  like a genuine two-letter code — a bare "und"/"mul"/"zxx" tag is ignored), and only
+  then the offline title heuristic (which scores seven languages: `en`, `pt`, `es`,
+  `it`, `fr`, `de`, `pl`). The embedded tag is checked *before* the title heuristic
+  runs, not only as a fallback when the heuristic finds nothing — see "a heads-up
+  from the real-library rehearsal" below for why that order matters.
 - `_review/<status>/` — a book the LLM pass flagged as not a real, identifiable title
   (`invalid`, `irrelevant`, `unidentified`). It is still converted and placed here, not
   dropped — just somewhere for a human to take a look.
-- `_review/unknown-language/` — a book whose title gave no language signal *and* whose
-  file carries no embedded language tag either. Offline title detection is
+- `_review/unknown-language/` — a book whose embedded tag isn't a genuine two-letter
+  code *and* whose title gave no language signal either. Offline title detection is
   deliberately conservative: a title with no clear marker for one of the seven scored
   languages is left unplaced rather than guessed, since a wrong shelf is worse than a
-  review folder — but this conservatism only applies to the title step; see below.
+  review folder.
 - `_leftover/` — a file already in the batch folder that no longer matches anything in
-  the current plan (for example, a book dropped from a later `--list`).
+  the current plan (for example, a book dropped from a later `--list`), mirroring its
+  own path relative to the batch (so `en/Title.azw3` and `pt/Title.azw3` both survive
+  as leftovers instead of one silently overwriting the other). Each leftover is called
+  out as a warning during the run (or one summarising warning past a handful), and the
+  run's `kept`/`renamed`/`leftover` counts appear in the final summary alongside the
+  LLM cost report.
 
 **A heads-up from the real-library rehearsal:** the title-based guess is *not*
-conservative in the same way once it does find a marker — a short, common word can
-still trigger a wrong, confident match, and that wrong match is used even when the
-book's own embedded language tag was already correct. Two examples found in a real
-~3,600-book library: "Die Trying" (an English Lee Child novel) was shelved under `de/`
-because "Die" is a German marker word, and "Death Du Jour" (English, Kathy Reichs) was
-shelved under `fr/` because of "Du" — both had a correct `en` embedded tag that the
-title guess overrode. This is a real limitation of the current heuristic, not a
-folder-placement bug — if a book ends up under a shelf that looks wrong, it is worth
-checking whether its title simply contains a short word that another language claims,
-before assuming the file itself is broken.
+conservative once it does find a marker — a short, common word can still trigger a
+wrong, confident match. Two examples found in a real ~3,600-book library: "Die Trying"
+(an English Lee Child novel) has a marker ("Die") that an offline title guess alone
+would read as German, and "Death Du Jour" (English, Kathy Reichs) has one ("Du") that
+would read as French. Because the embedded language tag is now checked *before* the
+title heuristic runs, both are correctly shelved under `en/` from their own `en` tag —
+but a book whose *tag itself* is missing or wrong, and whose title also carries one of
+these short markers, still lands on the heuristic's guess. If a book ends up under a
+shelf that looks wrong, check `data.language_origin` in `run.json` for that book
+(`embedded_tag` vs `title_heuristic`) before assuming the file itself is broken.
 
 **Re-running `build` on the same folder converts nothing that's already there.** It
 plans where every book should end up, then checks what's already on disk: a file
 already at its planned location is left alone, and a file elsewhere in the batch whose
-stable internal book id matches is *renamed* into place instead of reconverted. In
-practice this means an LLM title correction is free — it renames the existing file
-rather than running Calibre again — and only genuinely new books get converted.
+stable internal book id matches is *renamed* into place instead of reconverted — its
+embedded title/author/language are rewritten to match too, not just its filename, so
+the rename is genuinely complete. In practice this means an LLM title correction is
+free — it renames (and relabels) the existing file rather than running Calibre again —
+and only genuinely new books get converted. `--force` skips this rename lookup
+entirely: a book it would otherwise find and relabel under an old name is reconverted
+instead, matching what `--force` means everywhere else ("redo items whose output
+exists").
 
 **Duplicates and translations.** The same book showing up as an `.epub` and a `.mobi`
 collapses into one entry (only the preferred format is converted; `--prefer` controls
@@ -265,7 +277,10 @@ reorganising the library doesn't throw away what was already classified), and
 
 Every batch's `run.json` records, per book, its resolved title/author/language, where
 it came from (offline heuristic, LLM, cache, or a `--list` override), which other files
-were folded into it as duplicates, and where it was written.
+were folded into it as duplicates, and where it was written. The language's own origin
+(`language_origin`: `embedded_tag`, `title_heuristic`, `llm`, `cache`, `list`, or
+`unknown`) is recorded separately, since it can come from a different step than the
+title/author did.
 
 ## Where output goes
 
@@ -323,6 +338,12 @@ media-tools convert media/lecture --to mp3 --batch lecture-mp3
 - **`ebook build` fails with "no OpenRouter API key available"** — its LLM-assisted
   cleanup needs a key (see "Building an ebook library"), or pass `--no-llm` to skip it.
   `media-tools doctor` only reports whether a key resolves, never its value.
+- **`--op-item NAME` is slow to fail** — resolving a named item tries up to six field
+  labels, each a real `op` call; a name that never resolves can take up to ~3 minutes
+  in `ebook build` itself. `media-tools doctor --op-item NAME` uses a much shorter
+  per-call timeout and stops at the first one that times out (rather than a plain empty
+  result), so the health check itself never hangs anywhere near that long — but the
+  real `ebook build`/`convert`/etc. run still uses the full timeout.
 - **Calibre missing** — needed by `ebook build` and by `convert` for ebook formats:
   `brew install --cask calibre`.
 - Run `media-tools doctor` any time — it checks all of the above and gives an
