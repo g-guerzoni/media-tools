@@ -427,6 +427,9 @@ def test_calibre_check_uses_find_tool_not_just_shutil_which(tmp_path, monkeypatc
 # promises is absent.
 
 NO_KINDLE = "nothing attached"
+#: `skip_reason` is only ever read when the probe is SKIPPED, so this is what the
+#: cases below pass when an MTP Kindle is connected and the probe really runs.
+PROBE_RUNS = "unread: an MTP Kindle is connected"
 
 
 def _no_kindle(**_kwargs):
@@ -659,7 +662,7 @@ def test_the_skipped_driver_check_says_which_of_three_reasons_applies(monkeypatc
 
 def test_kindle_mtp_driver_check_warns_when_calibre_debug_is_absent(monkeypatch):
     monkeypatch.setattr(doctor_task.calibre, "find_tool", lambda name: None)
-    check = doctor_task._kindle_mtp_driver_check(_mtp_kindle())
+    check = doctor_task._kindle_mtp_driver_check(_mtp_kindle(), PROBE_RUNS)
     assert check.status == "warn"
     assert check.hint
 
@@ -675,7 +678,7 @@ def test_kindle_mtp_driver_check_is_ok_when_the_probe_prints_its_marker(monkeypa
         )
 
     monkeypatch.setattr(doctor_task.subprocess, "run", fake_run)
-    check = doctor_task._kindle_mtp_driver_check(_mtp_kindle())
+    check = doctor_task._kindle_mtp_driver_check(_mtp_kindle(), PROBE_RUNS)
     assert check.status == "ok"
 
 
@@ -688,7 +691,7 @@ def test_kindle_mtp_driver_check_warns_when_the_import_fails(monkeypatch):
         )
 
     monkeypatch.setattr(doctor_task.subprocess, "run", fake_run)
-    check = doctor_task._kindle_mtp_driver_check(_mtp_kindle())
+    check = doctor_task._kindle_mtp_driver_check(_mtp_kindle(), PROBE_RUNS)
     assert check.status == "warn"
 
 
@@ -699,7 +702,7 @@ def test_kindle_mtp_driver_check_warns_when_the_probe_cannot_run(monkeypatch):
         raise OSError("no such file")
 
     monkeypatch.setattr(doctor_task.subprocess, "run", fake_run)
-    check = doctor_task._kindle_mtp_driver_check(_mtp_kindle())
+    check = doctor_task._kindle_mtp_driver_check(_mtp_kindle(), PROBE_RUNS)
     assert check.status == "warn"
 
 
@@ -712,4 +715,4 @@ def test_kindle_mtp_driver_probe_marker_never_matches_by_accident(monkeypatch):
         "run",
         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
     )
-    assert doctor_task._kindle_mtp_driver_check(_mtp_kindle()).status == "warn"
+    assert doctor_task._kindle_mtp_driver_check(_mtp_kindle(), PROBE_RUNS).status == "warn"

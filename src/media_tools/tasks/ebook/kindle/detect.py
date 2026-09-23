@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 KINDLE_VENDOR_ID = 0x1949
-MTP_PRODUCT_IDS = frozenset({0x9981})
+# There is deliberately no product-id table here: a Kindle that exposes a mount is
+# mass storage and one without is MTP, and firmware has moved that line before. An
+# `MTP_PRODUCT_IDS` set used to sit on this line, referenced by nothing.
 _REQUIRED_DIRS = ("documents", "system")
 
 

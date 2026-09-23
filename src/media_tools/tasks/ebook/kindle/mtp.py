@@ -217,11 +217,13 @@ def parse_helper_output(stdout: str, stderr: str, returncode: int) -> dict:
     if returncode == EXIT_BUSY:
         raise DeviceBusy(busy_hint() + said)
     if returncode == EXIT_WRITE_PROTECTED:
-        error = DeviceWriteProtected("the Kindle refused the write as read-only." + said)
-        # The helper emits whatever it completed before aborting; without attaching it
-        # here that record is unreachable and a caller cannot tell which writes landed.
-        error.results = _results_of(payload) or []
-        raise error
+        # The helper emits whatever it completed before aborting, and that record used
+        # to be attached to the exception as `.results` for "a caller that needs to
+        # tell which writes landed". No caller ever read it: every one of them reacts
+        # to this by reporting `device_write_protected` and stopping, and what landed
+        # is established by the verify stage against the DEVICE, not by trusting a
+        # report from the invocation that just failed.
+        raise DeviceWriteProtected("the Kindle refused the write as read-only." + said)
     if returncode != EXIT_OK:
         raise CalibreError(tail or f"calibre-debug exited {returncode}")
 
@@ -364,8 +366,16 @@ class MtpBackend:
         if self._listing is None:
             files, complete, _missing = self._files_under("")
             if not complete:
-                # An incomplete listing must never become this backend's idea of the
-                # device for the rest of its life.
+                # A BACKSTOP, not the mechanism. An incomplete listing must never
+                # become this backend's idea of the device for the rest of its life —
+                # but what enforces that today is one layer down: `_op_list` answers
+                # `ok: false` for a walk that failed part-way and for ANY failure at
+                # the device root, and `_one` raises on a result that is not `ok`, so
+                # this line is not reached. The only `complete: false` the real helper
+                # produces is a MISSING prefix, which cannot happen at the root asked
+                # for here. Left in place because the rule it states is the one that
+                # matters, and a future helper answering differently must not silently
+                # start caching a short listing.
                 return _under_prefix(files, prefix)
             self._listing = files
         return _under_prefix(self._listing, prefix)
@@ -426,12 +436,14 @@ class MtpBackend:
             # exists to get right.
             return False
         if not complete:
-            # `partial`/`note`, unlike `missing`, mean the listing itself could not
-            # be completed — genuinely inconclusive. The caller (e.g. verifying a
-            # just-written Kindle thumbnail) needs to be able to tell "verified
-            # absent" from "could not check", and a possibly-wrong `False` here
-            # collapses that distinction (I3): a real device rejection and a merely
-            # inconclusive listing would otherwise look identical.
+            # The same BACKSTOP as in `list_files`, and reached by the same nothing:
+            # the real helper's only `complete: false` is a missing prefix, which the
+            # branch above already returned on, and a listing that failed part-way is
+            # `ok: false` and raises inside `_one`. So the distinction this guard
+            # exists for — a caller (verifying a just-written Kindle thumbnail) being
+            # able to tell "verified absent" from "could not check" (I3) — is already
+            # kept by the layer below; this states it at the layer that would notice
+            # if that ever stopped being true.
             raise CalibreError(
                 f"could not verify whether {path!r} exists: the MTP listing needed to "
                 "check it was incomplete, so absence cannot be confirmed"

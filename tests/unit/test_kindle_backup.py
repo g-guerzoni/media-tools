@@ -208,7 +208,6 @@ def test_the_codes_this_module_relies_on_are_already_registered():
     assert "hash_from_previous" in WARNING_CODES
     assert "backup_failed" in ERROR_CODES
     assert backup.HASH_FROM_PREVIOUS_WARNING == "hash_from_previous"
-    assert backup.BACKUP_FAILED_ERROR == "backup_failed"
 
 
 # --- scope ----------------------------------------------------------------------

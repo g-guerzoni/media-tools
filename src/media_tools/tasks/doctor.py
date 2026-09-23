@@ -323,9 +323,7 @@ _KINDLE_DEVICE_HINT = (
 _KINDLE_MODE_LABELS = {"mass_storage": "mass storage", "mtp": "MTP"}
 
 
-def _kindle_mtp_driver_check(
-    device: kindle_detect.Device | None, skip_reason: str = "no MTP Kindle connected"
-) -> Check:
+def _kindle_mtp_driver_check(device: kindle_detect.Device | None, skip_reason: str) -> Check:
     """Whether Calibre's own MTP driver imports inside Calibre's interpreter.
 
     `tasks.ebook.kindle.mtp` can never import that driver from this process — it only
@@ -343,7 +341,9 @@ def _kindle_mtp_driver_check(
     skipped, and for which of three different reasons, rather than claiming a driver
     was verified — "no MTP Kindle connected" on a run where detection itself FAILED
     would be a false statement on an "ok" row, since nothing is then known about what
-    is attached.
+    is attached. `skip_reason` has no default for exactly that reason: the obvious one
+    to give it is that same sentence, which is the statement this paragraph calls
+    false, and the only caller has always passed the real one anyway.
     """
     if device is None or device.mode != "mtp":
         return Check(

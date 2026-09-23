@@ -235,9 +235,12 @@ def test_exit_code_4_raises_device_write_protected(device, tmp_path):
         backend(device, runner).write(source, "documents/en/A Book.azw3")
 
 
-def test_exit_code_4_attaches_the_writes_that_already_landed(device, tmp_path):
-    """The helper emits what it completed before aborting; without attaching it the
-    caller cannot tell which books made it onto the device."""
+def test_exit_code_4_carries_what_the_device_said_and_nothing_a_caller_ignores(device, tmp_path):
+    """The helper's partial results used to be attached to the exception as
+    `.results`, for "a caller that needs to tell which writes landed". No caller ever
+    read it: every one reports `device_write_protected` and stops, and what actually
+    landed is established by the verify stage against the DEVICE, not by trusting the
+    invocation that just failed. What a caller does use is the message."""
     source = tmp_path / "A Book.azw3"
     source.write_bytes(b"book")
     payload = results(
@@ -247,7 +250,8 @@ def test_exit_code_4_attaches_the_writes_that_already_landed(device, tmp_path):
     runner = FakeRunner(parsed(payload, "device is read-only\n", 4))
     with pytest.raises(DeviceWriteProtected) as error:
         backend(device, runner).write(source, "documents/en/A Book.azw3")
-    assert [entry["ok"] for entry in error.value.results] == [True, False]
+    assert "read-only" in str(error.value)
+    assert not hasattr(error.value, "results")
 
 
 def test_any_other_non_zero_exit_carries_the_stderr_tail(device):
@@ -580,7 +584,7 @@ def test_several_ops_produce_exactly_one_runner_invocation(device, tmp_path):
     source.write_bytes(b"x")
     runner = FakeRunner(
         results(
-            {"op": "mkdir", "ok": True},
+            {"op": "free", "ok": True, "free": 4096},
             {"op": "put", "ok": True, "size": 1, "local_size": 1},
             {"op": "rm", "ok": True},
             listing(("documents/en/A Book.azw3", 1, 1.0)),
@@ -588,7 +592,7 @@ def test_several_ops_produce_exactly_one_runner_invocation(device, tmp_path):
     )
     outcome = backend(device, runner).run_ops(
         [
-            {"op": "mkdir", "path": "documents/en"},
+            {"op": "free"},
             {"op": "put", "path": "documents/en/A Book.azw3", "local": str(source)},
             {"op": "rm", "path": "documents/en/Old.azw3"},
             {"op": "list", "path": "documents/en"},
@@ -596,7 +600,7 @@ def test_several_ops_produce_exactly_one_runner_invocation(device, tmp_path):
     )
 
     assert len(runner.calls) == 1
-    assert [entry["op"] for entry in runner.calls[0]] == ["mkdir", "put", "rm", "list"]
+    assert [entry["op"] for entry in runner.calls[0]] == ["free", "put", "rm", "list"]
     assert len(outcome) == 4
 
 
@@ -1133,13 +1137,6 @@ def test_removing_what_the_cached_tree_hides_is_flagged_machine_readably(helper,
     assert device.deleted == []
 
 
-def test_the_helper_makes_a_directory(helper, tree):
-    device = StubDevice(tree)
-    assert helper._op_mkdir(device, {"op": "mkdir", "path": "documents/de"})["ok"] is True
-    assert device.tree["documents"]["de"] == {}
-    assert "_" not in device.tree["documents"]["de"], "the sentinel must not be created"
-
-
 def test_free_space_accepts_a_list_or_a_bare_integer(helper, tree):
     assert helper._op_free(StubDevice(tree, free=4096), {})["free"] == 4096
     assert helper._op_free(StubDevice(tree, free=[8192, 0, 0]), {})["free"] == 8192
@@ -1209,7 +1206,9 @@ def test_a_read_only_device_aborts_the_batch_and_keeps_what_landed(helper, tree,
             ],
         )
     assert error.value.code == helper.EXIT_WRITE_PROTECTED
-    # The ops that already ran are carried on the exception, and the third never ran.
+    # Inside the HELPER the partial results are still carried, because that is how the
+    # aborted batch is reported back at all. It is the BACKEND that stopped attaching
+    # them to `DeviceWriteProtected`, where nothing read them.
     assert [entry["ok"] for entry in error.value.results] == [True, False]
     assert error.value.results[1]["code"] == "write_protected"
 

@@ -91,12 +91,13 @@ from media_tools.tasks.ebook.kindle.massstorage import (
     is_volume_litter,
 )
 
-# Codes from the CLOSED registry in `core/events.py`. The plan called the warning
+# A code from the CLOSED registry in `core/events.py`. The plan called this warning
 # `backup_hash_from_previous`; the registry already ships `hash_from_previous`, and an
-# unregistered code raises inside `Reporter` by design — so these name the registered
-# ones rather than adding a second code for one meaning.
+# unregistered code raises inside `Reporter` by design — so this names the registered
+# one rather than adding a second code for one meaning. (A `BACKUP_FAILED_ERROR`
+# constant sat beside it and was referenced by nothing: every producer of that code
+# writes the literal, which is four places this constant did not save.)
 HASH_FROM_PREVIOUS_WARNING = "hash_from_previous"
-BACKUP_FAILED_ERROR = "backup_failed"
 
 KINDLE_DIR = "_kindle"
 MANIFEST_NAME = "manifest.json"

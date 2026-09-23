@@ -58,7 +58,10 @@ def _records_from(data: bytes) -> dict[int, bytes]:
             found[tag] = record[position + 8 : position + length]
             position += length
         return found
-    except (struct.error, IndexError):
+    except struct.error:
+        # `struct.error` only: every index above is a SLICE, which never raises, and
+        # the one subscript-shaped read (`offsets`) is bounds-checked first. The
+        # `IndexError` that used to be caught here could not happen.
         return {}
 
 

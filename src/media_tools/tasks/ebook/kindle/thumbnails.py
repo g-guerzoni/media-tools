@@ -341,7 +341,10 @@ def _read_cover_image(path: Path) -> bytes | None:
         end = offsets[index + 1] if index + 1 < count else len(data)
         image = data[start:end]
         return image if _looks_like_image(image) else None
-    except (struct.error, IndexError):
+    except struct.error:
+        # `struct.error` only: `offsets` has exactly `count` entries and every index
+        # into it is bounds-checked (`0 <= index < count`, `index + 1 < count`) before
+        # it is used, so the `IndexError` this used to catch was unreachable.
         return None
 
 

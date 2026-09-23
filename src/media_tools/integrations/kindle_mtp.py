@@ -117,11 +117,7 @@ backend as `DeviceNotFound` with the start marker present. Nothing past
     behind when the transfer is cut, whether it replaces a same-named file by default
     (``replace=True`` is the declared default), and what it raises when the device is
     full. Task 7's verify stage is what actually catches a truncated book.
-7.  Parent creation — ``ensure_parent(storage, parts)`` creates every component except
-    the LAST and returns the parent folder (confirmed by disassembly). ``_op_mkdir``
-    therefore appends a sentinel component to have the whole requested path created;
-    confirm the sentinel is never itself created.
-8.  Deletes are limited, and this is a real functional gap. ``delete_file_or_folder``
+7.  Deletes are limited, and this is a real functional gap. ``delete_file_or_folder``
     takes a ``FileOrFolder`` object, and the only way to obtain one is
     ``storage.find_path(parts)`` against the CACHED tree — which omits ``*.sdr``
     folders and ``system/``. Calibre 9.15 exposes no delete-by-name primitive (its own
@@ -130,17 +126,17 @@ backend as `DeviceNotFound` with the start marker present. Nothing past
     anything the cached tree hides; that case returns ``code: "not_in_cached_tree"``,
     which the backend raises as a named exception. Verify whether the cached tree is
     really that narrow.
-9.  Exit-code mapping — ``_classify`` first catches ``calibre.devices.errors`` classes
+8.  Exit-code mapping — ``_classify`` first catches ``calibre.devices.errors`` classes
     and otherwise matches substrings in the exception text. **The substring list is a
     guess.** Note in particular that read-only classification is gated on the op
     actually being a write: before that gate, a `put` whose error message merely
     contained a book title or local path with "read only" in it would abort the batch
     and tell the user their Kindle was write-protected. Record the real error text a
     device produces and replace the guesses.
-10. Free space — ``free_space()`` is documented by the DevicePlugin API to return a
+9.  Free space — ``free_space()`` is documented by the DevicePlugin API to return a
     three-element list (main, card A, card B); this file accepts either that or a bare
     integer. Confirm which one an MTP Kindle actually returns.
-11. Eject — MTP has no eject: the session is simply closed (``shutdown()``). Confirm
+10. Eject — MTP has no eject: the session is simply closed (``shutdown()``). Confirm
     the device is left in a clean state and the host does not need anything further.
 """
 
@@ -168,13 +164,15 @@ EXIT_WRITE_PROTECTED = 4
 
 # What `_classify` falls back on when an exception is not one of the
 # `calibre.devices.errors` classes it knows. Every one of these is a guess (see
-# FIRST-RUN VERIFICATION item 9).
+# FIRST-RUN VERIFICATION item 8).
 _BUSY_MARKERS = ("busy", "in use", "another application", "access denied", "lock")
 _NO_DEVICE_MARKERS = ("no device", "not found", "no mtp", "disconnected", "unplugged")
 _READ_ONLY_MARKERS = ("read-only", "read only", "write protect", "not writable", "readonly")
 
 _LIBRARY_UUID = "media-tools"
-_WRITE_OPS = frozenset({"put", "rm", "mkdir"})
+# Ops that write to the device, so that `_classify` only reads a "read only" error
+# message as write protection when a write was actually attempted.
+_WRITE_OPS = frozenset({"put", "rm"})
 
 
 class _HelperError(Exception):
@@ -503,7 +501,7 @@ def _op_rm(device, op: dict) -> dict:
         raise ValueError("rm needs a path, not the device root")
     target = storage.find_path(parts)
     if target is None:
-        # See FIRST-RUN VERIFICATION 8: `find_path` walks the CACHED tree, which omits
+        # See FIRST-RUN VERIFICATION 7: `find_path` walks the CACHED tree, which omits
         # `*.sdr` folders and `system/`, so "not found" here does not prove the path is
         # absent. The discriminator is what lets a caller tell "this class of path
         # cannot be deleted over MTP" from "the file is already gone" without
@@ -520,17 +518,6 @@ def _op_rm(device, op: dict) -> dict:
         }
     device.delete_file_or_folder(target)
     return {"op": "rm", "ok": True}
-
-
-def _op_mkdir(device, op: dict) -> dict:
-    storage = _storage(device)
-    parts = _split(op["path"])
-    if not parts:
-        return {"op": "mkdir", "ok": True}
-    # `ensure_parent` creates every component but the last, so a sentinel is appended
-    # to have the whole requested path created. See FIRST-RUN VERIFICATION 7.
-    device.ensure_parent(storage, parts + ["_"])
-    return {"op": "mkdir", "ok": True}
 
 
 def _op_free(device, op: dict) -> dict:
@@ -571,7 +558,6 @@ _OPS = {
     "get": _op_get,
     "put": _op_put,
     "rm": _op_rm,
-    "mkdir": _op_mkdir,
     "free": _op_free,
     "eject": _op_eject,
 }
