@@ -69,6 +69,7 @@ WARNING_CODES = frozenset(
         "book_id_unreadable",
         "extension_filter_bypassed",
         "device_rejected_thumbnail",
+        "sidecar_not_removed",
         "hash_from_previous",
         "name_collision_suffixed",
         "leftover_book",

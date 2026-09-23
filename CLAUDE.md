@@ -212,10 +212,20 @@ when the LLM is enabled and no OpenRouter key resolves.
 `warning` code (on an `item` event's `warnings`, or a standalone `warning` event):
 
 `no_gain`, `no_audio_only_format`, `cover_not_embedded`, `book_id_missing`,
-`extension_filter_bypassed`, `device_rejected_thumbnail`, `hash_from_previous`,
-`name_collision_suffixed`, `leftover_book`.
+`book_id_unreadable`, `extension_filter_bypassed`, `device_rejected_thumbnail`,
+`sidecar_not_removed`, `hash_from_previous`, `name_collision_suffixed`,
+`leftover_book`.
 
-(`device_rejected_thumbnail` IS produced today, by `ebook kindle thumbnails` — the
+(`book_id_unreadable` IS produced today, by `ebook kindle add`/`sync` — a device book
+whose EXTH 113 could not be READ AT ALL, which is a different thing from
+`book_id_missing` (a book that legitimately carries none): the first is transient and
+makes that book look absent to the "already on the device" check, the second is
+permanent. `sidecar_not_removed` IS produced today, by `ebook kindle remove`/`sync
+--delete-extras` — the book was removed but something that should have gone with it
+(its `.sdr` sidecar, its thumbnail) could not be, which over MTP is not a fault but a
+documented gap: Calibre 9.15 offers no delete-by-name and its cached device tree omits
+both. The book is still reported `done`.
+`device_rejected_thumbnail` IS produced today, by `ebook kindle thumbnails` — the
 same rejection `device_rejected` (above) reports as a `reason`, on the identical item.
 The `llm_unavailable` reason above is still reserved for the future LLM fallback and
 not produced by anything today. `hash_from_previous` IS produced today, by `ebook kindle

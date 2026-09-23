@@ -107,9 +107,10 @@ class MtpPathNotInCachedTree(FileNotFoundError):
 
     It subclasses `FileNotFoundError` so a caller written to `DeviceBackend`'s contract
     ("remove of an absent path raises FileNotFoundError") works unchanged against both
-    backends, while a caller that cares — Task 8, which surfaces this as a warning
-    rather than a failure — can catch this class specifically instead of
-    substring-matching English prose.
+    backends, while a caller that cares — `cli.run_remove`, which reports it as the
+    `sidecar_not_removed` warning on a book that is otherwise removed, rather than as
+    a failure — can catch this class specifically instead of substring-matching
+    English prose.
     """
 
 

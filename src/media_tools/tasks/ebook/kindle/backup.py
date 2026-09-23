@@ -224,7 +224,7 @@ class Snapshot:
 class RestoreReport:
     """What `restore` put back (or, under `dry_run`, would have).
 
-    Three lists say what did NOT go back, and why. They are reported rather than
+    Four lists say what did NOT go back, and why. They are reported rather than
     silently dropped, because a restore that quietly skips a book is the same class of
     lie as a backup that quietly skips one:
 
@@ -233,6 +233,12 @@ class RestoreReport:
       recorded, so it was NOT written to the device. Recovery is exactly where a
       corrupt snapshot does the most damage: this is the one path that overwrites a
       book the user still has with bytes from a backup.
+    - `not_in_snapshot` — an `only` entry this snapshot names nowhere at all, so there
+      is nothing to put back for it. **Only ever populated when `only` was given.**
+      The obvious way to reach it is undoing an operation that ADDED files: the
+      snapshot that protected it was taken BEFORE they existed, and `restore` only
+      ever writes files back — it never deletes — so the honest answer is "nothing to
+      restore", never a silent success.
     - `no_thumbnail` — a book restored without a thumbnail because it carries no EXTH
       113 id, so there was nothing to pair a thumbnail against. Its own bytes and its
       `.sdr` sidecar still went back. **Only ever populated when `only` was given**:
@@ -246,6 +252,7 @@ class RestoreReport:
     missing: list[str] = field(default_factory=list)
     corrupt: list[str] = field(default_factory=list)
     no_thumbnail: list[str] = field(default_factory=list)
+    not_in_snapshot: list[str] = field(default_factory=list)
     dry_run: bool = False
 
 
@@ -645,7 +652,12 @@ def _discard(partial: Path) -> None:
 
 
 def restore(
-    device_backend, snapshot: Path, *, only: list[str] | None = None, dry_run: bool
+    device_backend,
+    snapshot: Path,
+    *,
+    only: list[str] | None = None,
+    dry_run: bool,
+    on_progress=None,
 ) -> RestoreReport:
     """Put a snapshot's files back on the device.
 
@@ -654,12 +666,18 @@ def restore(
     travel with it, because a book restored without them reads as a different, unread
     book. The thumbnail is found through the book's own EXTH 113 id, read from the
     snapshot's copy of it, never from its filename. An entry that names a directory
-    selects everything beneath it.
+    selects everything beneath it. An entry this snapshot knows nothing about is
+    reported as `not_in_snapshot` rather than silently dropped.
 
     Every file's hash is checked against the manifest before a single byte is written,
     and one that disagrees is refused rather than restored — see `RestoreReport`.
 
     `dry_run` computes the same report, hashes included, and writes nothing at all.
+
+    `on_progress(done, total, phase)` fires once per selected file, with `phase`
+    always `"restore"` — the same shape `snapshot()`'s own callback uses. It exists
+    because the hashing above is a full read of every selected file and happens under
+    `dry_run` too: a whole-library dry run would otherwise sit silent for minutes.
     """
     directory = Path(snapshot)
     data = _read_json(directory / MANIFEST_NAME)
@@ -675,26 +693,28 @@ def restore(
         if isinstance(entry, dict) and entry.get("path")
     }
     if only is None:
-        wanted, no_thumbnail = set(index), []
+        wanted, no_thumbnail, unmatched = set(index), [], []
     else:
-        wanted, no_thumbnail = _expand(directory, index, only)
+        wanted, no_thumbnail, unmatched = _expand(directory, index, only)
 
     restored: list[str] = []
     missing: list[str] = []
     corrupt: list[str] = []
     total = 0
-    for path in sorted(wanted):
+    selected = sorted(wanted)
+    for done, path in enumerate(selected, start=1):
         stored = directory / FILES_DIR / _stored_of(index[path])
-        if not stored.is_file():
-            missing.append(path)
-            continue
-        if not _hash_agrees(stored, index[path]):
+        if stored.is_file() and _hash_agrees(stored, index[path]):
+            total += stored.stat().st_size
+            if not dry_run:
+                device_backend.write(stored, path)
+            restored.append(path)
+        elif stored.is_file():
             corrupt.append(path)
-            continue
-        total += stored.stat().st_size
-        if not dry_run:
-            device_backend.write(stored, path)
-        restored.append(path)
+        else:
+            missing.append(path)
+        if on_progress:
+            on_progress(done, len(selected), "restore")
     return RestoreReport(
         files=len(restored),
         bytes=total,
@@ -702,6 +722,7 @@ def restore(
         missing=missing,
         corrupt=sorted(corrupt),
         no_thumbnail=sorted(set(no_thumbnail)),  # two `only` entries can reach one book
+        not_in_snapshot=sorted(set(unmatched)),
         dry_run=dry_run,
     )
 
@@ -717,22 +738,29 @@ def _hash_agrees(stored: Path, entry: dict) -> bool:
     return sha256_of(stored) == recorded
 
 
-def _expand(directory: Path, index: dict[str, dict], only: list[str]) -> tuple[set[str], list[str]]:
-    """`(paths to restore, books that could not be paired with a thumbnail)`."""
+def _expand(
+    directory: Path, index: dict[str, dict], only: list[str]
+) -> tuple[set[str], list[str], list[str]]:
+    """`(paths to restore, books that could not be paired with a thumbnail, requests
+    this snapshot names nowhere)`."""
     wanted: set[str] = set()
     unpaired: list[str] = []
+    unmatched: list[str] = []
     for request in only:
         cleaned = str(request).strip("/")
         if not cleaned:
             continue
         direct = [p for p in index if p == cleaned or p.startswith(f"{cleaned}/")]
+        if not direct:
+            unmatched.append(cleaned)
+            continue
         wanted.update(direct)
         for path in direct:
             companions, paired = _companions_of(directory, index, path)
             wanted.update(companions)
             if not paired and PurePath(path).suffix.lower() in _BOOK_SUFFIXES:
                 unpaired.append(path)
-    return wanted, unpaired
+    return wanted, unpaired, unmatched
 
 
 def _companions_of(directory: Path, index: dict[str, dict], path: str) -> tuple[set[str], bool]:

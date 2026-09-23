@@ -1,11 +1,22 @@
-"""`media-tools ebook kindle status|scan|backup|thumbnails|add`, and the one place
-every later command (`remove`, `sync`, `eject`, `restore`) resolves a device through.
+"""`media-tools ebook kindle status|scan|backup|thumbnails|add|remove|sync|restore`,
+and the one place every later command (`eject`) resolves a device through.
 
-`status`/`scan` never write anywhere; `backup` writes only to the host. `thumbnails`
-and `add` write to the DEVICE itself — see their own docstrings, `run_thumbnails` and
-`run_add` below, for what that means for the mandatory pre-write backup and per-book
-failure handling. Do not read this module's name or this docstring's history as a
-promise that nothing here writes: that was true through Task 5 and is no longer true.
+`status`/`scan` never write anywhere; `backup` writes only to the host. `thumbnails`,
+`add`, `sync` and `restore` write to the DEVICE, and `remove`/`sync --delete-extras`
+DELETE from it — see their own docstrings (`run_thumbnails`, `run_add`, `run_remove`,
+`run_sync`, `run_restore`) for what that means for the mandatory pre-write backup and
+per-book failure handling. Do not read this module's name or this docstring's history
+as a promise that nothing here writes: that was true through Task 5 and is no longer
+true of anything below `run_backup`.
+
+**Nothing is ever deleted without `--yes`.** `remove` and `sync --delete-extras`
+without it are plans: they list what they would take, write nothing at all (not to the
+device, not a backup, not a journal entry) and exit. With `--yes` the mandatory backup
+runs FIRST and the deletions follow it, in one backend instance, never re-detected in
+between. A removal takes the book, its `.sdr` folder and its thumbnail together, and
+refuses outright for `audible/`, for `system/` outside `thumbnails/`, and for a
+purchased `*.kfx` (`_protection_refusal`). `restore` is the other side of that: it
+only ever writes files back out of a snapshot, and never deletes anything itself.
 
 **Device resolution lives in exactly one helper, `resolve_device`.** It does detection
 (`device_finder`, defaulting to `detect.find_device`) and backend construction
@@ -33,7 +44,7 @@ generic `_fail`/`empty_result` path, which can only express "nothing was attempt
 right for `device_not_found`/`device_busy`, wrong for a backup that really did run and
 really did fail. This does NOT generalise to a WRITE command whose MANDATORY pre-write
 backup fails — `run_thumbnails` and `run_add` here, and every future one
-(`remove`/`sync`, Task 8): there the backup is a precondition and nothing the user
+(`remove`, `sync` and `restore`): there the backup is a precondition and nothing the user
 actually asked for was attempted, so that failure should keep exit 3 AND `_fail`'s
 all-zero counts — see `_EXIT_FOR_CODE`'s own comment, and `_mandatory_backup` below
 (the one place this shape is built, shared by every write command rather than
@@ -98,6 +109,7 @@ from media_tools.core.events import (
     EXIT_FAILED,
     EXIT_INTERRUPTED,
     EXIT_OK,
+    EXIT_USAGE,
     Reporter,
 )
 from media_tools.core.paths import BatchNameError, output_root, sanitize_batch
@@ -108,16 +120,21 @@ from media_tools.tasks.ebook import exth
 from media_tools.tasks.ebook.kindle import backup as backup_module
 from media_tools.tasks.ebook.kindle import detect, massstorage, mtp, thumbnails
 from media_tools.tasks.ebook.kindle.backend import (
+    PROTECTED_DIRS,
+    RESTRICTED_EXCEPTION,
+    RESTRICTED_PARENT,
     DeviceBackend,
     DeviceFile,
+    DeviceWritePathRejected,
     DeviceWriteProtected,
     sanitize_device_name,
+    validate_writable_path,
 )
 from media_tools.tasks.ebook.kindle.detect import Device, DeviceBusy, DeviceNotFound
 from media_tools.tasks.ebook.normalize import IGNORED_LANGUAGE_TAGS
 
 NAME = "kindle"
-HELP = "Report on, scan, back up, add books to, or install cover thumbnails on a connected Kindle."
+HELP = "Report on, scan, back up, add to, remove from, sync or restore a connected Kindle."
 
 # The formats `exth.read_records` can actually parse (MOBI-family containers).
 BOOK_SUFFIXES = frozenset({".azw", ".azw3", ".azw8", ".kfx", ".mobi", ".prc", ".pdb"})
@@ -131,7 +148,7 @@ _CACHE_INDEX_NAME = "index.json"
 DOCUMENTS_DIR = "documents"
 # Where a book with no usable language code lands. Deliberately a folder rather than
 # `documents/` itself: ONE rule ("every book this tool adds lives in
-# `documents/<lang>/`") is easier to reason about — and for Task 8's `restore --op` to
+# `documents/<lang>/`") is easier to reason about — and for `restore --op` to
 # undo — than two, and `ebook build` already shelves a language-less book under its own
 # named folder rather than at the batch root.
 UNKNOWN_LANGUAGE = "unknown"
@@ -172,6 +189,13 @@ DETAIL_OUT_OF_SPACE = "out_of_space"
 DETAIL_WRITE_REFUSED = "write_refused"
 DETAIL_SHORT_WRITE = "short_write"
 DETAIL_VERIFY_FAILED = "verify_failed"
+# `remove`/`sync`/`restore`'s own five, same rule: one registry `reason` covers
+# several causes, and `detail`'s term is what an agent branches on.
+DETAIL_PROTECTED = "protected"
+DETAIL_NOT_A_BOOK = "not_a_book"
+DETAIL_REMOVE_FAILED = "remove_failed"
+DETAIL_CORRUPT = "corrupt"
+DETAIL_NOT_IN_SNAPSHOT = "not_in_snapshot"
 DETAIL_TERMS = frozenset(
     {
         DETAIL_EXISTS,
@@ -181,8 +205,21 @@ DETAIL_TERMS = frozenset(
         DETAIL_WRITE_REFUSED,
         DETAIL_SHORT_WRITE,
         DETAIL_VERIFY_FAILED,
+        DETAIL_PROTECTED,
+        DETAIL_NOT_A_BOOK,
+        DETAIL_REMOVE_FAILED,
+        DETAIL_CORRUPT,
+        DETAIL_NOT_IN_SNAPSHOT,
     }
 )
+
+# The one warning a removal can carry: something that should have gone with the book
+# did not. Over MTP that is not a fault but a documented gap — Calibre 9.15 has no
+# delete-by-name and its cached device tree omits `*.sdr` folders and everything under
+# `system/`, so `remove` cannot reach either (`mtp.MtpPathNotInCachedTree`). The book
+# itself is gone regardless, and reporting the sidecar as removed when it is still
+# there would be a lie the user discovers the next time they open that book.
+SIDECAR_NOT_REMOVED_WARNING = "sidecar_not_removed"
 
 
 # --- argument wiring --------------------------------------------------------------
@@ -297,6 +334,110 @@ def register_subparsers(kindle_parser) -> None:
         "a backup or writing anything to the device.",
     )
 
+    remove_help = (
+        "Delete books from the connected Kindle, each with its .sdr folder and its "
+        "thumbnail. Plans only and changes NOTHING unless --yes is given."
+    )
+    remove_parser = subparsers.add_parser("remove", help=remove_help, description=remove_help)
+    _add_kindle_flags(remove_parser)
+    remove_parser.add_argument(
+        "books",
+        nargs="*",
+        metavar="BOOK",
+        help="Device paths, exactly as `scan` reports them (documents/en/Book.azw3).",
+    )
+    remove_parser.add_argument(
+        "--match",
+        metavar="TEXT",
+        default=None,
+        help="Remove every book whose device path OR own title/author contains TEXT "
+        "(case-insensitive) — the same rule `thumbnails --match` uses.",
+    )
+    remove_parser.add_argument(
+        "--asin",
+        metavar="ID",
+        default=None,
+        help="Remove the book carrying this EXTH 113 id, wherever it sits and "
+        "whatever it is called.",
+    )
+    remove_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually delete. Without it nothing is written, listed or not: the run "
+        "reports what it WOULD remove and exits.",
+    )
+
+    sync_help = (
+        "Add what an `ebook build` batch has and the device lacks. Removes the "
+        "device's extras only with --delete-extras AND --yes."
+    )
+    sync_parser = subparsers.add_parser("sync", help=sync_help, description=sync_help)
+    _add_kindle_flags(sync_parser)
+    sync_parser.add_argument(
+        "--batch",
+        metavar="NAME",
+        default=None,
+        help="The `ebook build` batch this device should mirror.",
+    )
+    sync_parser.add_argument(
+        "--lang",
+        metavar="XX",
+        default=None,
+        help="Put every added book under documents/XX/ instead of its own language.",
+    )
+    sync_parser.add_argument(
+        "--match",
+        metavar="TEXT",
+        default=None,
+        help="Only consider books whose device path OR own title/author contains TEXT "
+        "(case-insensitive) — narrows both halves, the adds and the extras.",
+    )
+    sync_parser.add_argument(
+        "--delete-extras",
+        action="store_true",
+        dest="delete_extras",
+        help="Also plan the removal of device books the batch does not have. Nothing "
+        "is deleted without --yes as well.",
+    )
+    sync_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Allow --delete-extras to actually delete. Adding books never needs it.",
+    )
+    sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report the whole plan without taking a backup or writing anything.",
+    )
+
+    restore_help = (
+        "Put a backup snapshot's files back on the device, or undo exactly one "
+        "journalled operation. Never deletes anything."
+    )
+    restore_parser = subparsers.add_parser("restore", help=restore_help, description=restore_help)
+    _add_kindle_flags(restore_parser)
+    restore_parser.add_argument(
+        "snapshot",
+        nargs="?",
+        default=None,
+        metavar="SNAPSHOT",
+        help="A snapshot directory name (or path) under this device's backups. "
+        "Defaults to the newest complete snapshot.",
+    )
+    restore_parser.add_argument(
+        "--op",
+        metavar="ID",
+        default=None,
+        help="Restore only what one journalled operation touched, from the snapshot "
+        "that protected it (`result.data.operation` of the run that made it).",
+    )
+    restore_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be put back — hashes checked, exactly as a real run "
+        "checks them — and write nothing.",
+    )
+
 
 def _add_kindle_flags(parser) -> None:
     parser.add_argument(
@@ -323,6 +464,12 @@ def run(args) -> int:
         return run_thumbnails(args)
     if args.kindle_command == "add":
         return run_add(args)
+    if args.kindle_command == "remove":
+        return run_remove(args)
+    if args.kindle_command == "sync":
+        return run_sync(args)
+    if args.kindle_command == "restore":
+        return run_restore(args)
     raise UsageError(f"unknown kindle subcommand: {args.kindle_command!r}")  # pragma: no cover
 
 
@@ -381,7 +528,7 @@ def _error_code_for(error: BaseException) -> str:
 # Every mapped code exits 3 (EXIT_DEPENDENCY) EXCEPT `backup_failed` — see this
 # module's own docstring for why exit 1 is the honest code for `backup` specifically.
 # A WRITE command that treats a mandatory pre-write backup as a precondition
-# (`thumbnails` and `add` today, Task 8's `remove`/`sync` next) must NOT reuse this
+# (`thumbnails`, `add`, `remove`, `sync` and `restore`) must NOT reuse this
 # table for that failure: nothing the user asked for was attempted there, which is
 # exit 3's meaning, not exit 1's — `_mandatory_backup` maps that case separately,
 # rather than assuming every `backup_failed` means "exit 1".
@@ -409,6 +556,38 @@ def _fail(reporter: Reporter, code: str, message: str) -> int:
     reporter.error(code=code, message=message)
     reporter.result(**empty_result(exit_code))
     return exit_code
+
+
+def _announcer(reporter: Reporter, stages: list[str]) -> Callable[[str], None]:
+    """`announce("plan")` emits that stage's own `stage` event with the index it
+    actually has in THIS run's `stages` list. Commands here build that list
+    conditionally (`--yes`/`--dry-run`/`--delete-extras` each add or drop a stage), and
+    a hand-written index is exactly the kind of thing that silently stops matching the
+    list announced in `start` when a later flag shifts it."""
+
+    def announce(stage: str) -> None:
+        reporter.stage(stage=stage, index=stages.index(stage) + 1, count=len(stages))
+
+    return announce
+
+
+def _body_failure(reporter: Reporter, *, code: str, message: str, exit_code: int) -> dict:
+    """A `body`-shaped failure for something `body` itself diagnosed: a `--op` id that
+    is not in the journal, a snapshot that cannot be read. All-zero counts, because
+    nothing the user asked for was attempted — the same shape `_mandatory_backup`
+    returns for a failed precondition, and deliberately not `_fail`, which would emit
+    its own `result` and bypass `_run`'s single-result-per-run guarantee."""
+    reporter.error(code=code, message=message)
+    return {
+        "ok": False,
+        "exit_code": exit_code,
+        "counts": {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0},
+        "failed": [],
+        "pending": [],
+        "outputs": [],
+        "run_file": None,
+        "data": {},
+    }
 
 
 def _close_quietly(backend: DeviceBackend | None) -> None:
@@ -667,17 +846,9 @@ def run_scan(
             if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
         ]
 
-        if device.mode == "mass_storage":
-            records_by_path = {
-                book.path: exth.read_records_safe(device.mount / book.path) for book in books
-            }
-        else:
-            key = backup_module.device_key(device)
-            cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
-            local_paths = _materialize_for_scan(backend, books, cache_dir)
-            records_by_path = {
-                book.path: exth.read_records_safe(local_paths[book.path]) for book in books
-            }
+        records_by_path, _ = _records_for(
+            root, device, backend, books, backup_module.device_key(device)
+        )
 
         result_books = []
         for item_id, book in enumerate(books, start=1):
@@ -743,6 +914,32 @@ def run_scan(
         backend_factory=backend_factory or default_backend_factory,
         body=body,
     )
+
+
+def _records_for(
+    root: Path,
+    device: Device,
+    backend: DeviceBackend,
+    books: list[DeviceFile],
+    key: str,
+) -> tuple[dict[str, dict[int, bytes]], dict[str, Path]]:
+    """`({device path: its EXTH records}, {device path: its local copy})` for whatever
+    subset of the device's books it is given.
+
+    The one place this subsystem turns device books into EXTH records: off the mount
+    directly for mass storage, and over MTP through the per-book header cache
+    (`_materialize_for_scan`, one `read_many` batch), which is also why the local
+    paths come back — `thumbnails` reuses them so a book is never fetched twice.
+    `scan`, `thumbnails` and `remove`/`sync` all go through this rather than each
+    repeating the mode check, which is exactly the kind of thing that drifts.
+    """
+    if device.mode == "mass_storage":
+        return {book.path: exth.read_records_safe(device.mount / book.path) for book in books}, {}
+    cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
+    local_paths = _materialize_for_scan(backend, books, cache_dir)
+    return {
+        book.path: exth.read_records_safe(local_paths[book.path]) for book in books
+    }, local_paths
 
 
 def _has_sdr(book_path: str, all_paths: set[str]) -> bool:
@@ -958,9 +1155,9 @@ def _take_backup(
     """Take the backup every write command takes before touching the device, with
     progress/warning wired to `reporter` the same way every caller needs it.
     Extracted so the callback wiring is not hand-copied by every write command —
-    `run_backup`, `run_thumbnails` and `run_add` are the three call sites today, and
-    Task 8's `remove`/`sync` are meant to be the fourth and fifth rather than a fourth
-    and fifth copy of it.
+    `run_backup`, `run_thumbnails`, `run_add`, `run_remove`, `run_sync` and
+    `run_restore` all reach the device through this one function rather than through
+    six copies of its callback wiring.
 
     Raises `backup_module.BackupFailed` on failure, UNTOUCHED, so each caller reacts
     to it its own way: `run_backup` reports it as `counts.failed: 1`/exit 1, since
@@ -1205,17 +1402,7 @@ def run_thumbnails(
         # for every `--match` call — do not "optimise" this back without also
         # reading `TAG_TITLE`/`TAG_AUTHOR` before it.
 
-        local_paths: dict[str, Path] = {}
-        if device.mode == "mass_storage":
-            records_by_path = {
-                book.path: exth.read_records_safe(device.mount / book.path) for book in book_entries
-            }
-        else:
-            cache_dir = backup_module.backup_root(root, key) / ".cache" / "headers"
-            local_paths = _materialize_for_scan(backend, book_entries, cache_dir)
-            records_by_path = {
-                book.path: exth.read_records_safe(local_paths[book.path]) for book in book_entries
-            }
+        records_by_path, local_paths = _records_for(root, device, backend, book_entries, key)
 
         # One (book, already_covered) pair per MATCHED device book, decided up
         # front: a book already carrying its exact thumbnail name is never handed
@@ -1466,6 +1653,23 @@ class _PlannedBook:
     def succeed(self) -> None:
         self.status, self.reason, self.detail = "done", None, None
 
+    # --- what `_report_rows` reads off every reported row ----------------------
+    @property
+    def report_input(self) -> str:
+        return str(self.source.path)
+
+    @property
+    def report_outputs(self) -> list[str]:
+        return [self.device_path] if self.status == "done" else []
+
+    @property
+    def report_bytes_in(self) -> int | None:
+        return self.size or None
+
+    @property
+    def report_bytes_out(self) -> int | None:
+        return self.size if self.status == "done" else None
+
     def as_dict(self) -> dict:
         return {
             "source": str(self.source.path),
@@ -1569,9 +1773,10 @@ def _device_path_for(name: str, language: str, *, max_path: int) -> str:
 
     A prefix long enough to leave less than `_MIN_NAME_BUDGET` raises instead of
     quietly overrunning the limit this function's whole contract is about. Unreachable
-    from `run_add`, whose language is two or three letters or `UNKNOWN_LANGUAGE` — but
-    this helper is exactly the kind of thing Task 8's `sync` will reuse with a
-    different directory, and a contract that fails loudly is the point of stating one.
+    from `run_add`/`run_sync`, whose language is two or three letters or
+    `UNKNOWN_LANGUAGE` — but a caller that one day joins a longer directory onto this
+    would otherwise overrun the budget silently, and a contract that fails loudly is
+    the point of stating one.
     """
     directory = f"{DOCUMENTS_DIR}/{language}/"
     budget = max_path - len(directory)
@@ -1618,31 +1823,34 @@ def _sources_from_paths(paths: list[Path]) -> list[_SourceBook]:
     return found
 
 
-def _sources_from_batch(root: Path, name: str) -> list[_SourceBook]:
-    """Every book an `ebook build` run placed, with the language it resolved for each.
+def _library_batch(root: Path, batch: str, *, flag: str) -> tuple[list[_SourceBook], set[str]]:
+    """`(every book an `ebook build` run placed, every book id it recorded)`, from ONE
+    read of that batch's `run.json`.
 
-    Filtered by `ADDABLE_SUFFIXES`, exactly as a FOLDER given on the command line is:
-    a batch is a scan result, not a file the user pointed at, so an output in some
-    other format is skipped rather than turned into a usage error. This filter is also
-    load-bearing for `_device_path_for`'s budget arithmetic, which assumes a short,
-    known extension.
+    The SOURCES are filtered by `ADDABLE_SUFFIXES`, exactly as a FOLDER given on the
+    command line is: a batch is a scan result, not a file the user pointed at, so an
+    output in some other format is skipped rather than turned into a usage error. This
+    filter is also load-bearing for `_device_path_for`'s budget arithmetic, which
+    assumes a short, known extension. An item whose recorded output has since been
+    deleted is KEPT rather than filtered out here, so it is reported as its own
+    `source_missing` item instead of quietly shrinking the plan — the same reason
+    `ebook build` reports that case rather than dropping it.
 
-    An item whose recorded output has since been deleted is KEPT rather than filtered
-    out here, so it is reported as its own `source_missing` item instead of quietly
-    shrinking the plan — the same reason `ebook build` reports that case rather than
-    dropping it.
+    The IDS are deliberately NOT filtered that way: they answer `sync --delete-extras`'
+    only question — "does the library have this book at all" — and a library book
+    whose output happens to be a format this tool would not ADD is still a book the
+    library has, so deleting the device's copy of it would be wrong.
     """
-    try:
-        batch = sanitize_batch(name)
-    except BatchNameError as error:
-        raise UsageError(str(error)) from error
-
     sources: list[_SourceBook] = []
+    ids: set[str] = set()
     seen: set[str] = set()
-    for item in _read_library_items(root, batch, flag="--batch"):
+    for item in _read_library_items(root, batch, flag=flag):
         if not isinstance(item, dict) or item.get("status") != "done":
             continue
         data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        book_id = data.get("book_id")
+        if isinstance(book_id, str) and book_id:
+            ids.add(book_id)
         output = data.get("output")
         if not isinstance(output, str) or not output or output in seen:
             continue
@@ -1656,7 +1864,18 @@ def _sources_from_batch(root: Path, name: str) -> list[_SourceBook]:
                 language=language if isinstance(language, str) else None,
             )
         )
-    return sources
+    return sources, ids
+
+
+def _sources_from_batch(root: Path, name: str) -> list[_SourceBook]:
+    """`_library_batch`'s sources alone, for `add --batch NAME`, which has no use for
+    the library's ids (it matches what is already on the DEVICE, not what the library
+    lacks)."""
+    try:
+        batch = sanitize_batch(name)
+    except BatchNameError as error:
+        raise UsageError(str(error)) from error
+    return _library_batch(root, batch, flag="--batch")[0]
 
 
 def _resolve_add_sources(args, root: Path) -> list[_SourceBook]:
@@ -1935,9 +2154,13 @@ def _provenance_verdict(
 def _journal_add(root: Path, key: str, records: list[dict], snapshot_name: str) -> str | None:
     """Record everything this run put on the device, or nothing if it put nothing.
 
-    `paths` is what Task 8's `restore --op ID` removes (books AND their thumbnails);
-    `books` is the per-book provenance `_previous_placements` reads back, which is what
-    lets a later run recognise an id-less source without ever comparing filenames.
+    `paths` is every device path this run WROTE (books and their thumbnails), which
+    is what `restore --op ID` selects — and, for an `add`, deliberately finds nothing
+    for: the snapshot that protected this run was taken before those files existed, so
+    it reports them as `not_in_snapshot` rather than deleting them (`restore` never
+    deletes; taking an added book off again is `remove`'s job). `books` is the per-book
+    provenance `_previous_placements` reads back, which is what lets a later run
+    recognise an id-less source without ever comparing filenames.
     """
     if not records:
         return None
@@ -2022,9 +2245,10 @@ def run_add(
     source's. A write the backend accepted that left nothing, or left the wrong number
     of bytes (the real MTP failure mode — there is no rename primitive there, per
     Ruling R12), is a `failed` item, not a done one. The short file is left where it
-    is rather than deleted: the journal records it, so Task 8's `restore --op` can undo
-    it as part of the same operation, and this command never removes anything from a
-    device by itself.
+    is rather than deleted: this command never removes anything from a device by
+    itself, and the journal records the short file so `ebook kindle remove` can take
+    it off deliberately (re-running `add` also overwrites it, which is what the
+    unverified-placement waiver exists for).
 
     **The journal is written even when the run does not finish.** Everything from the
     first `write` to the journal call runs inside one guard: a Ctrl+C (which
@@ -2073,10 +2297,11 @@ def run_add(
 
     def body(reporter: Reporter, root: Path, device: Device, backend: DeviceBackend) -> dict:
         key = backup_module.device_key(device)
+        announce = _announcer(reporter, stages)
         snap: backup_module.Snapshot | None = None
 
         if not dry_run:
-            reporter.stage(stage="backup", index=2, count=len(stages))
+            announce("backup")
             failure, snap = _mandatory_backup(reporter, root, backend, key)
             if failure is not None:
                 return failure
@@ -2090,138 +2315,17 @@ def run_add(
                 )
 
         # --- plan ---------------------------------------------------------------
-        reporter.stage(stage="plan", index=len(stages) if dry_run else 3, count=len(stages))
-        all_entries = backend.list_files()
-        device_sizes = {entry.path: entry.size for entry in all_entries}
-        occupied = {path.casefold() for path in device_sizes}
-        device_books = [
-            entry
-            for entry in all_entries
-            if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
-        ]
-        ids_by_path, unreadable = _device_book_ids(root, device, backend, device_books, key)
-        device_ids = set(ids_by_path.values()) - {""}
-        if unreadable:
-            # A book whose EXTH could not be READ looks ABSENT to the id check, so a
-            # source it already holds reads as new and gets copied a second time —
-            # under a name the device copy need not share, which is how a systemic
-            # read failure quietly duplicates a whole library. Its own code, NOT
-            # `book_id_missing`: that one means a book legitimately carries no EXTH
-            # 113 (permanent, and cacheable as such), while this means the read itself
-            # failed (transient, and specifically never cached — see
-            # `_device_book_ids`). One code for both would re-conflate at the wire
-            # exactly what that function separates in the logic, and a consumer
-            # aggregating `book_id_missing` would be summing two populations.
-            reporter.warning(
-                code="book_id_unreadable",
-                message=(
-                    f"{len(unreadable)} book(s) on the device could not be read for "
-                    "their EXTH 113 id and will look absent to this run (first: "
-                    f"{unreadable[0]})"
-                ),
-            )
-        placements = _previous_placements(root, key)
-
-        max_path = MAX_DEVICE_PATH.get(device.mode, MAX_DEVICE_PATH["mtp"])
-        needle = args.match.lower() if args.match else None
-
-        planned: list[_PlannedBook] = []
-        queued: list[_PlannedBook] = []
-        claimed: dict[str, str] = {}  # casefolded device path -> the source that took it
-        for source in sources:
-            records = exth.read_records_safe(source.path)
-            book_id = exth.record_text(records, exth.TAG_UUID) or ""
-            title = exth.record_text(records, exth.TAG_TITLE) or ""
-            author = exth.record_text(records, exth.TAG_AUTHOR) or ""
-            cdetype = exth.record_text(records, exth.TAG_CDETYPE) or thumbnails.DEFAULT_CDETYPE
-            language = _language_for(
-                language_override, source.language, exth.record_text(records, exth.TAG_LANGUAGE)
-            )
-            device_path = _device_path_for(source.path.name, language, max_path=max_path)
-            if needle is not None and not any(
-                needle in haystack.lower() for haystack in (device_path, title, author)
-            ):
-                # The exact `--match` rule `thumbnails` established (Ruling R36): the
-                # device path OR the book's own EXTH title OR its author, any hit
-                # counting. A non-matching book gets no item at all — it was never
-                # part of what this run was asked to do.
-                continue
-
-            book = _PlannedBook(
-                id=len(planned) + 1,
-                source=source,
-                device_path=device_path,
-                book_id=book_id,
-                cdetype=cdetype,
-                title=title,
-                author=author,
-                language=language,
-                size=source.path.stat().st_size if source.path.is_file() else 0,
-            )
-            planned.append(book)
-            if source.path.is_file() and not book_id:
-                # Only for a book we could actually READ that carried no id — a source
-                # no longer on the host has no records to be missing one, and saying
-                # otherwise would blame the wrong thing.
-                book.warnings.append("book_id_missing")
-
-            placed_at, unconfirmed = (
-                (None, set()) if book_id else _provenance_verdict(placements, source, device_sizes)
-            )
-            if not source.path.is_file():
-                book.fail(
-                    "source_missing",
-                    DETAIL_SOURCE_MISSING,
-                    f"{source.path} is no longer on the host",
-                )
-            elif book_id and book_id in device_ids:
-                book.skip(
-                    "exists", DETAIL_EXISTS, "already on the device (matched by its EXTH 113 id)"
-                )
-            elif placed_at is not None:
-                book.skip(
-                    "exists",
-                    DETAIL_EXISTS,
-                    f"this tool already put this file at {placed_at} and the device still "
-                    "holds it at that size (it carries no EXTH 113 id to match on)",
-                )
-            elif device_path.casefold() in claimed:
-                book.fail(
-                    "output_collision",
-                    DETAIL_OUTPUT_COLLISION,
-                    f"{claimed[device_path.casefold()]} in this same run already resolves "
-                    f"to {device_path}",
-                )
-            elif device_path.casefold() in occupied and device_path.casefold() not in unconfirmed:
-                book.fail(
-                    "output_collision",
-                    DETAIL_OUTPUT_COLLISION,
-                    f"{device_path} is already occupied on the device by a file that is "
-                    "not this book; refusing to overwrite it",
-                )
-            else:
-                claimed[device_path.casefold()] = str(source.path)
-                queued.append(book)
-
-        # Free space is checked against the RUNNING total, not once against the sum:
-        # a device with room for some of the books should place those and fail only
-        # the ones that genuinely no longer fit. `free_space()` RAISES rather than
-        # answering 0 when it cannot tell (both backends), so "0 left" here always
-        # means a genuinely full device.
-        free_space = backend.free_space()
-        remaining = free_space
-        to_copy: list[_PlannedBook] = []
-        for book in queued:
-            if book.size > remaining:
-                book.fail(
-                    "engine_error",
-                    DETAIL_OUT_OF_SPACE,
-                    f"not enough free space on the device: {format_size(book.size)} needed, "
-                    f"{format_size(remaining)} left",
-                )
-                continue
-            remaining -= book.size
-            to_copy.append(book)
+        announce("plan")
+        view = _survey_device(reporter, root, device, backend, key)
+        planned, queued = _plan_add(
+            view,
+            sources,
+            language_override=language_override,
+            needle=args.match.lower() if args.match else None,
+            max_path=MAX_DEVICE_PATH.get(device.mode, MAX_DEVICE_PATH["mtp"]),
+            placements=_previous_placements(root, key),
+        )
+        free_space, to_copy = _fit_to_free_space(backend, queued)
 
         if dry_run:
             # Whatever survived planning WOULD be copied; `pending` is the honest
@@ -2236,152 +2340,12 @@ def run_add(
                 operation_id=None,
                 free_space=free_space,
                 queued=queued,
-                device_books_unreadable=len(unreadable),
+                device_books_unreadable=len(view.unreadable),
             )
 
-        written: list[dict] = []
-        try:
-            # --- copy -----------------------------------------------------------
-            reporter.stage(stage="copy", index=4, count=len(stages))
-            copied: list[_PlannedBook] = []
-            for index, book in enumerate(to_copy, start=1):
-                try:
-                    backend.write(book.source.path, book.device_path)
-                except (RuntimeError, OSError) as error:
-                    # Per book, never fatal to the batch: a full disk, a yanked cable,
-                    # a `DeviceWriteProtected`, an MTP `CalibreError` — whatever it
-                    # was, the books after this one still deserve their turn. A
-                    # `KeyboardInterrupt` is NOT caught here: it is not one book's
-                    # problem, and the outer guard journals what already landed.
-                    book.fail(
-                        "engine_error",
-                        DETAIL_WRITE_REFUSED,
-                        f"the device refused the write: {error}",
-                    )
-                    continue
-                # Appended BEFORE the hash, which reads the whole source again: a
-                # Ctrl+C in that window would otherwise leave this book on the device
-                # and absent from the journal, which is the very hole the outer guard
-                # exists to close.
-                record = book.provenance()
-                written.append(record)
-                copied.append(book)
-                record["sha256"] = _source_digest(book.source.path)
-                reporter.progress(
-                    stage="copy",
-                    index=index,
-                    count=len(to_copy),
-                    path=book.device_path,
-                    percent=100.0 * index / len(to_copy),
-                )
-
-            # --- thumbnails -------------------------------------------------------
-            reporter.stage(stage="thumbnails", index=5, count=len(stages))
-
-            def on_thumbnail_progress(done: int, total: int) -> None:
-                reporter.progress(
-                    stage="thumbnails",
-                    index=done,
-                    count=total,
-                    path=f"kindle:{key}",
-                    percent=(100.0 * done / total) if total else 100.0,
-                )
-
-            thumbnail_statuses = thumbnails.install(
-                backend,
-                [
-                    thumbnails.Book(
-                        device_path=book.device_path,
-                        book_id=book.book_id,
-                        cdetype=book.cdetype,
-                        # The copy we just sent IS the book — never fetch it back off
-                        # the device to read its embedded cover (one MTP round trip per
-                        # book instead of two, and identical bytes either way).
-                        local_path=book.source.path,
-                    )
-                    for book in copied
-                ],
-                cache_dir=root / ".cache",
-                on_progress=on_thumbnail_progress,
-            )
-            for record, book in zip(written, copied, strict=True):
-                status = thumbnail_statuses.get(book.book_id or book.device_path, "no_cover")
-                if status == "installed":
-                    book.thumbnail = (
-                        f"{thumbnails.THUMBNAIL_DIR}"
-                        f"{thumbnails.thumbnail_name(book.book_id, book.cdetype)}"
-                    )
-                    record["thumbnail"] = book.thumbnail
-                elif status == "rejected":
-                    book.warnings.append("device_rejected_thumbnail")
-                # "no_cover"/"failed" carry no registered warning code of their own;
-                # the book is on the device regardless, so the outcome is reported in
-                # `result.data.thumbnails` rather than invented into the registry.
-
-            # --- verify -----------------------------------------------------------
-            reporter.stage(stage="verify", index=6, count=len(stages))
-            landed: dict[str, int] | None = None
-            verify_error: str | None = None
-            try:
-                landed = {entry.path: entry.size for entry in backend.list_files(DOCUMENTS_DIR)}
-            except (RuntimeError, OSError) as error:
-                # Caught here rather than left to `_run`: every book already has an
-                # outcome, and letting this escape would replace them all with
-                # `_fail`'s all-zero "nothing was attempted" result, which would be a
-                # lie about a run that demonstrably wrote to the device.
-                verify_error = str(error)
-            # `record["verified"]` is set inside this loop, per book, the moment that
-            # book's own verdict is known — not in a second pass afterwards. It is
-            # what the NEXT run consults before overwriting anything
-            # (`_provenance_verdict`), and every statement between the write and the
-            # flag is a window in which an interrupt leaves a book that landed
-            # perfectly recorded as unconfirmed. The window cannot be closed (nothing
-            # can confirm a write before the device has been asked), but it should be
-            # as short as the code allows.
-            for record, book in zip(written, copied, strict=True):
-                if landed is None:
-                    book.fail(
-                        "engine_error",
-                        DETAIL_VERIFY_FAILED,
-                        f"the device could not be listed to confirm the write: {verify_error}",
-                    )
-                    record["verified"] = False
-                    continue
-                size = landed.get(book.device_path)
-                if size is None:
-                    book.fail(
-                        "engine_error",
-                        DETAIL_VERIFY_FAILED,
-                        "the device accepted the write but the file is not on it afterwards",
-                    )
-                elif size != book.size:
-                    book.fail(
-                        "engine_error",
-                        DETAIL_SHORT_WRITE,
-                        f"the file on the device is {format_size(size)}, not the "
-                        f"{format_size(book.size)} that was sent",
-                    )
-                else:
-                    book.succeed()
-                record["verified"] = book.status == "done"
-        except BaseException:
-            # `BaseException`, because the realistic case is `KeyboardInterrupt`:
-            # `MassStorageBackend.write` re-raises it after removing its own temp file,
-            # and without this the books already on the device would have no record of
-            # how they got there while `_run` reported all-zero counts. The journal is
-            # best-effort HERE only — a second failure while writing it must not
-            # replace the exception the user actually needs to see (and, for a
-            # `KeyboardInterrupt`, would cost `_run` its exit-130 mapping too).
-            with contextlib.suppress(Exception):
-                _journal_add(root, key, written, snap.path.name)
-            raise
-
-        # --- journal --------------------------------------------------------------
-        # Last on the happy path, exactly as the order of operations pins it. A
-        # failure writing it DOES escape here (unlike in the guard above): there is no
-        # other exception competing for the user's attention, and a run that wrote to
-        # the device without recording it is not a success.
-        operation_id = _journal_add(root, key, written, snap.path.name)
+        thumbnail_statuses, operation_id = _copy_books(
+            reporter, root, key, backend, to_copy, snap, announce
+        )
 
         return _add_result(
             reporter,
@@ -2391,7 +2355,7 @@ def run_add(
             operation_id=operation_id,
             free_space=free_space,
             queued=queued,
-            device_books_unreadable=len(unreadable),
+            device_books_unreadable=len(view.unreadable),
         )
 
     return _run(
@@ -2404,6 +2368,395 @@ def run_add(
         backend_factory=backend_factory or default_backend_factory,
         body=body,
     )
+
+
+# --- add's own phases, shared with `sync` ------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _DeviceView:
+    """Everything a plan needs to know about what is already on the device, read in
+    ONE listing: sizes by path, the casefolded set of occupied paths (FAT32 compares
+    that way), the books among them, each book's EXTH 113 id, and the paths whose id
+    could not be read at all."""
+
+    entries: list[DeviceFile]
+    sizes: dict[str, int]
+    occupied: set[str]
+    books: list[DeviceFile]
+    ids_by_path: dict[str, str]
+    unreadable: list[str]
+
+    @property
+    def paths(self) -> set[str]:
+        return set(self.sizes)
+
+    @property
+    def ids(self) -> set[str]:
+        return set(self.ids_by_path.values()) - {""}
+
+
+def _survey_device(
+    reporter: Reporter, root: Path, device: Device, backend: DeviceBackend, key: str
+) -> _DeviceView:
+    entries = backend.list_files()
+    sizes = {entry.path: entry.size for entry in entries}
+    books = [
+        entry for entry in entries if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
+    ]
+    ids_by_path, unreadable = _device_book_ids(root, device, backend, books, key)
+    if unreadable:
+        # A book whose EXTH could not be READ looks ABSENT to the id check, so a
+        # source it already holds reads as new and gets copied a second time —
+        # under a name the device copy need not share, which is how a systemic
+        # read failure quietly duplicates a whole library. (For `sync
+        # --delete-extras` it cuts the other way: a book with no readable id can
+        # never be PROVEN absent from the library, so it is never an extra.) Its own
+        # code, NOT `book_id_missing`: that one means a book legitimately carries no
+        # EXTH 113 (permanent, and cacheable as such), while this means the read
+        # itself failed (transient, and specifically never cached — see
+        # `_device_book_ids`). One code for both would re-conflate at the wire
+        # exactly what that function separates in the logic, and a consumer
+        # aggregating `book_id_missing` would be summing two populations.
+        reporter.warning(
+            code="book_id_unreadable",
+            message=(
+                f"{len(unreadable)} book(s) on the device could not be read for "
+                "their EXTH 113 id and will look absent to this run (first: "
+                f"{unreadable[0]})"
+            ),
+        )
+    return _DeviceView(
+        entries=entries,
+        sizes=sizes,
+        occupied={path.casefold() for path in sizes},
+        books=books,
+        ids_by_path=ids_by_path,
+        unreadable=unreadable,
+    )
+
+
+def _plan_add(
+    view: _DeviceView,
+    sources: list[_SourceBook],
+    *,
+    language_override: str | None,
+    needle: str | None,
+    max_path: int,
+    placements: dict[str, dict[str, dict]],
+) -> tuple[list[_PlannedBook], list[_PlannedBook]]:
+    """`(every matched source with a verdict, the ones that still want copying)`.
+
+    Read-only: every check here is a comparison against `view` or the journal, which
+    is what lets `--dry-run` report the same verdicts a real run would reach. Shared
+    with `sync`, which has exactly the same question to answer about its batch.
+    """
+    planned: list[_PlannedBook] = []
+    queued: list[_PlannedBook] = []
+    claimed: dict[str, str] = {}  # casefolded device path -> the source that took it
+    for source in sources:
+        records = exth.read_records_safe(source.path)
+        book_id = exth.record_text(records, exth.TAG_UUID) or ""
+        title = exth.record_text(records, exth.TAG_TITLE) or ""
+        author = exth.record_text(records, exth.TAG_AUTHOR) or ""
+        cdetype = exth.record_text(records, exth.TAG_CDETYPE) or thumbnails.DEFAULT_CDETYPE
+        language = _language_for(
+            language_override, source.language, exth.record_text(records, exth.TAG_LANGUAGE)
+        )
+        device_path = _device_path_for(source.path.name, language, max_path=max_path)
+        if needle is not None and not any(
+            needle in haystack.lower() for haystack in (device_path, title, author)
+        ):
+            # The exact `--match` rule `thumbnails` established (Ruling R36): the
+            # device path OR the book's own EXTH title OR its author, any hit
+            # counting. A non-matching book gets no item at all — it was never
+            # part of what this run was asked to do.
+            continue
+
+        book = _PlannedBook(
+            id=len(planned) + 1,
+            source=source,
+            device_path=device_path,
+            book_id=book_id,
+            cdetype=cdetype,
+            title=title,
+            author=author,
+            language=language,
+            size=source.path.stat().st_size if source.path.is_file() else 0,
+        )
+        planned.append(book)
+        if source.path.is_file() and not book_id:
+            # Only for a book we could actually READ that carried no id — a source
+            # no longer on the host has no records to be missing one, and saying
+            # otherwise would blame the wrong thing.
+            book.warnings.append("book_id_missing")
+
+        placed_at, unconfirmed = (
+            (None, set()) if book_id else _provenance_verdict(placements, source, view.sizes)
+        )
+        if not source.path.is_file():
+            book.fail(
+                "source_missing",
+                DETAIL_SOURCE_MISSING,
+                f"{source.path} is no longer on the host",
+            )
+        elif book_id and book_id in view.ids:
+            book.skip("exists", DETAIL_EXISTS, "already on the device (matched by its EXTH 113 id)")
+        elif placed_at is not None:
+            book.skip(
+                "exists",
+                DETAIL_EXISTS,
+                f"this tool already put this file at {placed_at} and the device still "
+                "holds it at that size (it carries no EXTH 113 id to match on)",
+            )
+        elif device_path.casefold() in claimed:
+            book.fail(
+                "output_collision",
+                DETAIL_OUTPUT_COLLISION,
+                f"{claimed[device_path.casefold()]} in this same run already resolves "
+                f"to {device_path}",
+            )
+        elif device_path.casefold() in view.occupied and device_path.casefold() not in unconfirmed:
+            book.fail(
+                "output_collision",
+                DETAIL_OUTPUT_COLLISION,
+                f"{device_path} is already occupied on the device by a file that is "
+                "not this book; refusing to overwrite it",
+            )
+        else:
+            claimed[device_path.casefold()] = str(source.path)
+            queued.append(book)
+
+    return planned, queued
+
+
+def _fit_to_free_space(
+    backend: DeviceBackend, queued: list[_PlannedBook]
+) -> tuple[int, list[_PlannedBook]]:
+    """`(free bytes on the device, the books that fit)`, failing the rest in
+    place."""
+    # Free space is checked against the RUNNING total, not once against the sum:
+    # a device with room for some of the books should place those and fail only
+    # the ones that genuinely no longer fit. `free_space()` RAISES rather than
+    # answering 0 when it cannot tell (both backends), so "0 left" here always
+    # means a genuinely full device.
+    free_space = backend.free_space()
+    remaining = free_space
+    to_copy: list[_PlannedBook] = []
+    for book in queued:
+        if book.size > remaining:
+            book.fail(
+                "engine_error",
+                DETAIL_OUT_OF_SPACE,
+                f"not enough free space on the device: {format_size(book.size)} needed, "
+                f"{format_size(remaining)} left",
+            )
+            continue
+        remaining -= book.size
+        to_copy.append(book)
+    return free_space, to_copy
+
+
+def _copy_books(
+    reporter: Reporter,
+    root: Path,
+    key: str,
+    backend: DeviceBackend,
+    to_copy: list[_PlannedBook],
+    snap: backup_module.Snapshot,
+    announce: Callable[[str], None],
+) -> tuple[dict[str, str], str | None]:
+    """The three stages that actually write: copy, thumbnails, verify — then the
+    journal. Returns `(per-book thumbnail statuses, the journalled operation id)`;
+    every book's own verdict is settled on the `_PlannedBook` objects themselves.
+    Shared with `sync`, which writes exactly the same way `add` does.
+    """
+    written: list[dict] = []
+    try:
+        # --- copy -----------------------------------------------------------
+        announce("copy")
+        copied: list[_PlannedBook] = []
+        for index, book in enumerate(to_copy, start=1):
+            try:
+                backend.write(book.source.path, book.device_path)
+            except (RuntimeError, OSError) as error:
+                # Per book, never fatal to the batch: a full disk, a yanked cable,
+                # a `DeviceWriteProtected`, an MTP `CalibreError` — whatever it
+                # was, the books after this one still deserve their turn. A
+                # `KeyboardInterrupt` is NOT caught here: it is not one book's
+                # problem, and the outer guard journals what already landed.
+                book.fail(
+                    "engine_error",
+                    DETAIL_WRITE_REFUSED,
+                    f"the device refused the write: {error}",
+                )
+                continue
+            # Appended BEFORE the hash, which reads the whole source again: a
+            # Ctrl+C in that window would otherwise leave this book on the device
+            # and absent from the journal, which is the very hole the outer guard
+            # exists to close.
+            record = book.provenance()
+            written.append(record)
+            copied.append(book)
+            record["sha256"] = _source_digest(book.source.path)
+            reporter.progress(
+                stage="copy",
+                index=index,
+                count=len(to_copy),
+                path=book.device_path,
+                percent=100.0 * index / len(to_copy),
+            )
+
+        # --- thumbnails -------------------------------------------------------
+        announce("thumbnails")
+
+        def on_thumbnail_progress(done: int, total: int) -> None:
+            reporter.progress(
+                stage="thumbnails",
+                index=done,
+                count=total,
+                path=f"kindle:{key}",
+                percent=(100.0 * done / total) if total else 100.0,
+            )
+
+        thumbnail_statuses = thumbnails.install(
+            backend,
+            [
+                thumbnails.Book(
+                    device_path=book.device_path,
+                    book_id=book.book_id,
+                    cdetype=book.cdetype,
+                    # The copy we just sent IS the book — never fetch it back off
+                    # the device to read its embedded cover (one MTP round trip per
+                    # book instead of two, and identical bytes either way).
+                    local_path=book.source.path,
+                )
+                for book in copied
+            ],
+            cache_dir=root / ".cache",
+            on_progress=on_thumbnail_progress,
+        )
+        for record, book in zip(written, copied, strict=True):
+            status = thumbnail_statuses.get(book.book_id or book.device_path, "no_cover")
+            if status == "installed":
+                book.thumbnail = (
+                    f"{thumbnails.THUMBNAIL_DIR}"
+                    f"{thumbnails.thumbnail_name(book.book_id, book.cdetype)}"
+                )
+                record["thumbnail"] = book.thumbnail
+            elif status == "rejected":
+                book.warnings.append("device_rejected_thumbnail")
+            # "no_cover"/"failed" carry no registered warning code of their own;
+            # the book is on the device regardless, so the outcome is reported in
+            # `result.data.thumbnails` rather than invented into the registry.
+
+        # --- verify -----------------------------------------------------------
+        announce("verify")
+        landed: dict[str, int] | None = None
+        verify_error: str | None = None
+        try:
+            landed = {entry.path: entry.size for entry in backend.list_files(DOCUMENTS_DIR)}
+        except (RuntimeError, OSError) as error:
+            # Caught here rather than left to `_run`: every book already has an
+            # outcome, and letting this escape would replace them all with
+            # `_fail`'s all-zero "nothing was attempted" result, which would be a
+            # lie about a run that demonstrably wrote to the device.
+            verify_error = str(error)
+        # `record["verified"]` is set inside this loop, per book, the moment that
+        # book's own verdict is known — not in a second pass afterwards. It is
+        # what the NEXT run consults before overwriting anything
+        # (`_provenance_verdict`), and every statement between the write and the
+        # flag is a window in which an interrupt leaves a book that landed
+        # perfectly recorded as unconfirmed. The window cannot be closed (nothing
+        # can confirm a write before the device has been asked), but it should be
+        # as short as the code allows.
+        for record, book in zip(written, copied, strict=True):
+            if landed is None:
+                book.fail(
+                    "engine_error",
+                    DETAIL_VERIFY_FAILED,
+                    f"the device could not be listed to confirm the write: {verify_error}",
+                )
+                record["verified"] = False
+                continue
+            size = landed.get(book.device_path)
+            if size is None:
+                book.fail(
+                    "engine_error",
+                    DETAIL_VERIFY_FAILED,
+                    "the device accepted the write but the file is not on it afterwards",
+                )
+            elif size != book.size:
+                book.fail(
+                    "engine_error",
+                    DETAIL_SHORT_WRITE,
+                    f"the file on the device is {format_size(size)}, not the "
+                    f"{format_size(book.size)} that was sent",
+                )
+            else:
+                book.succeed()
+            record["verified"] = book.status == "done"
+    except BaseException:
+        # `BaseException`, because the realistic case is `KeyboardInterrupt`:
+        # `MassStorageBackend.write` re-raises it after removing its own temp file,
+        # and without this the books already on the device would have no record of
+        # how they got there while `_run` reported all-zero counts. The journal is
+        # best-effort HERE only — a second failure while writing it must not
+        # replace the exception the user actually needs to see (and, for a
+        # `KeyboardInterrupt`, would cost `_run` its exit-130 mapping too).
+        with contextlib.suppress(Exception):
+            _journal_add(root, key, written, snap.path.name)
+        raise
+
+    # --- journal --------------------------------------------------------------
+    # Last on the happy path, exactly as the order of operations pins it. A
+    # failure writing it DOES escape here (unlike in the guard above): there is no
+    # other exception competing for the user's attention, and a run that wrote to
+    # the device without recording it is not a success.
+    operation_id = _journal_add(root, key, written, snap.path.name)
+    return thumbnail_statuses, operation_id
+
+
+def _report_rows(reporter: Reporter, rows: list) -> tuple[dict, list[dict], list[str], list[str]]:
+    """Emit one `item` per row and return `(counts, failed, pending, outputs)`.
+
+    The one place an `item` event is built for `add`, `remove`, `sync` and `restore`,
+    so the four cannot drift into reporting the same outcome four slightly different
+    ways. A row is anything carrying the `report_*` properties `_PlannedBook` and
+    `_PlannedRemoval` both define; `pending` names the row's own input, which is a
+    host path for a book being added and a device path for one being removed.
+    """
+    counts = {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0}
+    failed: list[dict] = []
+    pending: list[str] = []
+    outputs: list[str] = []
+    for row in rows:
+        counts["total"] += 1
+        counts[row.status] += 1
+        if row.status == "pending":
+            pending.append(row.report_input)
+        if row.status == "failed":
+            failed.append(
+                {
+                    "id": row.id,
+                    "input": row.report_input,
+                    "reason": row.reason,
+                    "detail": row.detail,
+                }
+            )
+        outputs.extend(row.report_outputs)
+        reporter.item(
+            id=row.id,
+            status=row.status,
+            input=row.report_input,
+            outputs=row.report_outputs,
+            bytes_in=row.report_bytes_in,
+            bytes_out=row.report_bytes_out,
+            reason=row.reason,
+            detail=row.detail,
+            warnings=row.warnings,
+        )
+    return counts, failed, pending, outputs
 
 
 def _add_result(
@@ -2424,36 +2777,7 @@ def _add_result(
     VALUE (`snapshot: null`, `operation: null`, `thumbnails: {}`) where a dry run has
     nothing to say rather than a missing key.
     """
-    counts = {"total": 0, "done": 0, "skipped": 0, "failed": 0, "pending": 0}
-    failed: list[dict] = []
-    outputs: list[str] = []
-    pending = [str(book.source.path) for book in planned if book.status == "pending"]
-    for book in planned:
-        counts["total"] += 1
-        counts[book.status] += 1
-        item_outputs = [book.device_path] if book.status == "done" else []
-        if book.status == "done":
-            outputs.append(book.device_path)
-        if book.status == "failed":
-            failed.append(
-                {
-                    "id": book.id,
-                    "input": str(book.source.path),
-                    "reason": book.reason,
-                    "detail": book.detail,
-                }
-            )
-        reporter.item(
-            id=book.id,
-            status=book.status,
-            input=str(book.source.path),
-            outputs=item_outputs,
-            bytes_in=book.size or None,
-            bytes_out=book.size if book.status == "done" else None,
-            reason=book.reason,
-            detail=book.detail,
-            warnings=book.warnings,
-        )
+    counts, failed, pending, outputs = _report_rows(reporter, planned)
 
     ok = not failed
     return {
@@ -2470,8 +2794,8 @@ def _add_result(
             # The same shape `backup`/`status`/`thumbnails` report for a snapshot,
             # never a second hand-built dict (see `_snapshot_summary`).
             "snapshot": _snapshot_summary(snapshot.path, fallback=snapshot) if snapshot else None,
-            # What Task 8's `restore --op ID` undoes; `None` when this run put nothing
-            # on the device at all.
+            # The id `restore --op ID` takes; `None` when this run put nothing on the
+            # device at all.
             "operation": operation_id,
             "free_space": free_space,
             "bytes_planned": sum(book.size for book in queued),
@@ -2482,3 +2806,1070 @@ def _add_result(
             "device_books_unreadable": device_books_unreadable,
         },
     }
+
+
+# --- remove: what is never deleted ---------------------------------------------------
+
+
+# The folder a purchased KFX keeps its DRM assets in, inside its own `.sdr` sidecar.
+ASSETS_DIR = "assets"
+
+
+def _sidecar_prefix(book_path: str) -> str:
+    """`documents/en/Book.azw3` -> `documents/en/Book.sdr/` — the device's own pairing
+    rule, by name rather than by any recorded link, because that is how the firmware
+    itself pairs a book with its reading position."""
+    suffix = PurePosixPath(book_path).suffix
+    stem = book_path[: -len(suffix)] if suffix else book_path
+    return f"{stem}.sdr/"
+
+
+def _protection_refusal(path: str, all_paths: set[str], *, sidecars_visible: bool) -> str | None:
+    """Why this tool will never delete `path`, or `None` if it may.
+
+    Three rules, all about content this tool did not put there and could not put back:
+
+    - **`audible/`** is Amazon's audiobook data, off-limits to this whole plan.
+    - **`system/`** is device internals — Wi-Fi credentials, logs, settings — with
+      only its `thumbnails/` child being ordinary cache data this tool writes.
+    - **A `*.kfx` whose sidecar holds an `assets/` folder** is a book bought from
+      Amazon: the purchase's DRM assets live in that folder, and nothing on the host
+      can reconstitute them.
+
+    `sidecars_visible` is what makes that third rule safe on BOTH backends. Over MTP
+    the cached device tree omits `*.sdr` folders entirely, so the `assets/` marker is
+    simply not there to be found — and "no marker" would then read as "sideloaded,
+    delete away" for exactly the books this rule exists to protect. So over MTP every
+    `*.kfx` is refused, sideloaded or not: the two cannot be told apart there, and the
+    wrong guess costs a purchase.
+
+    Both backends' `list_files` already refuse to LIST the first two, so a `--match`
+    can never reach one — a path NAMED on the command line can, which is exactly why
+    the check lives here and not only in the backends. `validate_writable_path` is
+    still called immediately before every delete as the backstop (`_guarded_remove`);
+    this is the layer that can explain itself to a user.
+    """
+    cleaned = str(path).strip("/")
+    parts = PurePosixPath(cleaned).parts
+    if not cleaned or not parts:
+        return "an empty device path names nothing to remove"
+    directories = parts[:-1]
+    if PROTECTED_DIRS & set(directories):
+        return (
+            f"{cleaned} is inside audible/, which holds Amazon's audiobook data — "
+            "this tool never removes anything from there"
+        )
+    for index, part in enumerate(directories):
+        if part == RESTRICTED_PARENT and (
+            index + 1 >= len(directories) or directories[index + 1] != RESTRICTED_EXCEPTION
+        ):
+            return (
+                f"{cleaned} is under system/, which holds device internals — only "
+                f"system/{RESTRICTED_EXCEPTION}/ is ever written or removed"
+            )
+    if PurePosixPath(cleaned).suffix.lower() == ".kfx":
+        assets = f"{_sidecar_prefix(cleaned)}{ASSETS_DIR}/"
+        if not sidecars_visible:
+            return (
+                f"{cleaned} is a KFX book and this device is connected over MTP, "
+                f"where {assets} cannot be listed at all — so a purchased book cannot "
+                "be told apart from a sideloaded one, and this tool refuses both"
+            )
+        if any(other.startswith(assets) for other in all_paths):
+            return (
+                f"{cleaned} is a purchased KFX book: its DRM assets sit in {assets}, "
+                "and nothing on the host could put them back"
+            )
+    return None
+
+
+def _guarded_remove(backend: DeviceBackend, path: str) -> None:
+    """`validate_writable_path` FIRST, then the delete — the same backstop `write`
+    already has, for the same reason: a path handed to this can be built from a book's
+    own EXTH records (a thumbnail's name is), and neither backend's `remove` checks
+    anything itself."""
+    backend.remove(validate_writable_path(path))
+
+
+def _companions_on_device(
+    book_path: str, book_id: str, cdetype: str, all_paths: set[str]
+) -> tuple[list[str], str | None, str]:
+    """`(the book's sidecar files, its thumbnail if the device has one, the `.sdr`
+    directory itself)` — the three things that make a removed book actually gone
+    rather than half-gone, kept apart here because they are not equally safe to take
+    (see `_books_sharing_sidecar`).
+
+    The sidecar is every file under `<stem>.sdr/` — reading position, highlights, page
+    numbers — and the thumbnail is the EXACT name `thumbnails.thumbnail_name` builds
+    from the book's own EXTH 113 id and content type, never a substring search under
+    `system/thumbnails/` (which could hit a DIFFERENT book's thumbnail that happened
+    to share a substring — the same fix `_has_thumbnail` and `backup._companions_of`
+    already apply). A book with no id has no thumbnail to find.
+    """
+    prefix = _sidecar_prefix(book_path)
+    sidecar = sorted(path for path in all_paths if path.startswith(prefix))
+    thumbnail = None
+    if book_id:
+        candidate = f"{thumbnails.THUMBNAIL_DIR}{thumbnails.thumbnail_name(book_id, cdetype)}"
+        if candidate in all_paths:
+            thumbnail = candidate
+    return sidecar, thumbnail, prefix.rstrip("/")
+
+
+def _books_sharing_sidecar(book_path: str, all_paths: set[str], removing: set[str]) -> list[str]:
+    """Other books on the device that the firmware pairs with the SAME `.sdr` folder
+    and that this run is NOT removing.
+
+    The device pairs a book with its sidecar by stem, so `Book.azw3` and `Book.mobi`
+    in one folder share `Book.sdr/` — and taking it with one of them would delete the
+    reading position, highlights and page numbers of a book the user is KEEPING. That
+    is the one case where a removal must leave the sidecar exactly where it is; it is
+    reported as `kept` on the item rather than passed over in silence.
+    """
+    prefix = _sidecar_prefix(book_path)
+    return sorted(
+        path
+        for path in all_paths
+        if path.casefold() != book_path.casefold()
+        and path.casefold() not in removing
+        and PurePosixPath(path).suffix.lower() in BOOK_SUFFIXES
+        and _sidecar_prefix(path) == prefix
+    )
+
+
+def _matches(needle: str, path: str, records: dict[int, bytes] | None) -> bool:
+    """Ruling R36's `--match` rule, in the one place every command applies it: the
+    device path OR the book's own EXTH title OR its author, case-insensitively, any
+    hit counting. A device's filenames are often opaque, so a user typing an author
+    name must not silently match nothing."""
+    title = exth.record_text(records or {}, exth.TAG_TITLE) or ""
+    author = exth.record_text(records or {}, exth.TAG_AUTHOR) or ""
+    return any(needle in haystack.lower() for haystack in (path, title, author))
+
+
+@dataclass
+class _PlannedRemoval:
+    """One book this run was asked to delete, and everything decided about it.
+
+    `status` starts `"pending"` — which for a run WITHOUT `--yes` is the final,
+    honest answer ("this is what would go"), and for a run with it is settled by
+    exactly one `fail()`/`skip()`/`succeed()` call.
+
+    `removed` and `not_removed` are the two halves of the truth about a removal that
+    only partly happened: over MTP a `.sdr` sidecar and anything under `system/`
+    cannot be deleted at all (Calibre 9.15 has no delete-by-name and its cached tree
+    omits both), so the book goes and its sidecar stays. That is reported as the
+    `sidecar_not_removed` WARNING on a book that is still `done`, because the book
+    really is gone — claiming the sidecar went with it would be a lie the user finds
+    the next time they re-add that book and it opens where they left off.
+
+    `kept` is a different thing from either, and carries NO warning: a sidecar that
+    another book on the device still reads (`shared_with`) was never part of the plan
+    to begin with. Nothing went wrong, and nothing was left half-done — this removal
+    simply does not own that folder.
+    """
+
+    id: int
+    device_path: str
+    book_id: str = ""
+    title: str = ""
+    author: str = ""
+    size: int | None = None
+    companions: list[str] = field(default_factory=list)
+    kept: list[str] = field(default_factory=list)
+    shared_with: list[str] = field(default_factory=list)
+    sidecar_dir: str | None = None
+    status: str = "pending"
+    reason: str | None = None
+    detail: str | None = None
+    removed: list[str] = field(default_factory=list)
+    not_removed: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def fail(self, reason: str, term: str, message: str) -> None:
+        self.status, self.reason, self.detail = "failed", reason, _detail(term, message)
+
+    def skip(self, reason: str, term: str, message: str) -> None:
+        self.status, self.reason, self.detail = "skipped", reason, _detail(term, message)
+
+    def succeed(self) -> None:
+        self.status, self.reason, self.detail = "done", None, None
+
+    @property
+    def would_remove(self) -> list[str]:
+        return [self.device_path, *self.companions]
+
+    # --- what `_report_rows` reads off every reported row ----------------------
+    @property
+    def report_input(self) -> str:
+        return self.device_path
+
+    @property
+    def report_outputs(self) -> list[str]:
+        # Deliberately empty on every path: a removal PRODUCES nothing, and reporting
+        # deleted paths as `outputs` would make one field mean two opposite things
+        # across `sync`'s two halves. What went away is `data.removed`.
+        return []
+
+    @property
+    def report_bytes_in(self) -> int | None:
+        return self.size or None
+
+    @property
+    def report_bytes_out(self) -> int | None:
+        return None
+
+    def as_dict(self) -> dict:
+        return {
+            "device_path": self.device_path,
+            "book_id": self.book_id or None,
+            "title": self.title or None,
+            "author": self.author or None,
+            "size": self.size,
+            "status": self.status,
+            "reason": self.reason,
+            "detail": self.detail,
+            "would_remove": self.would_remove,
+            "removed": list(self.removed),
+            "not_removed": list(self.not_removed),
+            # Deliberately left on the device, with the surviving books that need it.
+            "kept": list(self.kept),
+            "shared_with": list(self.shared_with),
+        }
+
+
+def _plan_removals(
+    paths: list[str],
+    *,
+    records_by_path: dict[str, dict[int, bytes]],
+    sizes: dict[str, int],
+    all_paths: set[str],
+    start_id: int,
+    sidecars_visible: bool,
+) -> list[_PlannedRemoval]:
+    """One row per book to remove, each already carrying the `.sdr` sidecar and the
+    thumbnail that will go with it — and already refused if it names something this
+    tool never deletes."""
+    rows: list[_PlannedRemoval] = []
+    removing = {path.casefold() for path in paths}
+    for offset, path in enumerate(paths):
+        records = records_by_path.get(path) or {}
+        book_id = exth.record_text(records, exth.TAG_UUID) or ""
+        cdetype = exth.record_text(records, exth.TAG_CDETYPE) or thumbnails.DEFAULT_CDETYPE
+        sidecar, thumbnail, sidecar_dir = _companions_on_device(path, book_id, cdetype, all_paths)
+        shared_with = _books_sharing_sidecar(path, all_paths, removing)
+        row = _PlannedRemoval(
+            id=start_id + offset,
+            device_path=path,
+            book_id=book_id,
+            title=exth.record_text(records, exth.TAG_TITLE) or "",
+            author=exth.record_text(records, exth.TAG_AUTHOR) or "",
+            size=sizes.get(path),
+            # A sidecar another surviving book also reads is KEPT, not removed — and
+            # the `.sdr` directory is then not offered for cleanup either.
+            companions=([] if shared_with else sidecar) + ([thumbnail] if thumbnail else []),
+            kept=sidecar if shared_with else [],
+            shared_with=shared_with,
+            sidecar_dir=None if shared_with else sidecar_dir,
+        )
+        refusal = _protection_refusal(path, all_paths, sidecars_visible=sidecars_visible)
+        if refusal is not None:
+            row.fail("engine_error", DETAIL_PROTECTED, refusal)
+        rows.append(row)
+    return rows
+
+
+def _remove_one(backend: DeviceBackend, device: Device, row: _PlannedRemoval) -> None:
+    """Delete one book and then its companions, settling `row`'s own verdict.
+
+    **The book goes FIRST and its companions only after it is gone.** The other order
+    reads better on paper (clean up around the book, then the book) but is wrong: a
+    device that refuses the book would leave it sitting there stripped of its reading
+    position and its cover, which is precisely the damage a removal is supposed to
+    take care of. If the book cannot go, nothing else does either.
+    """
+    try:
+        _guarded_remove(backend, row.device_path)
+    except mtp.MtpPathNotInCachedTree as error:
+        # A `FileNotFoundError` subclass, so it is caught BEFORE the "already gone"
+        # clause below: this path was in the listing moments ago, so for a BOOK the
+        # honest reading is "this cannot be deleted over MTP", not "it is not there".
+        row.fail(
+            "engine_error",
+            DETAIL_REMOVE_FAILED,
+            f"the device could not be asked to delete {row.device_path}: {error}",
+        )
+        return
+    except FileNotFoundError:
+        row.skip(
+            "source_missing",
+            DETAIL_SOURCE_MISSING,
+            f"{row.device_path} is no longer on the device",
+        )
+        return
+    except (RuntimeError, OSError) as error:
+        # Per book, never fatal to the run: a write-protected device, a yanked cable,
+        # an MTP `CalibreError`. The books after this one still deserve their turn.
+        row.fail(
+            "engine_error",
+            DETAIL_REMOVE_FAILED,
+            f"the device refused the deletion: {error}",
+        )
+        return
+    row.removed.append(row.device_path)
+
+    for companion in row.companions:
+        try:
+            _guarded_remove(backend, companion)
+        except mtp.MtpPathNotInCachedTree:
+            row.not_removed.append(companion)
+        except FileNotFoundError:
+            # Genuinely already gone: nothing was removed and nothing is left behind,
+            # so there is neither a journal entry nor a warning to make about it.
+            continue
+        except (RuntimeError, OSError):
+            row.not_removed.append(companion)
+        else:
+            row.removed.append(companion)
+
+    if device.mode == "mass_storage" and row.sidecar_dir and device.mount is not None:
+        # Best-effort, and mass storage only: `remove` deletes FILES, so an emptied
+        # `.sdr` would otherwise stay on the device as an empty directory forever.
+        # `rmdir` never deletes content — a sidecar file that could not go keeps the
+        # directory, and the `OSError` that reports it is swallowed here. This is the
+        # one delete that does not go through `backend.remove`, so it validates the
+        # path itself rather than inheriting `_guarded_remove`'s check.
+        with contextlib.suppress(OSError, DeviceWritePathRejected):
+            (device.mount / validate_writable_path(row.sidecar_dir)).rmdir()
+
+    if row.not_removed:
+        row.warnings.append(SIDECAR_NOT_REMOVED_WARNING)
+    row.succeed()
+
+
+def _journal_remove(
+    root: Path, key: str, rows: list[_PlannedRemoval], snapshot_name: str
+) -> str | None:
+    """Record what this run took off the device, or nothing if it took nothing.
+
+    `paths` is what `restore --op ID` puts back — the books AND the sidecars and
+    thumbnails that went with them, which is exactly the set the protecting snapshot
+    holds. A path that could NOT be removed is deliberately absent: it is still on the
+    device, and restoring it would be a no-op at best.
+    """
+    paths = [path for row in rows for path in row.removed]
+    if not paths:
+        return None
+    return backup_module.journal_append(
+        root,
+        key,
+        {
+            "op": "remove",
+            "paths": paths,
+            "books": [
+                {
+                    "device_path": row.device_path,
+                    "book_id": row.book_id or None,
+                    "removed": list(row.removed),
+                    "not_removed": list(row.not_removed),
+                }
+                for row in rows
+                if row.removed
+            ],
+            "snapshot": snapshot_name,
+        },
+    )
+
+
+def _remove_books(
+    reporter: Reporter,
+    root: Path,
+    key: str,
+    backend: DeviceBackend,
+    device: Device,
+    rows: list[_PlannedRemoval],
+    snap: backup_module.Snapshot,
+) -> str | None:
+    """Delete every row that still wants deleting, then journal what went.
+
+    The journal is written on the way out of an interrupt too (the same guard `add`
+    puts around its copy phase, for the same reason): a Ctrl+C between the first
+    delete and the journal call would otherwise leave books off the device with no
+    record of which operation took them, and `restore --op` needs that record. The
+    snapshot behind it holds the bytes either way.
+    """
+    pending = [row for row in rows if row.status == "pending"]
+    try:
+        for index, row in enumerate(pending, start=1):
+            _remove_one(backend, device, row)
+            reporter.progress(
+                stage="remove",
+                index=index,
+                count=len(pending),
+                path=row.device_path,
+                percent=100.0 * index / len(pending),
+            )
+    except BaseException:
+        with contextlib.suppress(Exception):
+            _journal_remove(root, key, rows, snap.path.name)
+        raise
+    return _journal_remove(root, key, rows, snap.path.name)
+
+
+def _removal_result(
+    reporter: Reporter,
+    rows: list[_PlannedRemoval],
+    *,
+    snapshot: backup_module.Snapshot | None,
+    operation_id: str | None,
+) -> dict:
+    """Emit one `item` per planned removal and build `body`'s return value. Shared by
+    the planning run (no `--yes`) and the real one, so an agent parsing either gets
+    the same keys — `snapshot`/`operation` explicitly `null` where a plan has nothing
+    to say, never a missing key."""
+    counts, failed, pending, outputs = _report_rows(reporter, rows)
+    ok = not failed
+    return {
+        "ok": ok,
+        "exit_code": EXIT_OK if ok else EXIT_FAILED,
+        "counts": counts,
+        "failed": failed,
+        "pending": pending,
+        "outputs": outputs,
+        "run_file": None,
+        "data": {
+            "books": [row.as_dict() for row in rows],
+            "removed": [path for row in rows for path in row.removed],
+            "snapshot": _snapshot_summary(snapshot.path, fallback=snapshot) if snapshot else None,
+            "operation": operation_id,
+        },
+    }
+
+
+def run_remove(
+    args,
+    *,
+    device_finder: Callable[[], Device] | None = None,
+    backend_factory: Callable[..., DeviceBackend] | None = None,
+) -> int:
+    """Delete books from the device — the one command in this subsystem whose whole
+    purpose is destructive, and therefore the one with the most refusals in it.
+
+    **Nothing is deleted without `--yes`.** Without it the run lists what it would
+    take, writes nothing (not to the device, not a backup, not a journal entry) and
+    exits 0 — the plan IS the dry run, which is why this command has no `--dry-run`
+    flag of its own to be confused with it. With `--yes` the mandatory backup runs
+    first, exactly as it does for every other write command, and a failure there is a
+    precondition that was never met: exit 3 with all-zero counts, nothing deleted.
+
+    **A removal takes three things together**: the book, its `.sdr` folder (reading
+    position, highlights, page numbers) and its thumbnail. Leaving the `.sdr` behind
+    is why a re-added book resumes in the wrong place, and leaving the thumbnail
+    behind leaves a cover for a book that is gone.
+
+    **Selection is by device path, by EXTH 113 id (`--asin`) or by `--match`** — the
+    device path OR the book's own title OR its author, case-insensitively, any hit
+    counting (Ruling R36, the same rule `thumbnails` and `add` use). At least one
+    selector is required: a bare `remove --yes` is a usage error, never "everything".
+    Identity is read from the books themselves, never from their filenames.
+
+    **Some things are never removed** and are refused per item with a clear message
+    (`detail: "protected: ..."`), rather than aborting the whole run: anything under
+    `audible/`, anything under `system/` but its `thumbnails/` child, and a purchased
+    `*.kfx` whose `.sdr/assets` holds its DRM — over MTP, where that marker cannot be
+    listed at all, EVERY `*.kfx` instead (`_protection_refusal`). A refusal makes the
+    run's own exit code 1, because something the user asked for demonstrably did not
+    happen.
+
+    **Over MTP a `.sdr` sidecar and anything under `system/` cannot be deleted at
+    all** — Calibre 9.15 exposes no delete-by-name and its cached tree omits both, so
+    `backend.remove` raises `MtpPathNotInCachedTree`. That is reported as the
+    `sidecar_not_removed` warning on a book that is still `done`: the book is gone
+    either way, and pretending the sidecar went with it would be a lie the user
+    discovers later.
+    """
+    yes = bool(args.yes)
+    names = [str(book).strip("/") for book in args.books]
+    needle = args.match.lower() if args.match else None
+    asin = (args.asin or "").strip() or None
+    if not names and needle is None and asin is None:
+        raise UsageError(
+            "nothing selected: name one or more device paths (as `ebook kindle scan` "
+            "reports them), or pass --match TEXT or --asin ID. `remove` never means "
+            "'remove everything'."
+        )
+
+    stages = ["detect", "backup", "plan", "remove"] if yes else ["detect", "plan"]
+    options = {
+        "kindle_command": "remove",
+        "books": len(names),
+        "match": args.match,
+        "asin": asin,
+        "yes": yes,
+    }
+
+    def body(reporter: Reporter, root: Path, device: Device, backend: DeviceBackend) -> dict:
+        key = backup_module.device_key(device)
+        announce = _announcer(reporter, stages)
+        snap: backup_module.Snapshot | None = None
+
+        if yes:
+            announce("backup")
+            failure, snap = _mandatory_backup(reporter, root, backend, key)
+            if failure is not None:
+                return failure
+            if snap is None:  # pragma: no cover - one or the other, never neither
+                raise RuntimeError(
+                    "internal error: a remove reached its delete phase with no "
+                    "protecting snapshot on record"
+                )
+
+        announce("plan")
+        entries = backend.list_files()
+        sizes = {entry.path: entry.size for entry in entries}
+        all_paths = set(sizes)
+        books = [
+            entry for entry in entries if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
+        ]
+
+        # `--match` needs every book's own title/author and `--asin` needs every
+        # book's id, so either one costs a read of the whole library (over MTP, into
+        # the header cache, which makes the next run cheap). With only paths named,
+        # just those books are read — for the content type the thumbnail's name needs.
+        wanted = {name.casefold(): name for name in names}
+        if needle is not None or asin is not None:
+            records_by_path, _ = _records_for(root, device, backend, books, key)
+        else:
+            named = [entry for entry in books if entry.path.casefold() in wanted]
+            records_by_path, _ = _records_for(root, device, backend, named, key)
+
+        folded_asin = asin.casefold() if asin else None
+        selected: list[str] = []
+        for entry in books:
+            records = records_by_path.get(entry.path)
+            hit = entry.path.casefold() in wanted
+            if not hit and folded_asin is not None:
+                book_id = exth.record_text(records or {}, exth.TAG_UUID) or ""
+                hit = book_id.casefold() == folded_asin
+            if not hit and needle is not None:
+                hit = _matches(needle, entry.path, records)
+            if hit:
+                selected.append(entry.path)
+                wanted.pop(entry.path.casefold(), None)
+
+        # Over MTP a `*.sdr` folder is not in the cached tree at all, so nothing
+        # under one can be seen — which changes what can be PROVEN about a KFX book
+        # (see `_protection_refusal`) as well as what can be deleted.
+        sidecars_visible = device.mode == "mass_storage"
+        rows = _plan_removals(
+            selected,
+            records_by_path=records_by_path,
+            sizes=sizes,
+            all_paths=all_paths,
+            start_id=1,
+            sidecars_visible=sidecars_visible,
+        )
+        # A path the user NAMED that no book on the device answers to gets an item of
+        # its own rather than vanishing from the report: they pointed at it
+        # explicitly, so a typo — or a path that is real but is not a book, or is one
+        # this tool never touches — deserves saying so.
+        # Matched the way FAT32 itself matches: a user who typed a path in the wrong
+        # case must be told what is actually there, not that it is missing.
+        folded_paths = {path.casefold() for path in all_paths}
+        for offset, name in enumerate(wanted.values(), start=len(rows) + 1):
+            row = _PlannedRemoval(id=offset, device_path=name, size=sizes.get(name))
+            refusal = _protection_refusal(name, all_paths, sidecars_visible=sidecars_visible)
+            if refusal is not None:
+                row.fail("engine_error", DETAIL_PROTECTED, refusal)
+            elif name.casefold() in folded_paths:
+                row.fail(
+                    "engine_error",
+                    DETAIL_NOT_A_BOOK,
+                    f"{name} is on the device but is not a book "
+                    f"({', '.join(sorted(BOOK_SUFFIXES))}); a book's sidecar and "
+                    "thumbnail are removed with the book itself, never on their own",
+                )
+            else:
+                row.fail(
+                    "source_missing",
+                    DETAIL_SOURCE_MISSING,
+                    f"{name} is not on the device",
+                )
+            rows.append(row)
+
+        if not yes:
+            return _removal_result(reporter, rows, snapshot=None, operation_id=None)
+
+        announce("remove")
+        operation_id = _remove_books(reporter, root, key, backend, device, rows, snap)
+        return _removal_result(reporter, rows, snapshot=snap, operation_id=operation_id)
+
+    return _run(
+        args,
+        kindle_command="remove",
+        stages=stages,
+        options=options,
+        device_finder=device_finder or detect.find_device,
+        backend_factory=backend_factory or default_backend_factory,
+        body=body,
+    )
+
+
+# --- sync ----------------------------------------------------------------------------
+
+
+def run_sync(
+    args,
+    *,
+    device_finder: Callable[[], Device] | None = None,
+    backend_factory: Callable[..., DeviceBackend] | None = None,
+) -> int:
+    """Make the device match an `ebook build` batch: add what the library has and the
+    device lacks, and — only with `--delete-extras` AND `--yes` — remove what the
+    device has and the library does not.
+
+    **The adding half IS `add --batch NAME`**, down to the same planning
+    (`_plan_add`), the same identity rules (EXTH 113, with the journal's provenance
+    fallback for an id-less book), the same free-space arithmetic and the same
+    copy/thumbnails/verify/journal phases (`_copy_books`). It is shared code, not a
+    second implementation, so the two commands cannot drift into placing books
+    differently.
+
+    **An extra is a device book whose EXTH 113 id the batch does not carry.** A book
+    whose id could not be read at all is NEVER an extra: absence from the library
+    cannot be proven for it, and guessing costs the user a book. Extras are reported
+    in `result.data.extras` whether or not `--delete-extras` was given, so the removal
+    can be seen before it is armed; with `--delete-extras` they become planned
+    removals (`pending`), and only with `--yes` as well are they actually deleted —
+    after the same mandatory backup, with the same `.sdr`-and-thumbnail pairing and
+    the same refusals `remove` applies.
+
+    **The two halves are journalled as two operations**, an `add` and a `remove`,
+    exactly as if the two commands had been run in turn. `restore --op ID` therefore
+    undoes either half on its own, and `add`'s provenance lookup keeps working for
+    books this command placed.
+
+    **The hazard worth stating plainly**: an extra is anything the batch does not
+    name, including a book somebody else put on the device. `--delete-extras --yes`
+    on a batch that is not actually the whole library will remove books the user
+    wanted. That is why it needs two flags, why the plan is printed first, why the
+    mandatory backup runs before it, and why `restore --op` exists.
+    """
+    dry_run = bool(args.dry_run)
+    delete_extras = bool(args.delete_extras)
+    root = output_root(args.output_dir)
+    language_override = _validated_language_override(args.lang)
+    if not args.batch:
+        raise UsageError(
+            "sync needs --batch NAME: the `ebook build` batch this device should "
+            "mirror. To copy books named on the command line, use `ebook kindle add`."
+        )
+    try:
+        batch = sanitize_batch(args.batch)
+    except BatchNameError as error:
+        raise UsageError(str(error)) from error
+    sources, library_ids = _library_batch(root, batch, flag="--batch")
+    if not sources:
+        raise UsageError(f"no books found in batch {batch!r}", code="no_input_matched")
+
+    deletions_armed = delete_extras and bool(args.yes) and not dry_run
+    stages = (
+        ["detect", "plan"]
+        if dry_run
+        else ["detect", "backup", "plan", "copy", "thumbnails", "verify"]
+    )
+    if deletions_armed:
+        stages.append("remove")
+    options = {
+        "kindle_command": "sync",
+        "batch": batch,
+        "lang": language_override,
+        "match": args.match,
+        "delete_extras": delete_extras,
+        "yes": bool(args.yes),
+        "dry_run": dry_run,
+    }
+
+    def body(reporter: Reporter, root: Path, device: Device, backend: DeviceBackend) -> dict:
+        key = backup_module.device_key(device)
+        announce = _announcer(reporter, stages)
+        needle = args.match.lower() if args.match else None
+        snap: backup_module.Snapshot | None = None
+
+        if not dry_run:
+            announce("backup")
+            failure, snap = _mandatory_backup(reporter, root, backend, key)
+            if failure is not None:
+                return failure
+            if snap is None:  # pragma: no cover - one or the other, never neither
+                raise RuntimeError(
+                    "internal error: a sync reached its write phase with no protecting "
+                    "snapshot on record"
+                )
+
+        announce("plan")
+        view = _survey_device(reporter, root, device, backend, key)
+        planned, queued = _plan_add(
+            view,
+            sources,
+            language_override=language_override,
+            needle=needle,
+            max_path=MAX_DEVICE_PATH.get(device.mode, MAX_DEVICE_PATH["mtp"]),
+            placements=_previous_placements(root, key),
+        )
+        free_space, to_copy = _fit_to_free_space(backend, queued)
+
+        # A book with no readable id is never an extra — see this command's
+        # docstring. Neither is anything sitting at a path THIS run's own plan
+        # targets, whatever its id: either the copy phase is about to overwrite it
+        # (the journal's unverified-placement waiver, `_provenance_verdict`) and
+        # deleting it afterwards would take the book just written, or the plan already
+        # refused to touch it as an `output_collision` — and deleting a file the same
+        # run declined to overwrite would leave the user with neither copy.
+        planned_paths = {book.device_path.casefold() for book in planned}
+        extra_entries = [
+            entry
+            for entry in view.books
+            if (view.ids_by_path.get(entry.path) or "") not in ("", *library_ids)
+            and entry.path.casefold() not in planned_paths
+        ]
+        extra_records: dict[str, dict[int, bytes]] = {}
+        if extra_entries:
+            # Only the extras are read, not the library: their own title/author are
+            # what `--match` narrows on and what the report names them by, and their
+            # content type is what a thumbnail's name needs.
+            extra_records, _ = _records_for(root, device, backend, extra_entries, key)
+            if needle is not None:
+                extra_entries = [
+                    entry
+                    for entry in extra_entries
+                    if _matches(needle, entry.path, extra_records.get(entry.path))
+                ]
+        removals = (
+            _plan_removals(
+                [entry.path for entry in extra_entries],
+                records_by_path=extra_records,
+                sizes=view.sizes,
+                all_paths=view.paths,
+                start_id=len(planned) + 1,
+                sidecars_visible=device.mode == "mass_storage",
+            )
+            if delete_extras
+            else []
+        )
+
+        thumbnail_statuses: dict[str, str] = {}
+        operation_id: str | None = None
+        if not dry_run:
+            thumbnail_statuses, operation_id = _copy_books(
+                reporter, root, key, backend, to_copy, snap, announce
+            )
+
+        remove_operation: str | None = None
+        if deletions_armed:
+            announce("remove")
+            remove_operation = _remove_books(reporter, root, key, backend, device, removals, snap)
+
+        rows = [*planned, *removals]
+        counts, failed, pending, outputs = _report_rows(reporter, rows)
+        ok = not failed
+        return {
+            "ok": ok,
+            "exit_code": EXIT_OK if ok else EXIT_FAILED,
+            "counts": counts,
+            "failed": failed,
+            "pending": pending,
+            "outputs": outputs,
+            "run_file": None,
+            "data": {
+                "books": [book.as_dict() for book in planned],
+                "removals": [row.as_dict() for row in removals],
+                # Reported whether or not `--delete-extras` was given: seeing what a
+                # removal WOULD take is the point of a mirror command.
+                "extras": [
+                    {
+                        "device_path": entry.path,
+                        "book_id": view.ids_by_path.get(entry.path) or None,
+                        "title": exth.record_text(
+                            extra_records.get(entry.path) or {}, exth.TAG_TITLE
+                        )
+                        or None,
+                        "size": entry.size,
+                    }
+                    for entry in extra_entries
+                ],
+                "removed": [path for row in removals for path in row.removed],
+                "thumbnails": thumbnail_statuses,
+                "snapshot": _snapshot_summary(snap.path, fallback=snap) if snap else None,
+                "operation": operation_id,
+                "remove_operation": remove_operation,
+                "free_space": free_space,
+                "bytes_planned": sum(book.size for book in queued),
+                "device_books_unreadable": len(view.unreadable),
+            },
+        }
+
+    return _run(
+        args,
+        kindle_command="sync",
+        stages=stages,
+        items=len(sources),
+        options=options,
+        device_finder=device_finder or detect.find_device,
+        backend_factory=backend_factory or default_backend_factory,
+        body=body,
+    )
+
+
+# --- restore -------------------------------------------------------------------------
+
+
+@dataclass
+class _RestoredFile:
+    """One file a restore selected, with the outcome `backup.restore` reported for
+    it. `pending` is what a `--dry-run` reports (it WOULD go back); every other
+    status is a real verdict."""
+
+    id: int
+    device_path: str
+    status: str
+    reason: str | None = None
+    detail: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def report_input(self) -> str:
+        return self.device_path
+
+    @property
+    def report_outputs(self) -> list[str]:
+        return [self.device_path] if self.status == "done" else []
+
+    @property
+    def report_bytes_in(self) -> int | None:
+        return None
+
+    @property
+    def report_bytes_out(self) -> int | None:
+        # Per-file sizes are not in `RestoreReport` (only the run's total, in
+        # `data.restore.bytes`), and inventing one per item would mean re-reading the
+        # manifest here for a number nothing needs.
+        return None
+
+
+def _resolve_snapshot(root: Path, key: str, name: str | None) -> Path | None:
+    """The snapshot directory a restore will read: `name` as a path, or as a name
+    under this device's own `backups/`, or — with no name at all — the newest complete
+    snapshot. `None` when nothing readable answers to it."""
+    if not name:
+        return backup_module.latest(root, key)
+    for candidate in (Path(name), backup_module.backup_root(root, key) / "backups" / name):
+        if (candidate / backup_module.MANIFEST_NAME).is_file():
+            return candidate
+    return None
+
+
+def run_restore(
+    args,
+    *,
+    device_finder: Callable[[], Device] | None = None,
+    backend_factory: Callable[..., DeviceBackend] | None = None,
+) -> int:
+    """Put a snapshot's files back on the device, or undo exactly one journalled
+    operation.
+
+    **It only ever WRITES files back; it never deletes.** Undoing an operation that
+    REMOVED files therefore restores them, which is the case this exists for; undoing
+    one that ADDED files restores nothing, because the snapshot that protected it was
+    taken before those files existed — reported honestly as `not_in_snapshot` rather
+    than as a silent success. Taking an added book off the device is `remove`'s job,
+    behind its own `--yes`.
+
+    **Every selected file is hashed against the manifest before a byte is written**,
+    including under `--dry-run`, and one that disagrees is refused rather than
+    restored: recovery is exactly where a corrupt snapshot does the most damage. That
+    hashing is a full read of everything selected, which is why this run reports
+    `progress` — a whole-library dry run would otherwise sit silent for minutes.
+
+    **The snapshot is resolved BEFORE the mandatory pre-write backup**, never after.
+    Restoring writes to the device, so it takes the same backup every write command
+    takes (so the restore itself can be undone) — and that backup becomes the newest
+    snapshot, so a `restore` with no SNAPSHOT argument resolved afterwards would
+    restore the state it had just recorded and do nothing at all. `--dry-run` takes no
+    backup, since it writes nothing.
+
+    One `item` is emitted per SELECTED FILE — not per book — so undoing an operation
+    reports the book, its sidecar and its thumbnail separately, and a whole-snapshot
+    restore reports every file in it.
+    """
+    dry_run = bool(args.dry_run)
+    stages = ["detect", "restore"] if dry_run else ["detect", "backup", "restore"]
+    options = {
+        "kindle_command": "restore",
+        "snapshot": args.snapshot,
+        "op": args.op,
+        "dry_run": dry_run,
+    }
+
+    def body(reporter: Reporter, root: Path, device: Device, backend: DeviceBackend) -> dict:
+        key = backup_module.device_key(device)
+        announce = _announcer(reporter, stages)
+
+        only: list[str] | None = None
+        snapshot_name = args.snapshot
+        if args.op:
+            operation = next(
+                (
+                    entry
+                    for entry in backup_module.journal_read(root, key)
+                    if entry.get("id") == args.op
+                ),
+                None,
+            )
+            if operation is None:
+                return _body_failure(
+                    reporter,
+                    code="usage",
+                    message=(
+                        f"no operation {args.op!r} in this device's journal "
+                        f"({backup_module.backup_root(root, key) / backup_module.JOURNAL_NAME}); "
+                        "the id is `result.data.operation` of the run that made it"
+                    ),
+                    exit_code=EXIT_USAGE,
+                )
+            only = [path for path in (operation.get("paths") or []) if isinstance(path, str)]
+            # An explicit SNAPSHOT still wins: the operation names the snapshot that
+            # protected it, but that one can have been deleted by hand, and refusing
+            # to look anywhere else would make recovery impossible.
+            snapshot_name = args.snapshot or operation.get("snapshot")
+
+        snapshot_dir = _resolve_snapshot(root, key, snapshot_name)
+        if snapshot_dir is None:
+            return _body_failure(
+                reporter,
+                code="backup_failed",
+                message=(
+                    f"no readable snapshot {snapshot_name!r} for this device under "
+                    f"{backup_module.backup_root(root, key) / 'backups'}"
+                    if snapshot_name
+                    else "this device has no complete backup on this host yet: run "
+                    "`media-tools ebook kindle backup` first"
+                ),
+                exit_code=EXIT_DEPENDENCY,
+            )
+
+        if not dry_run:
+            announce("backup")
+            failure, _ = _mandatory_backup(reporter, root, backend, key)
+            if failure is not None:
+                return failure
+
+        announce("restore")
+
+        def on_progress(done: int, total: int, phase: str) -> None:
+            reporter.progress(
+                stage=phase,
+                index=done,
+                count=total,
+                path=f"kindle:{key}",
+                percent=(100.0 * done / total) if total else 100.0,
+            )
+
+        try:
+            report = backup_module.restore(
+                backend, snapshot_dir, only=only, dry_run=dry_run, on_progress=on_progress
+            )
+        except backup_module.BackupFailed as error:
+            # Caught here rather than left to `_run`, which would map it to exit 1
+            # ("an item failed"): nothing was attempted, which is exit 3's meaning —
+            # the same reading `_mandatory_backup` applies to a failed precondition.
+            return _body_failure(
+                reporter, code="backup_failed", message=str(error), exit_code=EXIT_DEPENDENCY
+            )
+
+        rows: list[_RestoredFile] = []
+        for path in report.paths:
+            rows.append(
+                _RestoredFile(
+                    id=len(rows) + 1,
+                    device_path=path,
+                    status="pending" if dry_run else "done",
+                )
+            )
+        for path in report.missing:
+            rows.append(
+                _RestoredFile(
+                    id=len(rows) + 1,
+                    device_path=path,
+                    status="failed",
+                    reason="source_missing",
+                    detail=_detail(
+                        DETAIL_SOURCE_MISSING,
+                        "the snapshot's manifest names this file but its stored copy "
+                        "is gone from the snapshot",
+                    ),
+                )
+            )
+        for path in report.corrupt:
+            rows.append(
+                _RestoredFile(
+                    id=len(rows) + 1,
+                    device_path=path,
+                    status="failed",
+                    reason="engine_error",
+                    detail=_detail(
+                        DETAIL_CORRUPT,
+                        "the stored copy no longer hashes to what the manifest "
+                        "recorded, so it was NOT written to the device",
+                    ),
+                )
+            )
+        for path in report.not_in_snapshot:
+            rows.append(
+                _RestoredFile(
+                    id=len(rows) + 1,
+                    device_path=path,
+                    status="skipped",
+                    reason="source_missing",
+                    detail=_detail(
+                        DETAIL_NOT_IN_SNAPSHOT,
+                        "this snapshot holds no copy of it — an operation that ADDED "
+                        "it is undone with `remove`, not here: restore never deletes",
+                    ),
+                )
+            )
+
+        counts, failed, pending, outputs = _report_rows(reporter, rows)
+        ok = not failed
+        return {
+            "ok": ok,
+            "exit_code": EXIT_OK if ok else EXIT_FAILED,
+            "counts": counts,
+            "failed": failed,
+            "pending": pending,
+            "outputs": outputs,
+            "run_file": None,
+            "data": {
+                "restore": {
+                    "snapshot": str(snapshot_dir),
+                    "operation": args.op,
+                    "dry_run": dry_run,
+                    "files": report.files,
+                    "bytes": report.bytes,
+                    "missing": report.missing,
+                    "corrupt": report.corrupt,
+                    "no_thumbnail": report.no_thumbnail,
+                    "not_in_snapshot": report.not_in_snapshot,
+                }
+            },
+        }
+
+    return _run(
+        args,
+        kindle_command="restore",
+        stages=stages,
+        options=options,
+        device_finder=device_finder or detect.find_device,
+        backend_factory=backend_factory or default_backend_factory,
+        body=body,
+    )
