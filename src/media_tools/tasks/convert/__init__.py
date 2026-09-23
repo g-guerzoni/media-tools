@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from media_tools.core.ffmpeg import ffmpeg_exe
+from media_tools.core.paths import output_root
 from media_tools.core.runner import run_items
 from media_tools.tasks.common import UsageError, add_common_flags, prepare
 from media_tools.tasks.convert.audio import AudioEngine
+from media_tools.tasks.convert.ebook import EbookEngine
 
 NAME = "convert"
 HELP = "Convert media to a different format (e.g. video/audio to mp3)."
-ENGINES = [AudioEngine()]
+ENGINES = [AudioEngine(), EbookEngine()]
 
 
 def register(subparsers):
@@ -30,7 +32,8 @@ def run(args) -> int:
         raise UsageError(f"cannot convert to {args.to!r}; supported: {', '.join(sorted(targets))}")
 
     prepared = prepare(args, task=NAME, engines=ENGINES, to=args.to)
-    deps = {"ffmpeg": ffmpeg_exe(), "options": prepared.options}
+    cache_dir = output_root(args.output_dir) / ".cache"
+    deps = {"ffmpeg": ffmpeg_exe(), "options": prepared.options, "cache_dir": cache_dir}
     return run_items(
         prepared.sources,
         task=NAME,

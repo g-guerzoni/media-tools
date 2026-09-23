@@ -6,7 +6,8 @@ import argparse
 import sys
 
 from media_tools import __version__
-from media_tools.core.events import EXIT_FAILED, EXIT_USAGE, Reporter
+from media_tools.core.events import EXIT_FAILED, EXIT_INTERRUPTED, EXIT_USAGE, Reporter
+from media_tools.core.runner import empty_result
 from media_tools.tasks import compress, convert, doctor, download, ebook, formats, split, status
 from media_tools.tasks.common import UsageError
 
@@ -64,7 +65,18 @@ def main(argv: list[str] | None = None) -> int:
         reporter.error(code=error.code, message=str(error), hint=error.hint)
         return error.exit_code
     except KeyboardInterrupt:
-        return 130
+        # C2: this outer handler is the last resort for a task whose own code (a
+        # `_run_pipeline` planning phase, a batch loop, ...) let a KeyboardInterrupt
+        # escape uncaught. It must leave the same guarantee every task-specific
+        # interrupt handler already gives: an `error` AND a matching `result` (exit
+        # 130), never a bare exit with nothing on stdout for a --json caller to parse.
+        reporter = Reporter(
+            json_mode=getattr(args, "json_mode", False),
+            quiet=getattr(args, "quiet", False),
+        )
+        reporter.error(code="interrupted", message="interrupted by user")
+        reporter.result(**empty_result(EXIT_INTERRUPTED))
+        return EXIT_INTERRUPTED
     except Exception as error:
         # The net beneath every task-specific handler above: anything a task's own code
         # did not anticipate (a real bug, not a usage problem) must still leave an agent
@@ -80,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
             hint="this is a bug in media-tools",
             retryable=False,
         )
+        reporter.result(**empty_result(EXIT_FAILED))
         return EXIT_FAILED
 
 

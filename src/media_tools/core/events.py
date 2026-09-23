@@ -67,6 +67,8 @@ WARNING_CODES = frozenset(
         "extension_filter_bypassed",
         "device_rejected_thumbnail",
         "hash_from_previous",
+        "name_collision_suffixed",
+        "leftover_book",
     }
 )
 
@@ -168,11 +170,20 @@ class Reporter:
         self.stderr.flush()
 
     def result(
-        self, *, ok, exit_code, counts, failed, pending, outputs, run_file, elapsed_s=None
+        self,
+        *,
+        ok,
+        exit_code,
+        counts,
+        failed,
+        pending,
+        outputs,
+        run_file,
+        elapsed_s=None,
+        data=None,
     ) -> None:
         elapsed = time.monotonic() - self._started if elapsed_s is None else elapsed_s
-        self._emit(
-            "result",
+        fields = dict(
             ok=ok,
             exit_code=exit_code,
             counts=counts,
@@ -182,5 +193,31 @@ class Reporter:
             run_file=str(run_file) if run_file else None,
             elapsed_s=round(elapsed, 2),
         )
+        # `data` is opt-in and left out entirely for every task that never passes it, so
+        # the `result` event's shape for compress/convert/split/download is unchanged.
+        # The ebook task uses it to carry the LLM cost summary (requests, cache hits,
+        # tokens, heuristic fallbacks) — the only warning before a large bill (spec 8.3).
+        if data is not None:
+            fields["data"] = data
+        self._emit("result", **fields)
         parts = " · ".join(f"{k} {v}" for k, v in counts.items() if v)
-        self._say(f"{'✓' if ok else '✗'} {parts} · {elapsed:.1f}s")
+        llm = data.get("llm") if data else None
+        llm_part = ""
+        # Only worth a line when the LLM was actually used this run — a --no-llm run's
+        # all-zero summary would otherwise print a misleading "llm 0 req" every time.
+        # `heuristic_fallback_batches` is included here (not just requests/cache_hits)
+        # so a total outage — every request failing and silently falling back to the
+        # heuristic, `requests` and `cache_hits` both 0 — still prints a line instead
+        # of hiding the exact case this summary exists to surface.
+        if llm and (
+            llm.get("requests") or llm.get("cache_hits") or llm.get("heuristic_fallback_batches")
+        ):
+            llm_part = (
+                f" · llm {llm.get('requests', 0)} req"
+                f" · {llm.get('cache_hits', 0)} cached"
+                f" · {llm.get('prompt_tokens', 0)}+{llm.get('completion_tokens', 0)} tok"
+            )
+            fallback = llm.get("heuristic_fallback_batches", 0)
+            if fallback:
+                llm_part += f" · {fallback} batch(es) fell back to heuristic"
+        self._say(f"{'✓' if ok else '✗'} {parts} · {elapsed:.1f}s{llm_part}")

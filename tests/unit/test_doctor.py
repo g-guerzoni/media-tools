@@ -286,3 +286,102 @@ def test_update_propagates_quiet_but_not_check_updates_to_the_fresh_recheck(monk
 def test_fetch_pypi_version_real_network():
     version = doctor_task._fetch_pypi_version("yt-dlp")
     assert version is None or isinstance(version, str)
+
+
+# -- Task 12: Calibre's tools and the OpenRouter key are optional, ebook-flavoured ---
+
+
+def test_doctor_reports_calibre_and_the_key_as_optional(tmp_path):
+    payload = json.loads(_cli("doctor", "--json", "-o", str(tmp_path)).stdout)
+    names = {c["name"]: c for c in payload["checks"]}
+    assert "calibre" in names and "openrouter-key" in names
+    for name in ("calibre", "openrouter-key"):
+        assert names[name]["status"] in {"ok", "warn"}
+        assert (
+            "ebook" in names[name]["detail"].lower()
+            or "ebook" in (names[name].get("hint") or "").lower()
+        )
+
+
+def test_doctor_never_prints_the_key(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-m", "media_tools", "doctor", "--json", "-o", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "OPENROUTER_API_KEY": "sk-do-not-print-me"},
+    )
+    assert "sk-do-not-print-me" not in result.stdout + result.stderr
+
+
+# -- RULING RB2: doctor must ask integrations.openrouter.key_present(...), not read
+# OPENROUTER_API_KEY itself - otherwise an op:// reference or a --op-item resolves for
+# the ebook task but doctor reports the key "missing" anyway. -----------------------
+
+
+def test_openrouter_check_resolves_an_op_style_reference():
+    def fake_runner(argv):
+        assert argv[:2] == ["op", "read"]
+        return "resolved-secret-value"
+
+    env = {"OPENROUTER_API_KEY": "op://vault/item/field"}
+    check = doctor_task._openrouter_check(env=env, runner=fake_runner)
+    assert check.status == "ok"
+    assert "resolved-secret-value" not in check.detail
+    assert "resolved-secret-value" not in (check.hint or "")
+
+
+def test_openrouter_check_honours_op_item():
+    def fake_runner(argv):
+        return "resolved-secret-value" if argv[:2] == ["op", "item"] else ""
+
+    check = doctor_task._openrouter_check(op_item="my-item", env={}, runner=fake_runner)
+    assert check.status == "ok"
+    assert "resolved-secret-value" not in check.detail
+    assert "resolved-secret-value" not in (check.hint or "")
+
+
+def test_openrouter_check_warns_when_nothing_resolves():
+    check = doctor_task._openrouter_check(env={}, runner=lambda argv: "")
+    assert check.status == "warn"
+    assert "ebook" in check.detail.lower() or "ebook" in (check.hint or "").lower()
+
+
+def test_openrouter_check_uses_a_short_timeout_for_the_op_item_lookup(monkeypatch):
+    # Minor finding: `doctor` is a quick health check, not a real key resolution —
+    # a named --op-item that never resolves must not be able to make it hang for
+    # anywhere near resolve_key's own ~3-minute worst case.
+    captured = {}
+
+    def fake_key_present(op_item=None, *, env=None, runner=None, timeout=30):
+        captured["timeout"] = timeout
+        return False
+
+    monkeypatch.setattr(doctor_task.openrouter, "key_present", fake_key_present)
+    doctor_task._openrouter_check(op_item="whatever", env={})
+    assert captured["timeout"] == doctor_task._OP_ITEM_LOOKUP_TIMEOUT_S
+    assert captured["timeout"] < 30
+
+
+# -- I6: doctor must agree with calibre.find_tool, not just shutil.which ------------
+
+
+def test_calibre_check_uses_find_tool_not_just_shutil_which(tmp_path, monkeypatch):
+    """A .dmg/App-bundle Calibre install (found via `calibre.find_tool`'s extra
+    search dirs, e.g. /Applications/calibre.app/Contents/MacOS on macOS) must not
+    make doctor warn "not found" while `ebook build`/`convert` — which already go
+    through `find_tool` — work just fine. Same defect class RB2 already fixed for
+    the OpenRouter key check."""
+    from media_tools.integrations import calibre as calibre_mod
+
+    fake_dir = tmp_path / "calibre-app"
+    fake_dir.mkdir()
+    for name in doctor_task.CALIBRE_TOOLS:
+        script = fake_dir / name
+        script.write_text("#!/bin/sh\necho fake 1.0\n")
+        script.chmod(0o755)
+
+    monkeypatch.setattr(calibre_mod, "_EXTRA_DIRS", (fake_dir,))
+    monkeypatch.setenv("PATH", "/nonexistent")  # shutil.which alone must find nothing
+
+    check = doctor_task._calibre_check()
+    assert check.status == "ok"

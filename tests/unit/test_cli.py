@@ -93,15 +93,15 @@ def test_convert_with_garbage_input_fails_the_item_not_the_command(tmp_path):
     assert item["reason"] == "engine_error"
 
 
-def test_ebook_stub_task_reports_not_implemented():
-    # ebook is the only task still a Task 8 stub; formats/doctor/status were replaced
-    # by Task 14/15 and are covered by their own test modules. Its exit code is 3
-    # (missing dependency/configuration), but the error code is "config_missing", not
-    # "dependency_missing" — nothing is missing from the machine to go install.
+def test_ebook_without_a_subcommand_is_a_usage_error():
+    # `ebook` (Task 11) requires one of build/scan/normalize/dedup/covers/convert;
+    # argparse itself enforces this (`required=True` on its subparsers), so a bare
+    # `media-tools ebook` is the same "usage" shape as any other missing-subcommand
+    # call, not the old Task 8 stub's config_missing/exit 3.
     result = _run(["ebook", "--json"])
-    assert result.returncode == 3
+    assert result.returncode == 2
     events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
-    assert any(e["type"] == "error" and e["code"] == "config_missing" for e in events)
+    assert any(e["type"] == "error" and e["code"] == "usage" for e in events)
 
 
 def test_json_mode_emits_only_jsonlines_on_stdout(tmp_path):
@@ -137,6 +137,27 @@ def test_keyboard_interrupt_in_a_task_exits_130(monkeypatch):
     assert main(["compress", "x"]) == 130
 
 
+def test_keyboard_interrupt_also_emits_an_error_and_a_result(monkeypatch, capsys):
+    # C2: this outer handler is the last resort for a task whose own code let a
+    # KeyboardInterrupt escape uncaught — it must still leave a --json caller with
+    # an `error` AND a matching `result` (exit 130), not a bare process exit with
+    # nothing usable on stdout.
+    def boom(args):
+        raise KeyboardInterrupt
+
+    compress_task = next(t for t in TASKS if t.NAME == "compress")
+    monkeypatch.setattr(compress_task, "run", boom)
+    code = main(["compress", "x", "--json"])
+    assert code == 130
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    (error,) = [e for e in events if e["type"] == "error"]
+    assert error["code"] == "interrupted"
+    (result,) = [e for e in events if e["type"] == "result"]
+    assert result["exit_code"] == 130
+    assert result["ok"] is False
+
+
 # -- C3: an unanticipated exception must not escape as a bare traceback --------------
 
 
@@ -164,6 +185,11 @@ def test_unexpected_exception_emits_an_internal_error_json_event(monkeypatch, ca
     assert "RuntimeError" in error["message"]
     assert "kaboom" in error["message"]
     assert error["hint"]
+    # C2: this generic handler must also emit a `result`, so a --json caller does
+    # not have to special-case "the stream ended after an error with no result".
+    (result,) = [e for e in events if e["type"] == "result"]
+    assert result["exit_code"] == EXIT_FAILED
+    assert result["ok"] is False
 
 
 # -- C2: a corrupt or non-object run.json must fail cleanly, not crash ---------------
