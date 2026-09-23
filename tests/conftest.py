@@ -131,3 +131,20 @@ def make_audio(tmp_path, ffmpeg_path):
         return target
 
     return _make
+
+
+@pytest.fixture
+def fake_kindle(tmp_path):
+    """A directory shaped like a mass-storage Kindle, with two books already on it."""
+    from media_tools.tasks.ebook.kindle.detect import Device
+
+    root = tmp_path / "Kindle"
+    (root / "documents" / "en").mkdir(parents=True)
+    (root / "documents" / "pt").mkdir(parents=True)
+    (root / "system" / "thumbnails").mkdir(parents=True)
+    (root / "audible").mkdir()
+    (root / "documents" / "en" / "A Book - An Author.azw3").write_bytes(b"english book")
+    (root / "documents" / "en" / "A Book - An Author.sdr").mkdir()
+    (root / "documents" / "pt" / "Um Livro - Um Autor.azw3").write_bytes(b"livro")
+    (root / "My Clippings.txt").write_text("clippings", encoding="utf-8")
+    return Device(serial="G000TESTSERIAL", product_id=0x0004, mode="mass_storage", mount=root)
