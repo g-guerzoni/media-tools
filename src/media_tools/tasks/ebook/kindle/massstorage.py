@@ -43,6 +43,7 @@ from media_tools.tasks.ebook.kindle.backend import (
     prefix_targets_a_forbidden_system_child,
     validate_writable_path,
 )
+from media_tools.tasks.ebook.kindle.detect import DeviceNotFound
 
 # The four constants and two functions above USED to be defined here, with `mtp.py`
 # importing them from this module so the two backends' listings could not drift
@@ -175,6 +176,22 @@ class MassStorageBackend:
             raise
 
     def remove(self, path: str) -> None:
+        """Delete one file. `FileNotFoundError` means exactly one thing here — THIS
+        PATH is not on the device — because that is what a caller acts on: `ebook
+        kindle remove` reports it as "the book was already gone" and moves on.
+
+        So a vanished DEVICE must not take that shape. `unlink()` on an unmounted
+        volume raises `FileNotFoundError` like any other missing path, and a Kindle
+        pulled mid-run would then report every remaining book as already gone and exit
+        0 — telling the user their books were not there when the device simply left.
+        The same check `list_files` and `exists` make, raising `DeviceNotFound`
+        instead: a `RuntimeError`, which every caller already treats as a real fault
+        (and which is what the MTP backend raises in the same situation).
+        """
+        if not self.mount.is_dir() or (
+            self._device_id is not None and _device_id(self.mount) != self._device_id
+        ):
+            raise DeviceNotFound(f"the Kindle is no longer mounted at {self.mount}")
         (self.mount / path).unlink()
 
     def exists(self, path: str) -> bool:

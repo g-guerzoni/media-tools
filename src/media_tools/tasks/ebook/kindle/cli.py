@@ -150,13 +150,6 @@ BOOK_SUFFIXES = frozenset({".azw", ".azw3", ".azw8", ".kfx", ".mobi", ".prc", ".
 # recognised as already on the device and always reports `book_id_missing` — see
 # `run_add`'s own docstring.
 ADDABLE_SUFFIXES = BOOK_SUFFIXES | {".epub", ".pdf"}
-# What can OWN a `.sdr` sidecar on the device: everything a Kindle opens, not just the
-# formats whose EXTH records this project can parse. The device pairs a document with
-# its reading position by stem, and it does that for a `.pdf` or a `.txt` exactly as it
-# does for an `.azw3` — so a `Book.pdf` sitting beside a `Book.azw3` being removed is a
-# surviving owner of `Book.sdr/`, and deciding otherwise silently costs it its reading
-# position (`_books_sharing_sidecar`).
-SIDECAR_OWNER_SUFFIXES = ADDABLE_SUFFIXES | {".txt"}
 _CACHE_INDEX_NAME = "index.json"
 
 DOCUMENTS_DIR = "documents"
@@ -1133,7 +1126,11 @@ def _read_library_index(root: Path, batch_name: str) -> dict[str, dict]:
             continue
         book_data = item.get("data") if isinstance(item.get("data"), dict) else {}
         book_id = book_data.get("book_id")
-        if not book_id:
+        # `isinstance`, not just truthiness: this value becomes a dict KEY compared
+        # against ids read off the device, and a hand-edited `run.json` holding a
+        # number or a list there would otherwise quietly enter the index. Its twin in
+        # `_library_batch` checks the same way.
+        if not isinstance(book_id, str) or not book_id:
             continue
         index[book_id] = {
             "title": book_data.get("title"),
@@ -1893,10 +1890,14 @@ def _library_batch(root: Path, batch: str, *, flag: str) -> tuple[list[_SourceBo
     for item in _read_library_items(root, batch, flag=flag):
         if not isinstance(item, dict):
             continue
-        if item.get("status") not in LIBRARY_ITEM_STATUSES:
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        # An item with no `data` at all describes no book, whatever its status says —
+        # it is exactly the incomplete entry the `--delete-extras` refusal is about,
+        # and counting only the status would let it through as a library item that
+        # happens to contribute nothing.
+        if item.get("status") not in LIBRARY_ITEM_STATUSES or not data:
             unfinished += 1
             continue
-        data = item.get("data") if isinstance(item.get("data"), dict) else {}
         book_id = data.get("book_id")
         if isinstance(book_id, str) and book_id:
             ids.add(book_id)
@@ -2876,39 +2877,45 @@ def _sidecar_prefix(book_path: str) -> str:
 def _protection_refusal(path: str, all_paths: set[str], *, sidecars_visible: bool) -> str | None:
     """Why this tool will never delete `path`, or `None` if it may.
 
-    Five rules. The first is structural and the rest are about content this tool did
-    not put there and could not put back:
+    Five rules, listed in the order they are CHECKED — a path can break several, and
+    the first match is the message the user gets, so the more specific reasons come
+    before the more general one:
 
-    - **Anything the mandatory backup does not cover** (`backup.DEFAULT_SCOPE`) —
-      a book in a folder of the user's own making, or sitting at the device root. The
-      snapshot taken moments earlier does not hold it, so `restore` could not put it
-      back and would say `not_in_snapshot` while the book stayed gone. Deleting only
-      what the backup holds is the invariant that makes "every deletion is undoable"
-      true rather than merely intended, and it costs nothing: everything this tool
-      itself places lives under `documents/<lang>/`, which is in scope.
-    - **An absolute path, or one with a `.`/`..` component** — the same shapes
-      `validate_writable_path` refuses before a write. Unreachable from a device
-      listing, reachable from a command line, and the two checks are otherwise
-      line-for-line mirrors: they should not diverge.
-    - **`audible/`** is Amazon's audiobook data, off-limits to this whole plan.
-    - **`system/`** is device internals — Wi-Fi credentials, logs, settings — with
-      only its `thumbnails/` child being ordinary cache data this tool writes.
-    - **A `*.kfx` whose sidecar holds an `assets/` folder** is a book bought from
-      Amazon: the purchase's DRM assets live in that folder, and nothing on the host
-      can reconstitute them.
+    1. **An absolute path, or one with a `.`/`..` component** — the same shapes
+       `validate_writable_path` refuses before a write. Unreachable from a device
+       listing, reachable from a command line, and the two checks are otherwise
+       line-for-line mirrors: they should not diverge.
+    2. **`audible/`** is Amazon's audiobook data, off-limits to this whole plan.
+    3. **`system/`** is device internals — Wi-Fi credentials, logs, settings — with
+       only its `thumbnails/` child being ordinary cache data this tool writes.
+    4. **A `*.kfx` whose sidecar holds an `assets/` folder** is a book bought from
+       Amazon: the purchase's DRM assets live in that folder, and nothing on the host
+       can reconstitute them.
+    5. **Anything the mandatory backup does not cover** (`backup.DEFAULT_SCOPE`) — a
+       book in a folder of the user's own making, or sitting at the device root. The
+       snapshot taken moments earlier does not hold it, so `restore` could not put it
+       back and would say `not_in_snapshot` while the book stayed gone. Deleting only
+       what the backup holds is the invariant that makes "every deletion is undoable"
+       true rather than merely intended, and it costs nothing: everything this tool
+       itself places lives under `documents/<lang>/`, which is in scope.
 
-    `sidecars_visible` is what makes that third rule safe on BOTH backends. Over MTP
-    the cached device tree omits `*.sdr` folders entirely, so the `assets/` marker is
-    simply not there to be found — and "no marker" would then read as "sideloaded,
-    delete away" for exactly the books this rule exists to protect. So over MTP every
-    `*.kfx` is refused, sideloaded or not: the two cannot be told apart there, and the
-    wrong guess costs a purchase.
+    `sidecars_visible` is what makes rule 4 safe on BOTH backends. Over MTP the cached
+    device tree omits `*.sdr` folders entirely, so the `assets/` marker is simply not
+    there to be found — and "no marker" would then read as "sideloaded, delete away"
+    for exactly the books this rule exists to protect. So over MTP every `*.kfx` is
+    refused, sideloaded or not: the two cannot be told apart there, and the wrong
+    guess costs a purchase.
 
-    Both backends' `list_files` already refuse to LIST the first two, so a `--match`
-    can never reach one — a path NAMED on the command line can, which is exactly why
-    the check lives here and not only in the backends. `validate_writable_path` is
-    still called immediately before every delete as the backstop (`_guarded_remove`);
-    this is the layer that can explain itself to a user.
+    **How a path reaches each rule differs, and rule 5 is the one that matters.** Both
+    backends' `list_files` already refuse to LIST anything under `audible/` or under a
+    non-`thumbnails` child of `system/`, so no selector can reach rules 2 and 3 — only
+    a path NAMED on the command line can, which is why they are checked here as well
+    as in the backends. Rule 5 is different: a book in `Books/` or at the device root
+    IS listed, and is an ordinary book in every other respect, so `remove` keeps it out
+    of `--match`'s net itself while `--asin` and a named path reach this and get the
+    message. `validate_writable_path` and the scope check are both applied again
+    immediately before every delete as the backstop (`_guarded_remove`); this is the
+    layer that can explain itself to a user.
     """
     cleaned = str(path).replace("\\", "/").strip("/")
     parts = PurePosixPath(cleaned).parts
@@ -3013,13 +3020,24 @@ def _books_sharing_sidecar(book_path: str, all_paths: set[str], removing: set[st
     """Other books on the device that the firmware pairs with the SAME `.sdr` folder
     and that this run is NOT removing.
 
-    The device pairs a book with its sidecar by stem, so `Book.azw3` and `Book.mobi` —
-    or `Book.pdf`, or `Book.txt`, whether or not this project can read their metadata
-    (`SIDECAR_OWNER_SUFFIXES`, deliberately wider than `BOOK_SUFFIXES`) — in one folder
-    share `Book.sdr/` — and taking it with one of them would delete the
-    reading position, highlights and page numbers of a book the user is KEEPING. That
-    is the one case where a removal must leave the sidecar exactly where it is; it is
-    reported as `kept` on the item rather than passed over in silence.
+    The device pairs a document with its sidecar by STEM, so `Book.azw3` and
+    `Book.mobi` in one folder share `Book.sdr/` — and taking it with one of them would
+    delete the reading position, highlights and page numbers of a book the user is
+    KEEPING. That is the one case where a removal must leave the sidecar exactly where
+    it is; it is reported as `kept` on the item rather than passed over in silence.
+
+    **Any surviving file sharing the stem counts, with no extension filter at all.**
+    The asymmetry is total: a missed owner costs reading position and highlights,
+    unrecoverably, while a spurious one costs an empty `.sdr` folder left on the
+    device — which this already reports honestly as `kept`/`shared_with`. An allowlist
+    fails safe on the cheap side and open on the expensive one, and would have to name
+    every format a Kindle opens (`.pdf`, `.txt`, `.htm`, `.html`, `.rtf`, `.doc`, and
+    whatever the next firmware adds) to be even approximately right. A denylist can be
+    added here if some file type ever proves to need one.
+
+    A file INSIDE the sidecar cannot match: `_sidecar_prefix` builds its prefix from
+    the stem, so `Book.sdr/position.mbp` yields `Book.sdr/position.sdr/`, never
+    `Book.sdr/`. Thumbnails live under a different directory entirely.
 
     **`removing` must be the books that will ACTUALLY be removed, not the ones that
     were selected.** A selection can contain books this tool then refuses — a
@@ -3035,7 +3053,6 @@ def _books_sharing_sidecar(book_path: str, all_paths: set[str], removing: set[st
         for path in all_paths
         if path.casefold() != book_path.casefold()
         and path.casefold() not in removing
-        and PurePosixPath(path).suffix.lower() in SIDECAR_OWNER_SUFFIXES
         and _sidecar_prefix(path) == prefix
     )
 
@@ -3254,6 +3271,12 @@ def _plan_removals(
         )
         refusal = refusals[path]
         if refusal is not None:
+            # Nothing about this book will be touched, so nothing is advertised:
+            # `would_remove` collapses to the book's own path, and the thumbnail it
+            # would otherwise have listed is not part of any plan. (`sidecar` is
+            # already empty — `takes_sidecar` requires being in `removing`, which a
+            # refused path never is.)
+            row.thumbnail = None
             if protected_status == "skipped":
                 row.skip("unsupported_input", DETAIL_PROTECTED, refusal)
             else:
@@ -3557,16 +3580,25 @@ def run_remove(
             entry for entry in entries if PurePosixPath(entry.path).suffix.lower() in BOOK_SUFFIXES
         ]
 
-        # `--match` needs every book's own title/author and `--asin` needs every
-        # book's id, so either one costs a read of the whole library (over MTP, into
-        # the header cache, which makes the next run cheap). With only paths named,
-        # just those books are read — for the content type the thumbnail's name needs.
+        # Which books have to be READ, which over MTP means fetching each one into
+        # the header cache. `--asin` needs every book's id, wherever it sits, because
+        # an id names a book this run may still have to refuse by name. `--match`
+        # only ever selects inside the backed-up area (below), so nothing outside it
+        # needs its title read. With only paths named, just those books are read —
+        # for the content type the thumbnail's name needs.
         wanted = {name.casefold(): name for name in names}
-        if needle is not None or asin is not None:
-            records_by_path, _ = _records_for(root, device, backend, books, key)
+        if asin is not None:
+            to_read = books
+        elif needle is not None:
+            to_read = [
+                entry
+                for entry in books
+                if backup_module.DEFAULT_SCOPE.includes(entry.path)
+                or entry.path.casefold() in wanted
+            ]
         else:
-            named = [entry for entry in books if entry.path.casefold() in wanted]
-            records_by_path, _ = _records_for(root, device, backend, named, key)
+            to_read = [entry for entry in books if entry.path.casefold() in wanted]
+        records_by_path, _ = _records_for(root, device, backend, to_read, key)
 
         folded_asin = asin.casefold() if asin else None
         selected: list[str] = []
@@ -3579,8 +3611,9 @@ def run_remove(
             if not hit and needle is not None and backup_module.DEFAULT_SCOPE.includes(entry.path):
                 # `--match` is a NET, so it never sweeps in a book outside the area
                 # every backup covers — there would be nothing to put back if it did.
-                # The two IDENTITY selectors are different: a path or an id names one
-                # specific book, and the user deserves the refusal and its reason
+                # The two IDENTITY selectors are different: a path names one file and
+                # an id names every copy carrying it, but either way the user asked
+                # for THOSE books by name, and deserves the refusal and its reason
                 # (`_protection_refusal`, via `_plan_removals`) rather than a run that
                 # reports nothing at all and exits 0.
                 hit = _matches(needle, entry.path, records)

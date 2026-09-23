@@ -175,6 +175,28 @@ def test_exists_raises_rather_than_answering_false_when_the_device_is_gone(fake_
         device.exists("documents/en/A Book - An Author.azw3")
 
 
+def test_remove_refuses_to_call_a_vanished_device_an_absent_file(fake_kindle, monkeypatch):
+    """`FileNotFoundError` out of `remove` means one thing to its callers — THIS PATH
+    is not on the device, so the book was already gone — and `ebook kindle remove`
+    reports exactly that and moves on. An unmounted volume makes `unlink()` raise the
+    same exception for every path, which would turn a Kindle pulled mid-run into a
+    run that reports every remaining book as already gone and exits 0. `DeviceNotFound`
+    is a `RuntimeError`, which every caller treats as the real fault it is."""
+    from media_tools.tasks.ebook.kindle.detect import DeviceNotFound
+
+    device = massstorage.MassStorageBackend(fake_kindle.mount)
+    # A path that really is absent still reports itself as absent, and as nothing else.
+    with pytest.raises(FileNotFoundError) as absent:
+        device.remove("documents/en/Never Existed.azw3")
+    assert not isinstance(absent.value, DeviceNotFound)
+
+    monkeypatch.setattr(massstorage, "_device_id", lambda mount: device._device_id + 1)
+    with pytest.raises(DeviceNotFound):
+        device.remove("documents/en/A Book - An Author.azw3")
+    # ...and the book is still there, because nothing was attempted.
+    assert (fake_kindle.mount / "documents/en/A Book - An Author.azw3").is_file()
+
+
 def test_write_is_atomic_leaving_no_partial_file(fake_kindle, tmp_path, monkeypatch):
     device = massstorage.MassStorageBackend(fake_kindle.mount)
     source = tmp_path / "x.azw3"

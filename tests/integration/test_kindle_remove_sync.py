@@ -1431,14 +1431,21 @@ def test_a_second_builds_skipped_items_are_still_the_library(fake_kindle, tmp_pa
     unchanged library one big pile of extras."""
     device = prepare_device(fake_kindle)
     root = tmp_path / "media"
-    new_book = tmp_path / "library" / "A Brand New Book.azw3"
-    new_book.parent.mkdir(parents=True)
+    library = tmp_path / "library"
+    library.mkdir(parents=True)
+    # Three real library files, one per item — the shape a build actually leaves
+    # behind — all recorded as `skipped`/`exists`, which is what a second build of the
+    # same batch writes for every book it did not have to reconvert.
+    new_book = library / "A Brand New Book.azw3"
     new_book.write_bytes(mobi_bytes(book_id=NEW_ID, title="A Brand New Book", language="en"))
-    # Exactly what a second build of this batch writes: nothing was reconverted.
+    english = library / "A Book - An Author.azw3"
+    english.write_bytes(mobi_bytes(book_id=EN_ID, title=EN_TITLE, author=EN_AUTHOR, language="en"))
+    portuguese = library / "Um Livro - Um Autor.azw3"
+    portuguese.write_bytes(mobi_bytes(book_id=PT_ID, title="Um Livro", language="pt"))
     plant_library_batch(
         root,
         "library",
-        [(NEW_ID, new_book, "en"), (EN_ID, new_book, "en"), (PT_ID, new_book, "pt")],
+        [(NEW_ID, new_book, "en"), (EN_ID, english, "en"), (PT_ID, portuguese, "pt")],
         status="skipped",
     )
 
@@ -1463,11 +1470,16 @@ def test_a_surviving_pdf_keeps_the_sidecar_it_shares_with_a_removed_book(
     fake_kindle, tmp_path, capsys
 ):
     """A `.pdf` owns a `.sdr` exactly as an `.azw3` does, whether or not this project
-    can read its metadata."""
+    can read its metadata — and so does anything else sharing the stem. There is no
+    extension allowlist here on purpose: a missed owner costs reading position and
+    highlights for good, a spurious one costs an empty folder this run reports."""
     device = prepare_device(fake_kindle)
     mount = device.mount
     pdf = mount / "documents" / "en" / "A Book - An Author.pdf"
     pdf.write_bytes(b"%PDF-1.4 not really a pdf")
+    # A format no allowlist in this project has ever named.
+    comic = mount / "documents" / "en" / "A Book - An Author.cbz"
+    comic.write_bytes(b"PK not really a comic")
 
     args = _remove_args(tmp_path / "media", EN_PATH, "--yes")
     assert (
@@ -1479,10 +1491,14 @@ def test_a_surviving_pdf_keeps_the_sidecar_it_shares_with_a_removed_book(
 
     assert not (mount / EN_PATH).exists()
     assert pdf.is_file()
+    assert comic.is_file()
     assert (mount / EN_SDR / "position.mbp").is_file()
     book = _events(capsys)[-1]["data"]["books"][0]
     assert book["kept"] == [f"{EN_SDR}/position.mbp"]
-    assert book["shared_with"] == ["documents/en/A Book - An Author.pdf"]
+    assert book["shared_with"] == [
+        "documents/en/A Book - An Author.cbz",
+        "documents/en/A Book - An Author.pdf",
+    ]
 
 
 def test_asin_for_a_book_outside_the_backed_up_area_says_why(fake_kindle, tmp_path, capsys):
