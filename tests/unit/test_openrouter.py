@@ -124,6 +124,57 @@ def test_chat_raises_a_clear_error_when_response_has_no_choices():
         openrouter.chat([], model="m", api_key="k", opener=opener)
 
 
+def test_resolve_key_tries_every_label_until_one_has_a_value():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return "found-it" if "label=key" in argv else ""
+
+    assert openrouter.resolve_key("My Item", env={}, runner=runner) == "found-it"
+    # "key" is the 5th of 6 field labels; every earlier one must have been tried.
+    assert len(calls) == openrouter._FIELD_LABELS.index("key") + 1
+
+
+def test_default_runner_signals_a_timeout_distinctly_from_an_empty_result(monkeypatch):
+    import subprocess
+
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(openrouter.subprocess, "run", fake_run)
+    assert openrouter._default_runner(["op", "read", "op://x"]) is openrouter._TIMED_OUT
+
+
+def test_resolve_key_stops_trying_op_item_labels_after_a_timeout():
+    # Minor finding: a named --op-item that never resolves used to cost up to
+    # len(_FIELD_LABELS) x 30s (~3 minutes) because a hanging/unreachable `op`
+    # looked exactly like "this field is empty, try the next one". A timeout must
+    # stop the loop instead of repeating the same wait for every remaining label.
+    calls = []
+
+    def fake_runner(argv):
+        calls.append(argv)
+        return openrouter._TIMED_OUT
+
+    with pytest.raises(openrouter.OpenRouterError):
+        openrouter.resolve_key("My Item", env={}, runner=fake_runner)
+
+    assert len(calls) == 1, "a timed-out call must not be retried with the next field label"
+
+
+def test_key_present_forwards_a_custom_timeout_to_resolve_key(monkeypatch):
+    captured = {}
+
+    def fake_resolve_key(op_item=None, *, env=None, runner=None, timeout=30):
+        captured["timeout"] = timeout
+        raise openrouter.OpenRouterError("no key")
+
+    monkeypatch.setattr(openrouter, "resolve_key", fake_resolve_key)
+    assert openrouter.key_present(env={}, timeout=5.0) is False
+    assert captured["timeout"] == 5.0
+
+
 def test_default_runner_returns_empty_string_when_op_is_not_installed(monkeypatch):
     # resolve_key's default runner (used whenever a test - or a real caller -
     # does not inject one) must degrade to "no value from this source" rather

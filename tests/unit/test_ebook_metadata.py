@@ -117,6 +117,39 @@ def test_a_malformed_cache_entry_is_re_read_not_crashed_on(tmp_path, monkeypatch
     assert json.loads((cache / "ebook-meta.json").read_text())[key]["title"] == "Recovered Title"
 
 
+def test_read_all_writes_the_cache_through_fsync_replace(tmp_path, monkeypatch):
+    # I7: this cache is shared across every batch under the output root and is
+    # written from OUTSIDE any batch's lock — a concurrent run or a Ctrl+C
+    # mid-write must not truncate it, so it must go through the project's own
+    # temp+fsync+rename helper, not a bare `write_text`.
+    book = tmp_path / "book.epub"
+    book.write_bytes(b"x")
+    cache = tmp_path / "cache"
+
+    def fake_read(path, *, cache_dir, timeout=120):
+        from media_tools.integrations.calibre import BookMetadata
+
+        return BookMetadata("Title", "Author", "en", "uuid-1", False)
+
+    monkeypatch.setattr(metadata.calibre, "read_metadata", fake_read)
+
+    calls = []
+
+    def spy(temp, target):
+        calls.append((temp, target))
+        temp.replace(target)
+
+    monkeypatch.setattr(metadata, "fsync_replace", spy)
+
+    metadata.read_all([book], cache_dir=cache, workers=1)
+
+    assert calls, "the cache write must go through fsync_replace, not a bare write_text"
+    temp, target = calls[0]
+    assert target == cache / metadata.CACHE_FILENAME
+    assert temp.name.startswith(".") and temp.name.endswith(".partial")
+    assert json.loads(target.read_text())  # the real rename still landed a usable cache
+
+
 def test_dry_run_scratch_dir_is_private_and_cleaned_up(tmp_path, monkeypatch):
     book = tmp_path / "book.epub"
     book.write_bytes(b"x")

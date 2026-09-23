@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+from media_tools.core.paths import fsync_replace, temp_path
 from media_tools.integrations import calibre
 from media_tools.tasks.ebook import names
 
@@ -140,8 +141,16 @@ def read_all(
                     on_progress(done, len(todo), path)
 
     if cache_file:
+        # I7: this cache is shared by every batch under the output root and is
+        # written from OUTSIDE any batch's lock — a concurrent run, or a Ctrl+C mid
+        # write, must never leave a truncated file that `_load_cache` then silently
+        # discards (paying for the whole re-read/re-classify on the next run). Write
+        # to a `.partial` name, fsync it, then rename — the same guarantee every
+        # final output already gets via `core.paths.fsync_replace`.
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+        temp = temp_path(cache_file)
+        temp.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+        fsync_replace(temp, cache_file)
 
     facts = []
     for path in paths:

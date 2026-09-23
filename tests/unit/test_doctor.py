@@ -344,3 +344,44 @@ def test_openrouter_check_warns_when_nothing_resolves():
     check = doctor_task._openrouter_check(env={}, runner=lambda argv: "")
     assert check.status == "warn"
     assert "ebook" in check.detail.lower() or "ebook" in (check.hint or "").lower()
+
+
+def test_openrouter_check_uses_a_short_timeout_for_the_op_item_lookup(monkeypatch):
+    # Minor finding: `doctor` is a quick health check, not a real key resolution —
+    # a named --op-item that never resolves must not be able to make it hang for
+    # anywhere near resolve_key's own ~3-minute worst case.
+    captured = {}
+
+    def fake_key_present(op_item=None, *, env=None, runner=None, timeout=30):
+        captured["timeout"] = timeout
+        return False
+
+    monkeypatch.setattr(doctor_task.openrouter, "key_present", fake_key_present)
+    doctor_task._openrouter_check(op_item="whatever", env={})
+    assert captured["timeout"] == doctor_task._OP_ITEM_LOOKUP_TIMEOUT_S
+    assert captured["timeout"] < 30
+
+
+# -- I6: doctor must agree with calibre.find_tool, not just shutil.which ------------
+
+
+def test_calibre_check_uses_find_tool_not_just_shutil_which(tmp_path, monkeypatch):
+    """A .dmg/App-bundle Calibre install (found via `calibre.find_tool`'s extra
+    search dirs, e.g. /Applications/calibre.app/Contents/MacOS on macOS) must not
+    make doctor warn "not found" while `ebook build`/`convert` — which already go
+    through `find_tool` — work just fine. Same defect class RB2 already fixed for
+    the OpenRouter key check."""
+    from media_tools.integrations import calibre as calibre_mod
+
+    fake_dir = tmp_path / "calibre-app"
+    fake_dir.mkdir()
+    for name in doctor_task.CALIBRE_TOOLS:
+        script = fake_dir / name
+        script.write_text("#!/bin/sh\necho fake 1.0\n")
+        script.chmod(0o755)
+
+    monkeypatch.setattr(calibre_mod, "_EXTRA_DIRS", (fake_dir,))
+    monkeypatch.setenv("PATH", "/nonexistent")  # shutil.which alone must find nothing
+
+    check = doctor_task._calibre_check()
+    assert check.status == "ok"

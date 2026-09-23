@@ -16,6 +16,7 @@ the caller and never printed, logged, or otherwise surfaced by this module.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import subprocess
@@ -54,9 +55,20 @@ class Usage:
     completion_tokens: int
 
 
-def _default_runner(argv: list[str]) -> str:
+# A sentinel `_default_runner` returns instead of "" when the `op` call itself timed
+# out, distinct from a call that ran and simply had nothing for that field — so
+# `resolve_key`'s `--op-item` loop can tell "this field is empty, try the next label"
+# apart from "`op` is hanging/unreachable, trying five more labels would just repeat
+# the same multi-second wait" (minor finding: a named item that never resolves could
+# otherwise cost up to len(_FIELD_LABELS) x timeout, ~3 minutes at the 30s default).
+_TIMED_OUT = object()
+
+
+def _default_runner(argv: list[str], *, timeout: float = 30) -> str:
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return _TIMED_OUT  # type: ignore[return-value]
     except (subprocess.SubprocessError, OSError):
         return ""
     if proc.returncode != 0:
@@ -64,36 +76,46 @@ def _default_runner(argv: list[str]) -> str:
     return (proc.stdout or "").strip()
 
 
-def resolve_key(op_item: str | None = None, *, env=None, runner=None) -> str:
+def resolve_key(op_item: str | None = None, *, env=None, runner=None, timeout: float = 30) -> str:
     """Resolve the OpenRouter API key. Raises OpenRouterError, never a fallback
-    default, when none of the three sources produces one."""
+    default, when none of the three sources produces one.
+
+    `timeout` only affects the DEFAULT runner (the real `op` subprocess calls) — an
+    injected `runner` (every test, and any future caller with its own transport)
+    controls its own timing. `doctor` passes a much shorter one than the default
+    30s so a named `--op-item` that never resolves cannot turn a quick health check
+    into a multi-minute hang.
+    """
     env = os.environ if env is None else env
-    runner = _default_runner if runner is None else runner
+    if runner is None:
+        runner = functools.partial(_default_runner, timeout=timeout)
 
     raw = (env.get("OPENROUTER_API_KEY") or "").strip()
     if raw:
         if raw.startswith("op://"):
-            resolved = runner(["op", "read", raw]).strip()
-            if resolved:
-                return resolved
+            resolved = runner(["op", "read", raw])
+            if resolved is not _TIMED_OUT and resolved.strip():
+                return resolved.strip()
         else:
             return raw
 
     if op_item:
         for label in _FIELD_LABELS:
-            value = runner(
-                ["op", "item", "get", op_item, "--fields", f"label={label}", "--reveal"]
-            ).strip()
-            if value:
-                return value
+            value = runner(["op", "item", "get", op_item, "--fields", f"label={label}", "--reveal"])
+            if value is _TIMED_OUT:
+                # `op` itself is hanging or unreachable — the next label would just
+                # repeat the same wait, so stop here instead of compounding it.
+                break
+            if value.strip():
+                return value.strip()
 
     raise OpenRouterError(_NO_KEY_MESSAGE)
 
 
-def key_present(op_item: str | None = None, *, env=None, runner=None) -> bool:
+def key_present(op_item: str | None = None, *, env=None, runner=None, timeout: float = 30) -> bool:
     """For `doctor`: whether a key resolves, without ever exposing it."""
     try:
-        resolve_key(op_item, env=env, runner=runner)
+        resolve_key(op_item, env=env, runner=runner, timeout=timeout)
     except OpenRouterError:
         return False
     return True

@@ -36,7 +36,7 @@ from pathlib import Path
 from media_tools.core.events import EXIT_DEPENDENCY, EXIT_OK, EXIT_USAGE
 from media_tools.core.ffmpeg import ffmpeg_exe
 from media_tools.core.paths import output_root
-from media_tools.integrations import openrouter
+from media_tools.integrations import calibre, openrouter
 
 NAME = "doctor"
 HELP = "Check the environment: ffmpeg, Calibre, Deno, output root, and more."
@@ -54,6 +54,11 @@ PACKAGES = ["media-tools", "yt-dlp", "yt-dlp-ejs", "deno", "imageio-ffmpeg"]
 UPDATE_CHECK_PACKAGES = [name for name in PACKAGES if name != "media-tools"]
 OPENROUTER_ENV = "OPENROUTER_API_KEY"
 UPDATE_CACHE_TTL_S = 24 * 60 * 60
+# Minor finding: `openrouter.resolve_key`'s own default (30s x up to 6 field labels,
+# ~3 minutes worst case) is fine for a real `ebook build` that is about to spend
+# minutes converting books anyway, but `doctor` is a quick health check — a named
+# `--op-item` that never resolves must not make it hang for anywhere near that long.
+_OP_ITEM_LOOKUP_TIMEOUT_S = 5.0
 _STATUS_MARK = {"ok": "✓", "warn": "!", "missing": "✗"}
 
 
@@ -212,7 +217,13 @@ _CALIBRE_HINT = (
 
 
 def _calibre_check() -> Check:
-    paths = {name: shutil.which(name) for name in CALIBRE_TOOLS}
+    # I6: use the same lookup `ebook build`/`convert` themselves use
+    # (`calibre.find_tool`, which also searches e.g.
+    # /Applications/calibre.app/Contents/MacOS on macOS), not a bare `shutil.which`
+    # — otherwise a .dmg install makes doctor warn "not found" while the tools it is
+    # reporting on work fine for every other command. Same defect class as RB2's fix
+    # for the OpenRouter key check below.
+    paths = {name: calibre.find_tool(name) for name in CALIBRE_TOOLS}
     missing = [name for name in CALIBRE_TOOLS if not paths[name]]
     if missing:
         return Check("calibre", "warn", f"{', '.join(missing)} not found", hint=_CALIBRE_HINT)
@@ -236,7 +247,7 @@ def _openrouter_check(op_item: str | None = None, *, env=None, runner=None) -> C
         "reference) or pass --op-item NAME; needed by `media-tools ebook build`'s "
         "LLM-assisted normalize/dedup stages, or pass --no-llm to skip them"
     )
-    if openrouter.key_present(op_item, env=env, runner=runner):
+    if openrouter.key_present(op_item, env=env, runner=runner, timeout=_OP_ITEM_LOOKUP_TIMEOUT_S):
         return Check(
             "openrouter-key",
             "ok",
