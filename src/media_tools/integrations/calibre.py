@@ -104,6 +104,11 @@ FETCH_COVER = Dependency(
     locate=lambda: find_tool("fetch-ebook-metadata"),
     install_hint=_INSTALL_HINT,
 )
+# Calibre's own interpreter, used to run `integrations/kindle_mtp.py` — the only way
+# to reach `calibre.devices.mtp.driver`, which cannot be imported from outside it.
+CALIBRE_DEBUG = Dependency(
+    name="calibre-debug", locate=lambda: find_tool("calibre-debug"), install_hint=_INSTALL_HINT
+)
 
 
 def config_env(cache_dir: Path) -> dict[str, str]:
