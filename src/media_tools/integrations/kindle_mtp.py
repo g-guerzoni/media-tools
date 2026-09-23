@@ -84,18 +84,30 @@ backend as `DeviceNotFound` with the start marker present. Nothing past
     PRIVATE attribute set during ``open``; it is what Calibre's own ``upload_books``
     uses, but a private name can vanish without notice. The fallback here (first
     entry of the cache) has never run either.
-5.  Uncached lookups — ``list_folder_by_name(parent, *names)`` returns a tuple of
-    ``ListEntry(name, is_folder, size, mtime)``, and ``get_file_by_name(outfile,
-    parent, *names)`` writes into an open binary stream. Both were confirmed to exist
-    with those signatures. UNVERIFIED: **what either one raises for a folder that does
-    not exist**, which is the single assumption `_op_list` cannot make safely — it
-    treats a raise at a NON-ROOT requested prefix as "not there" (matching mass
-    storage's empty-list-for-a-missing-directory) but a raise at the device root, or
-    anywhere deeper in the walk, as a real failure, because reporting a transient
-    error as an empty device is how a backup silently writes nothing and calls it a
-    success. If the real API returns an empty tuple for a missing folder instead of
-    raising, tighten this to treat EVERY raise as a failure. Also unverified: whether
-    ``ListEntry.mtime`` really is a timezone-aware datetime — ``_epoch`` guesses.
+5.  Uncached lookups — RESOLVED by reading the frozen bytecode of Calibre 9.15.0's
+    **unix** MTP driver (`calibre-debug -c` + `dis`, unwrapping the lock decorator to
+    `calibre.devices.mtp.unix.driver.MTP_DEVICE.list_mtp_folder_by_name`), plus
+    `dis` on the high-level `driver.MTP_DEVICE.list_folder_by_name` to confirm it adds
+    no `except` clause of its own (no `CHECK_EXC_MATCH`, no `PUSH_EXC_INFO` — its
+    exception table is only generator machinery). Established:
+
+      * ``list_mtp_folder_by_name`` raises ``FileNotFoundError`` ("Could not find
+        folder named: X in Y") for a folder that is not there, and ``ValueError``
+        ("... is not a folder") for a path that is not a folder. **It never returns an
+        empty result to mean "missing".** `_op_list` therefore treats ONLY
+        ``FileNotFoundError``, and only at a non-root prefix, as "not there";
+        ``ValueError`` and every other exception are `list_failed`, because reporting
+        a transient libmtp error as an empty listing is how a backup silently writes
+        nothing and calls it a success.
+      * ``ListEntry._fields == ('name', 'is_folder', 'size', 'mtime')``.
+      * ``convert_timestamp`` returns a timezone-aware ``datetime``, so ``_epoch``'s
+        ``.timestamp()`` path is the real one.
+
+    STILL UNVERIFIED: only the **unix** driver was read. Windows uses
+    ``calibre.devices.mtp.windows.driver`` and may raise different types for the same
+    situations — re-check there before trusting `_op_list`'s missing-prefix branch on
+    Windows. ``get_file_by_name(outfile, parent, *names)`` writing into an open binary
+    stream is confirmed by signature only, not by bytecode.
 6.  **Write atomicity is an open question.** ``put_file(parent, name, stream, size)``
     writes straight to the final name; there is no staging primitive here and none was
     invented. So an interrupted transfer may leave a short file at the real name. This
@@ -169,10 +181,19 @@ class _HelperError(Exception):
     """An invocation-level failure, carrying the exit code it maps to and any
     per-op results already collected (so an aborted batch still reports what landed)."""
 
-    def __init__(self, message: str, code: int, results: list | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        code: int,
+        results: list | None = None,
+        reason: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.results = results or []
+        # Exit 2 covers three different situations; `reason` is how the backend tells
+        # them apart without substring-matching this message.
+        self.reason = reason
 
 
 def _split(path: str) -> list[str]:
@@ -185,9 +206,9 @@ def _split(path: str) -> list[str]:
 
 
 def _epoch(value) -> float:
-    """`ListEntry.mtime` is whatever Calibre's `convert_timestamp` produced — a
-    timezone-aware datetime as far as the disassembly shows, but this has never run.
-    Accept a datetime, a number, or nothing at all."""
+    """`ListEntry.mtime` is what Calibre's `convert_timestamp` produced: a
+    timezone-aware `datetime` (verified — see FIRST-RUN VERIFICATION 5). A number and
+    `None` are still accepted so a future Calibre cannot break the listing outright."""
     if value is None:
         return 0.0
     if isinstance(value, (int, float)):
@@ -253,6 +274,7 @@ def _open_device():
             raise _HelperError(
                 "no MTP device found: connect a Kindle over USB and unlock it",
                 EXIT_NO_DEVICE,
+                reason="no_device",
             )
         device.open(connected, _LIBRARY_UUID)
     except _HelperError:
@@ -302,6 +324,7 @@ def _check_serial(device, expected: str | None) -> dict:
             f"a different MTP device is attached: expected serial {expected!r}, "
             f"found {found!r}. Nothing was touched.",
             EXIT_NO_DEVICE,
+            reason="different_device",
         )
     if expected and not found:
         info["note"] = "the driver reported no serial, so the device could not be verified"
@@ -317,7 +340,7 @@ def _storage(device):
         return cache.storage(storage_id)
     entries = list(getattr(cache, "entries", []))
     if not entries:
-        raise _HelperError("the device reported no storage", EXIT_NO_DEVICE)
+        raise _HelperError("the device reported no storage", EXIT_NO_DEVICE, reason="no_storage")
     return entries[0]
 
 
@@ -350,6 +373,15 @@ def _walk(device, storage, parts: list[str], entries: list, out: list) -> None:
             )
 
 
+def _list_failed(error: Exception, what: str) -> dict:
+    return {
+        "op": "list",
+        "ok": False,
+        "code": "list_failed",
+        "error": f"{what}: {type(error).__name__}: {error}",
+    }
+
+
 def _op_list(device, op: dict) -> dict:
     """Recursive listing.
 
@@ -365,15 +397,19 @@ def _op_list(device, op: dict) -> dict:
     parts = _split(op.get("path", ""))
     try:
         top = _entries(device, storage, parts)
-    except Exception as error:
+    except FileNotFoundError as error:
+        # The ONLY exception that means "that folder is not on the device" (verified:
+        # `list_mtp_folder_by_name` raises FileNotFoundError for a missing folder and
+        # ValueError for a non-folder — see FIRST-RUN VERIFICATION 5). The device root
+        # always exists, so even this is a failure there.
         if not parts:
-            return {
-                "op": "list",
-                "ok": False,
-                "code": "list_failed",
-                "error": f"could not list the device root: {type(error).__name__}: {error}",
-            }
+            return _list_failed(error, "could not list the device root")
         return {"op": "list", "ok": True, "files": [], "missing": True, "note": str(error)}
+    except Exception as error:
+        # Anything else — a transient libmtp error, a path that is not a folder — is a
+        # failure. Reporting it as an empty listing is the same lie at a narrower
+        # address.
+        return _list_failed(error, f"could not list {op.get('path', '')!r}")
 
     files: list = []
     try:
@@ -611,8 +647,10 @@ def main(argv: list) -> int:
         _emit(_run_ops(device, envelope["ops"]), info)
         return EXIT_OK
     except _HelperError as error:
-        if error.results:
-            _emit(error.results, info)
+        # Emit even with no results: the payload's `device.reason` is how the backend
+        # tells "no device" from "a different device answered" from "no storage",
+        # all three of which are exit 2.
+        _emit(error.results, {**info, "reason": error.reason})
         sys.stderr.write(str(error) + "\n")
         return error.code
     except Exception as error:

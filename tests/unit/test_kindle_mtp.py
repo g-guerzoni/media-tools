@@ -157,14 +157,17 @@ def test_unparseable_json_after_the_marker_is_a_calibre_error(device):
     assert "traceback tail" in str(error.value)
 
 
-def test_a_marker_line_with_nothing_after_it_is_not_mistaken_for_the_result(device):
-    """The marker and the payload share a line precisely so a bare marker line in
-    chatter cannot be read as an empty result."""
+def test_a_bare_marker_line_after_the_result_does_not_fail_the_invocation(device):
+    """A BARE marker line printed after the payload is the nastiest case: it starts
+    with the marker, so a last-line-wins parser would try to read its empty remainder
+    as the result and fail an invocation that actually succeeded. The parser keeps
+    scanning backwards instead."""
     payload = results(listing(("documents/en/A Book.azw3", 1, 1.0)))
     stdout = (
         f"{mtp.START_MARKER}\n"
         f"{mtp.RESULT_MARKER}{json.dumps(payload)}\n"
         f"a plugin mentions {mtp.RESULT_MARKER} in passing\n"
+        f"{mtp.RESULT_MARKER}\n"
     )
     runner = FakeRunner(lambda ops: mtp.parse_helper_output(stdout, "", 0))
     assert len(backend(device, runner).list_files()) == 1
@@ -816,6 +819,12 @@ class StubDevice:
     entries in REVERSE name order on purpose, so a test can prove the helper sorts.
     `cached_hidden` names paths the CACHED tree does not expose, which is what makes
     `rm`'s real limitation reproducible.
+
+    It raises what the real driver raises, because that is the one distinction
+    `_op_list` turns on: a MISSING folder is `FileNotFoundError` and a path that is
+    not a folder is `ValueError` (both verified from Calibre 9.15's frozen unix
+    driver), while `fail_listing` models a transient libmtp error as a `RuntimeError`
+    — which must NOT be mistaken for "the folder is not there".
     """
 
     _main_id = "main"
@@ -845,8 +854,10 @@ class StubDevice:
         if self.fail_listing is not None and joined == self.fail_listing:
             raise RuntimeError(f"transient MTP failure listing {joined!r}")
         node = self.node(list(names))
+        if node is None:
+            raise FileNotFoundError(f"Could not find folder named: {joined} in storage")
         if not isinstance(node, dict):
-            raise RuntimeError(f"no such folder: {joined!r}")
+            raise ValueError(f"{joined} is not a folder")
         entries = [
             StubEntry(name, isinstance(value, dict), 0 if isinstance(value, dict) else len(value))
             for name, value in node.items()
@@ -1228,3 +1239,148 @@ def test_a_whole_batch_round_trips_from_ops_to_device_files(helper, tree, capsys
     assert [f.path for f in backend(device, runner).list_files("documents/pt")] == [
         "documents/pt/Um Livro.azw3"
     ]
+
+
+# --- fix round 2: the exclusions cannot leak through run_ops --------------------
+
+
+EXCLUSION_LISTING = listing(
+    ("My Clippings.txt", 1, 1.0),
+    ("audible/Some Audiobook.aax", 2, 2.0),
+    ("documents/en/A Book.azw3", 3, 3.0),
+    ("system/thumbnails/cover.jpg", 4, 4.0),
+    ("system/wifi/wifi.cfg", 5, 5.0),
+)
+EXPECTED_AFTER_EXCLUSION = [
+    "My Clippings.txt",
+    "documents/en/A Book.azw3",
+    "system/thumbnails/cover.jpg",
+]
+
+
+def test_run_ops_filters_list_results_exactly_as_list_files_does(device):
+    """`run_ops` is the entry point bulk callers are pointed at, so the exclusions
+    must hold there too — otherwise a batched `list` hands back the Wi-Fi credentials
+    and the audiobooks that the filter exists to keep off the host."""
+    through_run_ops = backend(device, FakeRunner(results(EXCLUSION_LISTING))).run_ops(
+        [{"op": "list", "path": ""}]
+    )
+    through_list_files = backend(device, FakeRunner(results(EXCLUSION_LISTING))).list_files()
+
+    assert [entry["path"] for entry in through_run_ops[0]["files"]] == EXPECTED_AFTER_EXCLUSION
+    assert [f.path for f in through_list_files] == EXPECTED_AFTER_EXCLUSION
+
+
+def test_run_ops_leaves_non_list_results_alone(device):
+    runner = FakeRunner(
+        results({"op": "put", "ok": True, "size": 3, "local_size": 3}, {"op": "rm", "ok": True})
+    )
+    outcome = backend(device, runner).run_ops(
+        [{"op": "put", "path": "a", "local": "/b"}, {"op": "rm", "path": "c"}]
+    )
+    assert outcome == [
+        {"op": "put", "ok": True, "size": 3, "local_size": 3},
+        {"op": "rm", "ok": True},
+    ]
+
+
+def test_run_ops_keeps_a_list_results_own_flags_while_filtering(device):
+    """Filtering must not drop `partial`/`missing`, which is what tells a bulk caller
+    the listing is not authoritative."""
+    runner = FakeRunner(results(listing(("audible/x.aax", 1, 1.0), partial=True)))
+    outcome = backend(device, runner).run_ops([{"op": "list", "path": ""}])
+    assert outcome[0]["partial"] is True
+    assert outcome[0]["files"] == []
+
+
+# --- fix round 2: only FileNotFoundError means "that folder is not there" -------
+
+
+def test_a_transient_failure_at_a_non_root_prefix_is_a_failure_not_an_empty_listing(helper, tree):
+    """The lie killed at the root must not survive one level down: a libmtp hiccup
+    while listing `documents/pt` is not "that folder is empty"."""
+    device = StubDevice(tree, fail_listing="documents/pt")
+    result = helper._op_list(device, {"op": "list", "path": "documents/pt"})
+    assert result["ok"] is False
+    assert result["code"] == "list_failed"
+    assert "missing" not in result
+
+
+def test_a_path_that_is_not_a_folder_is_a_failure_not_a_missing_prefix(helper, tree):
+    """The real driver raises ValueError for this, not FileNotFoundError."""
+    result = helper._op_list(StubDevice(tree), {"op": "list", "path": "documents/en/A Book.azw3"})
+    assert result["ok"] is False
+    assert result["code"] == "list_failed"
+
+
+def test_only_file_not_found_produces_the_missing_verdict(helper, tree):
+    missing = helper._op_list(StubDevice(tree), {"op": "list", "path": "documents/de"})
+    assert missing["ok"] is True and missing["missing"] is True and missing["files"] == []
+
+
+# --- fix round 2: exit 2 says which of the three situations it was --------------
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("no_device", "connect one over USB"),
+        ("different_device", "serial does not match"),
+        ("no_storage", "still locked"),
+    ],
+)
+def test_the_exit_2_message_names_which_situation_it_was(device, reason, expected):
+    payload = {"v": 1, "device": {"reason": reason}, "results": []}
+    runner = FakeRunner(parsed(payload, "helper said something\n", 2))
+    with pytest.raises(DeviceNotFound) as error:
+        backend(device, runner).list_files()
+    assert expected in str(error.value)
+
+
+def test_an_exit_2_with_no_reason_names_all_three_possibilities(device):
+    runner = FakeRunner(parsed(None, "", 2))
+    with pytest.raises(DeviceNotFound) as error:
+        backend(device, runner).list_files()
+    message = str(error.value)
+    assert "none is connected" in message
+    assert "not the one detected" in message
+    assert "no storage" in message
+
+
+def test_the_helper_reports_the_reason_for_each_exit_2_situation(helper, tree, capsys):
+    """The three reasons really are emitted by the helper, so the backend's mapping is
+    fed by something real rather than a shape invented in the test."""
+    stub = StubDevice(tree)
+    stub.current_serial_num = "SOMEOTHERDEVICE"
+    with pytest.raises(helper._HelperError) as mismatch:
+        helper._check_serial(stub, SERIAL)
+    assert mismatch.value.reason == "different_device"
+
+    empty = StubDevice(tree)
+    empty.filesystem_cache = SimpleNamespace(storage=lambda sid: None, entries=[])
+    del type(empty)._main_id
+    try:
+        with pytest.raises(helper._HelperError) as no_storage:
+            helper._storage(empty)
+        assert no_storage.value.reason == "no_storage"
+    finally:
+        type(empty)._main_id = "main"
+
+    # And `main` emits the reason even when there are no results to report.
+    helper._emit([], {"reason": "different_device"})
+    payload = mtp._payload_from(capsys.readouterr().out)
+    assert payload["device"]["reason"] == "different_device"
+
+
+# --- fix round 2: exists() does not quietly pay for a full scan -----------------
+
+
+def test_exists_on_a_root_level_path_keeps_the_full_listing_it_paid_for(device):
+    """A root-level path has the device root as its parent, so the scan is a full one
+    either way — it must at least populate the cache instead of being thrown away."""
+    runner = FakeRunner(results(listing(("My Clippings.txt", 1, 1.0))))
+    device_backend = backend(device, runner)
+    assert device_backend.exists("My Clippings.txt")
+    assert not device_backend.exists("Other.txt")
+    assert [f.path for f in device_backend.list_files()] == ["My Clippings.txt"]
+    assert len(runner.calls) == 1, "the full scan was paid for once and kept"

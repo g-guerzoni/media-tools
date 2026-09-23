@@ -71,6 +71,28 @@ _HELPER = Path(__file__).resolve().parents[3] / "integrations" / "kindle_mtp.py"
 # `DeviceBusy` they cannot act on.
 _GUI_EXECUTABLES = frozenset({"calibre", "calibre-gui", "calibre.exe"})
 
+# Exit 2 covers three different situations and the user needs to know which: "plug it
+# in" and "you have the wrong device attached" call for opposite actions. The helper
+# reports which one in the result payload's `device.reason`, so this never has to
+# substring-match the helper's own prose.
+_NO_DEVICE_REASONS = {
+    "no_device": "no Kindle found over MTP: connect one over USB and unlock it.",
+    "different_device": (
+        "the MTP device that answered is not the Kindle media-tools detected — its "
+        "serial does not match. Nothing on it was touched. Disconnect the other MTP "
+        "device, or re-run detection."
+    ),
+    "no_storage": (
+        "the Kindle answered over MTP but reported no storage — it is usually still "
+        "locked. Unlock the screen and try again."
+    ),
+}
+_NO_DEVICE_UNKNOWN = (
+    "no usable Kindle over MTP. One of three things: none is connected, the device "
+    "that answered is not the one detected, or it reported no storage (usually a "
+    "locked screen)."
+)
+
 
 class MtpPathNotInCachedTree(FileNotFoundError):
     """`rm` could not reach this path.
@@ -153,8 +175,11 @@ def _payload_from(stdout: str) -> dict | None:
         try:
             parsed = json.loads(stripped[len(RESULT_MARKER) :])
         except json.JSONDecodeError:
-            return None
-        return parsed if isinstance(parsed, dict) else None
+            # A bare marker line, or one a plugin garbled, must not fail an otherwise
+            # successful invocation — keep looking further back.
+            continue
+        if isinstance(parsed, dict):
+            return parsed
     return None
 
 
@@ -184,7 +209,8 @@ def parse_helper_output(stdout: str, stderr: str, returncode: int) -> dict:
         )
 
     if returncode == EXIT_NO_DEVICE:
-        raise DeviceNotFound("no Kindle found over MTP: connect one over USB and unlock it." + said)
+        reason = (payload or {}).get("device", {}).get("reason")
+        raise DeviceNotFound(_NO_DEVICE_REASONS.get(reason, _NO_DEVICE_UNKNOWN) + said)
     if returncode == EXIT_BUSY:
         raise DeviceBusy(busy_hint() + said)
     if returncode == EXIT_WRITE_PROTECTED:
@@ -301,7 +327,11 @@ class MtpBackend:
             raise CalibreError(
                 f"the MTP helper returned {len(results)} results for {len(ops)} operations"
             )
-        return results
+        # The exclusions are applied HERE, not only in `list_files`, because this is
+        # the entry point bulk callers are pointed at: a caller batching `list` ops
+        # through `run_ops` must not get `audible/` or `system/wifi/` back, which is
+        # exactly the data the exclusion exists to keep off the host.
+        return [_without_excluded_files(result) for result in results]
 
     def _preflight(self) -> None:
         """MTP allows exactly one holder, and Calibre's GUI grabs a connected device
@@ -351,10 +381,14 @@ class MtpBackend:
     def exists(self, path: str) -> bool:
         if self._listing is not None:
             return any(entry.path == path for entry in self._listing)
-        # Cold cache: list only the parent folder rather than the whole device, so a
-        # lone existence check does not pay for a full scan.
-        parent = path.rsplit("/", 1)[0] if "/" in path else ""
-        files, _ = self._files_under(parent)
+        if "/" not in path:
+            # A root-level path has the device root as its parent, so there is no
+            # cheaper listing to ask for — go through `list_files` and at least keep
+            # what the full scan cost.
+            return any(entry.path == path for entry in self.list_files())
+        # Cold cache, nested path: list only the parent folder, so a lone existence
+        # check does not pay for a full device scan.
+        files, _ = self._files_under(path.rsplit("/", 1)[0])
         return any(entry.path == path for entry in files)
 
     def free_space(self) -> int:
@@ -385,7 +419,6 @@ class MtpBackend:
                 mtime=float(entry.get("mtime") or 0.0),
             )
             for entry in result.get("files") or []
-            if _is_listable(str(entry.get("path", "")))
         ]
         complete = not (result.get("partial") or result.get("missing") or result.get("note"))
         return files, complete
@@ -402,6 +435,23 @@ def _error_for(result: dict, op: dict) -> Exception:
     if code == "write_protected":
         return DeviceWriteProtected(message)
     return CalibreError(message)
+
+
+def _without_excluded_files(result: dict) -> dict:
+    """A `list` result with the excluded paths removed. Anything else is untouched."""
+    if not isinstance(result, dict) or result.get("op") != "list":
+        return result
+    files = result.get("files")
+    if not isinstance(files, list):
+        return result
+    return {
+        **result,
+        "files": [
+            entry
+            for entry in files
+            if isinstance(entry, dict) and _is_listable(str(entry.get("path", "")))
+        ],
+    }
 
 
 def _is_listable(path: str) -> bool:
