@@ -236,7 +236,8 @@ Item statuses (`item.status`, and `run.json`'s per-item `status`):
 `error` event `code`:
 
 `usage`, `no_input_matched`, `batch_in_use`, `batch_task_mismatch`, `dependency_missing`,
-`config_missing`, `device_not_found`, `device_busy`, `device_write_protected`,
+`config_missing`, `device_not_found`, `device_busy`, `multiple_devices`,
+`device_write_protected`,
 `eject_failed`, `backup_failed`, `interrupted`, `output_not_writable`, `internal_error`,
 `extraction_failed`.
 

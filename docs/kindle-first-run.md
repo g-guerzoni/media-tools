@@ -73,6 +73,42 @@ sidecar cannot be deleted over MTP at all), the free-space return shape, the
 exit-code classification — whose substring list is an outright guess — and whether
 closing the session is really the whole of an MTP eject.
 
+## What a first real run confirmed (2026-09-24, mass storage)
+
+A real Kindle was attached and steps 1-3 were run, plus an `add`/`remove` round trip.
+This is evidence, not a promise about other models -- it was ONE device, in mass-storage
+mode. Everything MTP in the list above is still unverified.
+
+What held:
+
+- Detection, `status`, and `scan` (999 books) work, and `scan` is stable across a
+  disconnect/reconnect.
+- **Incremental backup does what it claims.** First snapshot: 2450 files, 1.08 GB
+  copied, 84s. Second, immediately after: the same 2450 files, **0 bytes copied,
+  1.08 GB hard-linked**, 1.2s, costing 988 KB on disk instead of 1.0 GB.
+- **The backup scope held against a real `system/`.** The device's `system/` carries
+  `btlogs`, `Search Indexes`, `CloudIndices`, `fmcache`, `kf8`, `grok_thumbnails` and
+  more; exactly `system/thumbnails` was collected (1161 files on the device, 1161 in
+  the snapshot) and nothing else. `audible/`, `voice/` and `.active_content_sandbox/`
+  were not collected.
+- **`add` then `remove` is a faithful round trip.** A book written to the device was
+  byte-identical to its source (same sha256), `add` run a second time SKIPPED it with
+  `reason: exists` (matched by EXTH 113, not by name), and `remove` left the library at
+  exactly the count it started with. Both took their mandatory backup first.
+- A book with no cover reports `no_cover` rather than failing.
+
+What this run changed in the code:
+
+- `.TemporaryItems` had to be added to `VOLUME_LITTER`. macOS creates it on removable
+  volumes and denies `scandir` on it, so `scan` aborted on EVERY mass-storage Kindle on
+  macOS -- reported as `device_not_found` on a mounted device.
+- `find_device` now RAISES `MultipleDevicesFound` when more than one Kindle is present
+  instead of taking the first. A mass-storage Kindle reports no serial, so backups are
+  keyed by the volume name, and every Kindle is named "Kindle": picking silently could
+  write one device's snapshot into another's directory.
+
+Still unverified after this run: everything MTP, and `eject` in both modes.
+
 ## Before plugging anything in
 
 ```bash

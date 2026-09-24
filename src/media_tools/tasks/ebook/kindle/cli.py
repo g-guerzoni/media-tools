@@ -142,7 +142,12 @@ from media_tools.tasks.ebook.kindle.backend import (
     sanitize_device_name,
     validate_writable_path,
 )
-from media_tools.tasks.ebook.kindle.detect import Device, DeviceBusy, DeviceNotFound
+from media_tools.tasks.ebook.kindle.detect import (
+    Device,
+    DeviceBusy,
+    DeviceNotFound,
+    MultipleDevicesFound,
+)
 from media_tools.tasks.ebook.normalize import IGNORED_LANGUAGE_TAGS
 
 NAME = "kindle"
@@ -546,6 +551,8 @@ def _error_code_for(error: BaseException) -> str:
     `PermissionError`, `OSError(EIO)`, `OSError(ENODEV)` — that `free_space()` (a bare
     `shutil.disk_usage`) and `read`/`read_many` (copying bytes off a device that just
     went away) raise at least as often as a plain "not found"."""
+    if isinstance(error, MultipleDevicesFound):
+        return "multiple_devices"
     if isinstance(error, DeviceBusy):
         return "device_busy"
     if isinstance(error, DeviceWriteProtected):
@@ -586,6 +593,7 @@ def _error_code_for(error: BaseException) -> str:
 _EXIT_FOR_CODE = {
     "device_not_found": EXIT_DEPENDENCY,
     "device_busy": EXIT_DEPENDENCY,
+    "multiple_devices": EXIT_DEPENDENCY,
     "device_write_protected": EXIT_DEPENDENCY,
     "eject_failed": EXIT_DEPENDENCY,
     "dependency_missing": EXIT_DEPENDENCY,

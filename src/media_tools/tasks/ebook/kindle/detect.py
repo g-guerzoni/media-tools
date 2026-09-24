@@ -26,6 +26,10 @@ class DeviceNotFound(RuntimeError):
     """No Kindle is connected, or it exposes nothing we can talk to."""
 
 
+class MultipleDevicesFound(RuntimeError):
+    """More than one Kindle is attached, so "the connected Kindle" has no answer."""
+
+
 class DeviceBusy(RuntimeError):
     """Another program holds the device (MTP allows exactly one holder)."""
 
@@ -163,6 +167,20 @@ def find_device(
     # The mount is listed FIRST so `identify=False` can return on it without touching
     # the bus. Neither lister has side effects, so the order is free.
     mounts = [m for m in (mount_lister or list_candidate_mounts)() if _looks_like_a_kindle(m)]
+    # Two Kindles is an ERROR, not a pick. This used to take `mounts[0]`/`usb[0]`
+    # silently, which is the worst available behaviour for the one case that matters:
+    # a mass-storage Kindle reports NO serial (confirmed on hardware), so
+    # `backup.device_key` falls back to the mount's name, and every Kindle is named
+    # "Kindle" by default. Silently choosing one therefore risks writing one device's
+    # snapshots into a directory keyed for another. A real Kindle presents exactly one
+    # mount and one USB entry, so >1 means more than one device rather than a composite.
+    if len(mounts) > 1:
+        raise MultipleDevicesFound(
+            f"{len(mounts)} Kindles are connected ({', '.join(m.name for m in mounts)}). "
+            "This tool works with exactly one at a time, because a mass-storage Kindle "
+            "reports no serial and its backups are keyed by the volume name -- with two "
+            "attached, the wrong one could be read or written. Unplug all but one."
+        )
     if mounts and not identify:
         return Device(serial=None, product_id=None, mode="mass_storage", mount=mounts[0])
 
@@ -175,6 +193,12 @@ def find_device(
         if entry.get("vendor_id") == KINDLE_VENDOR_ID
     ]
 
+    if len(usb) > 1:
+        raise MultipleDevicesFound(
+            f"{len(usb)} Kindles are connected over USB. This tool works with exactly "
+            "one at a time, so that the device it reads, writes and backs up is never "
+            "ambiguous. Unplug all but one."
+        )
     if mounts:
         first = usb[0] if usb else {}
         return Device(
