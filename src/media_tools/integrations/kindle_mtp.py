@@ -64,8 +64,12 @@ backend as `DeviceNotFound` with the start marker present. Nothing past
 
 1.  **SERIAL MATCHING — verify this first; it is the guard on everything else.**
     Calibre's MTP driver is a GENERAL MTP driver, not a Kindle driver, and this code
-    path deletes files. `_device_serial` reads ``current_serial_num`` (seen in
-    ``open``'s disassembly) and falls back to ``get_device_uid()``. Confirm that at
+    path deletes files. `_device_serial` reads ``current_serial_num`` (confirmed by
+    reading Calibre's own ``devices/mtp/unix/driver.py``: an ATTRIBUTE assigned during
+    ``open()``, not a method) and falls back to ``get_device_uid()`` -- which that
+    driver **does not define at all**, so on macOS and Linux the fallback never fires
+    and the ``getattr`` guard below is what keeps it from raising. That makes the
+    unguarded branch more likely than this note first assumed. Confirm that at
     least one of them yields a value, and that it is the SAME string
     ``detect.find_device`` reports from the USB layer — if the two spell the serial
     differently, every invocation will refuse to run. When neither yields anything,

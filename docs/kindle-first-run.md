@@ -37,14 +37,18 @@ confirmed. These are the ones that matter most, worst first:
    - when neither yields anything, the helper proceeds **unguarded** and says so in
      `device.checked` — decide whether that is acceptable *before* running any
      destructive command, because unguarded means "whatever MTP device answered".
-2. **MTP write atomicity is unknown.** There is no known staging or rename primitive
-   in Calibre's MTP driver, and none was invented: `put_file` writes straight to the
-   final name. An interrupted transfer can therefore leave a short file sitting at the
-   real name. Nothing detects that at write time — the only thing that catches it is
-   `add`'s own verify stage, which re-reads the file's size off the device afterwards
-   and fails the book as `short_write`. Confirm what `put_file` actually leaves behind
-   when a transfer is cut, whether it replaces a same-named file by default, and what
-   it raises when the device is full.
+2. **MTP write atomicity is worse than this used to say.** Reading Calibre's own
+   `devices/mtp/unix/driver.py` settled the three questions, and one answer is worse
+   than the guess it replaces. `put_file` takes `replace=True`, and when a file of the
+   same name exists it **deletes it first** (`delete_file_or_folder`) and only then
+   uploads. So an interrupted REPLACE does not leave a short file at the real name —
+   it can leave **nothing at all**, the previous copy already gone. There is still no
+   staging or rename primitive; the write goes straight to the final name. A failed
+   upload raises a generic `DeviceError("Failed to upload file named: …")` that does
+   **not** distinguish a full device from a cut transfer. `add`'s verify stage, which
+   re-reads the size off the device and fails the book as `short_write`, remains the
+   only thing that catches a bad write — and it cannot catch the deleted-then-not-
+   replaced case, because there is no file left to measure.
 3. ~~**`fonts/` and a root `My Clippings.txt` are unverified guesses.**~~ **Settled on
    hardware.** `fonts/` exists at the root of a real Kindle, as assumed. The root
    `My Clippings.txt` was wrong: the real file is `documents/My Clippings.txt` (with a
@@ -108,6 +112,43 @@ What this run changed in the code:
   write one device's snapshot into another's directory.
 
 Still unverified after this run: everything MTP, and `eject` in both modes.
+
+## What research settled about MTP, with no MTP device available (2026-09-24)
+
+The owner has no 2024-or-later Kindle or Scribe, so the MTP half **cannot be verified
+by running it** and this is as far as it goes. What follows was read from Calibre's
+source on `master` and from libmtp's issue tracker — it is better evidence than the
+`inspect.signature`/`dis` introspection the code was written from, because it is the
+actual implementation rather than a shape, but **nothing here was executed**, and the
+installed Calibre is 9.15.0 rather than `master`.
+
+- **`put_file` replaces by deleting first.** See item 2 above — this is the finding
+  that changes a risk rather than confirming one.
+- **No staging primitive exists.** The assumption the code was built on is correct.
+- **A failed upload is one generic `DeviceError`.** The message is
+  `"Failed to upload file named: <name> to <path>"`, with no separate signal for a
+  full device. The exit-code classification's substring list, which this project's own
+  comments call "an outright guess", can at least be anchored to that string now.
+- **`current_serial_num` is an attribute, not a method**, assigned during `open()`.
+  The helper reads it with `getattr`, which is right.
+- **`get_device_uid` does not exist in the unix driver.** The documented fallback
+  therefore never fires on macOS or Linux. The helper calls it through
+  `getattr(device, "get_device_uid", None)`, so this degrades rather than raising —
+  but it means a device whose `current_serial_num` is unset proceeds **unguarded**,
+  exactly the case item 1 says to decide about before running anything destructive.
+- **`eject()` is not just closing a session.** It adds the device to `ejected_devices`
+  and calls `post_yank_cleanup()`, which nulls `dev`, `_filesystem_cache` and
+  `current_friendly_name`.
+- **The target device may not enumerate at all.** libmtp issue #231 reports a Kindle
+  Paperwhite 2024 on firmware 5.17.0 (VID `0x1949`, PID `0x9981` — the same PID this
+  project's own MTP test uses) as UNKNOWN to libmtp 1.1.21, failing with
+  `LIBMTP PANIC: Unable to initialize device` and a busy libusb interface where GVFS
+  or KDE's MTP handling holds it. Detection fails outright there, before any file
+  operation. Treat "the MTP path is untested" as covering the possibility that it does
+  not reach the device at all on some stacks.
+
+**Everything in the list above is still unverified by execution**, and should stay
+unverified in this document until someone runs it against real hardware.
 
 ## Before plugging anything in
 
