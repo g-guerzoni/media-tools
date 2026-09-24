@@ -58,11 +58,15 @@ confirmed. These are the ones that matter most, worst first:
    put it at the root. The same real device also shows two root entries the scope does
    not mention: `voice/` and `.active_content_sandbox/`, neither of which is book
    content and neither of which is collected.
-4. **`eject` has never run against the real binaries.** The mass-storage path runs
-   `sync`, then `diskutil info -plist <mount>` to read `ParentWholeDisk` and
-   `diskutil eject <disk>` on macOS, or `udisksctl unmount -b` + `udisksctl power-off
-   -b` on Linux. The command shapes, the plist key and the busy-retry were all written
-   from documentation, never executed against a mounted device.
+4. ~~**`eject` has never run against the real binaries.**~~ **The macOS mass-storage
+   path has now run.** `sync`, then `diskutil info -plist <mount>` to read
+   `ParentWholeDisk`, then `diskutil eject <disk>`: exit 0 in 1.1s, the volume gone
+   from `/Volumes`, and the whole disk gone from `diskutil list` rather than merely
+   unmounted. `status` afterwards exits 3 with no device, which is correct. The plist
+   key and the command shapes were written from documentation and turned out right.
+   **The Linux path is still unexecuted** -- `udisksctl unmount -b` plus `udisksctl
+   power-off -b` -- as is the busy-retry on both platforms, which needs a device that
+   refuses the first attempt.
 5. **Only Calibre's *unix* MTP driver was ever read**, and only by disassembly.
    Windows uses a different driver module and may raise different exception types for
    the same situations — in particular the "folder is not there" branch, which decides
@@ -100,6 +104,8 @@ What held:
   `reason: exists` (matched by EXTH 113, not by name), and `remove` left the library at
   exactly the count it started with. Both took their mandatory backup first.
 - A book with no cover reports `no_cover` rather than failing.
+- **`eject` works on macOS mass storage.** It ejects the whole disk, not just the
+  mount: `diskutil list` stops showing the device entirely.
 
 What this run changed in the code:
 
@@ -111,7 +117,7 @@ What this run changed in the code:
   keyed by the volume name, and every Kindle is named "Kindle": picking silently could
   write one device's snapshot into another's directory.
 
-Still unverified after this run: everything MTP, and `eject` in both modes.
+Still unverified after this run: everything MTP, `eject` on Linux, and the busy-retry on either platform.
 
 ## What research settled about MTP, with no MTP device available (2026-09-24)
 
