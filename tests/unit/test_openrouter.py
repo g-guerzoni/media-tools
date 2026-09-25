@@ -1,5 +1,6 @@
 import io
 import json
+import os
 
 import pytest
 
@@ -195,3 +196,42 @@ def test_default_runner_returns_empty_string_when_op_is_not_installed(monkeypatc
 )
 def test_parse_json_content_tolerates_a_fenced_code_block(fenced):
     assert openrouter.parse_json_content(fenced) == {"books": ["a", "b"]}
+
+
+# -- OPENROUTER_API_KEY_FILE ----------------------------------------------------------
+
+
+def test_resolve_key_reads_a_key_file_first(tmp_path):
+    key_file = tmp_path / "openrouter"
+    key_file.write_text("sk-from-file\n")
+    env = {"OPENROUTER_API_KEY_FILE": str(key_file), "OPENROUTER_API_KEY": "sk-literal"}
+    assert openrouter.resolve_key(env=env, runner=lambda argv: pytest.fail("no op")) == (
+        "sk-from-file"
+    )
+
+
+@pytest.mark.parametrize("content", [None, "", "  \n"])
+def test_a_named_key_file_that_fails_never_falls_through(tmp_path, content):
+    key_file = tmp_path / "openrouter"
+    if content is not None:
+        key_file.write_text(content)
+    env = {"OPENROUTER_API_KEY_FILE": str(key_file), "OPENROUTER_API_KEY": "sk-literal"}
+    with pytest.raises(openrouter.OpenRouterError) as info:
+        openrouter.resolve_key(env=env)
+    assert str(key_file) in str(info.value)
+    assert "sk-literal" not in str(info.value)
+
+
+def test_a_key_file_error_never_contains_the_key(tmp_path):
+    key_file = tmp_path / "openrouter"
+    key_file.write_text("sk-secret-value")
+    key_file.chmod(0o000)
+    env = {"OPENROUTER_API_KEY_FILE": str(key_file)}
+    try:
+        if os.access(key_file, os.R_OK):
+            pytest.skip("running as a user that can read a mode-000 file")
+        with pytest.raises(openrouter.OpenRouterError) as info:
+            openrouter.resolve_key(env=env)
+    finally:
+        key_file.chmod(0o600)
+    assert "sk-secret-value" not in str(info.value)

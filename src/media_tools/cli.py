@@ -6,7 +6,14 @@ import argparse
 import sys
 
 from media_tools import __version__
-from media_tools.core.events import EXIT_FAILED, EXIT_INTERRUPTED, EXIT_USAGE, Reporter
+from media_tools.core import disabled
+from media_tools.core.events import (
+    EXIT_DEPENDENCY,
+    EXIT_FAILED,
+    EXIT_INTERRUPTED,
+    EXIT_USAGE,
+    Reporter,
+)
 from media_tools.core.runner import empty_result
 from media_tools.tasks import compress, convert, doctor, download, ebook, formats, split, status
 from media_tools.tasks.common import UsageError
@@ -47,6 +54,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _refuse_if_disabled(args) -> None:
+    """Checked here, at dispatch, rather than only in `serve`, so that a shell inside
+    the prod container cannot run a disabled task either."""
+    loaded = disabled.load()
+    reason = disabled.refusal(args, loaded)
+    if reason is None:
+        return
+    if loaded.unreadable:
+        raise UsageError(
+            reason,
+            code="config_missing",
+            hint="the image is damaged or mounted wrongly; run `media-tools doctor`",
+            exit_code=EXIT_DEPENDENCY,
+        )
+    raise UsageError(
+        reason,
+        hint="run it where it is enabled (a local install); `media-tools formats` lists "
+        "what this deployment disables",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -56,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
 
     task = next(t for t in TASKS if args.task == t.NAME)
     try:
+        _refuse_if_disabled(args)
         return task.run(args)
     except UsageError as error:
         # A `UsageError` fires before a task's own `start` (it is exactly the

@@ -5,7 +5,12 @@ the actual network call routed through an injectable `opener` so tests never tou
 the network. Likewise, 1Password lookups go through an injectable `runner` so tests
 never shell out to the real `op` binary.
 
-A key may be supplied three ways: a literal value in `OPENROUTER_API_KEY`, an
+A key may be supplied four ways. First, `OPENROUTER_API_KEY_FILE`: a path to a file
+holding the key, which is how a container receives it (Docker file secrets; there is
+no `op` inside one). When that variable is set it is the only source consulted: a
+missing, unreadable or empty file is an error, never a silent fall-through to the
+others, since a deployment that names a secret file meant to use it. Otherwise: a
+literal value in `OPENROUTER_API_KEY`, an
 `op://vault/item/field` reference in that same variable (resolved via `op read`),
 or a named 1Password item passed as `--op-item` (its `credential`/`password`/
 `api key`/`apikey`/`key`/`token` field is tried, in that order, via `op item get
@@ -24,6 +29,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -37,8 +43,11 @@ _RETRYABLE_STATUSES = frozenset({408, 409, 425, 429})
 # wording, without hardcoding any particular item name.
 _FIELD_LABELS = ("credential", "password", "api key", "apikey", "key", "token")
 
+KEY_FILE_ENV = "OPENROUTER_API_KEY_FILE"
+
 _NO_KEY_MESSAGE = (
-    "No OpenRouter API key available. Provide one via the OPENROUTER_API_KEY "
+    "No OpenRouter API key available. Provide one via OPENROUTER_API_KEY_FILE (a path "
+    "to a file holding the key), the OPENROUTER_API_KEY "
     "environment variable (either a literal key or an op://vault/item/field "
     "reference resolved through the 1Password CLI), via --op-item NAME (a named "
     "1Password item), or pass --no-llm to skip LLM-assisted features."
@@ -89,6 +98,20 @@ def resolve_key(op_item: str | None = None, *, env=None, runner=None, timeout: f
     env = os.environ if env is None else env
     if runner is None:
         runner = functools.partial(_default_runner, timeout=timeout)
+
+    key_file = (env.get(KEY_FILE_ENV) or "").strip()
+    if key_file:
+        # The message names the path, never the content.
+        try:
+            value = Path(key_file).read_text(encoding="utf-8").strip()
+        except OSError as error:
+            raise OpenRouterError(
+                f"{KEY_FILE_ENV} is set but {key_file} could not be read: "
+                f"{error.strerror or type(error).__name__}"
+            ) from None
+        if not value:
+            raise OpenRouterError(f"{KEY_FILE_ENV} is set but {key_file} is empty")
+        return value
 
     raw = (env.get("OPENROUTER_API_KEY") or "").strip()
     if raw:
