@@ -218,22 +218,42 @@ networks: [media_int, media_egress]      # no ports:
 
 ### Resources
 
-Limits come from **measurement, not estimates**. During implementation, each
-representative job is run inside the image with `MAX_JOBS=1` and `MAX_WORKERS=1`, and
-the container's own cgroup is sampled: **`memory.peak`** (RSS plus page cache,
-including anything written to tmpfs) and `pids.peak`. Peak RSS alone is not enough,
-because it misses every byte charged to the cgroup that is not process memory. The
-jobs:
+Limits come from **measurement, then proof**. The metric has to follow the architecture.
+Job scratch now lives on the volume, not on tmpfs. So most of what the page cache holds
+during a job is ordinary file cache from reading and writing `/data`, which the kernel
+reclaims under pressure rather than OOM-killing. `memory.peak` counts that cache, so on
+its own it over-sizes the limit. On a host with no spare memory, over-sizing is not the
+safe direction: the number feeds a capacity decision, and its precision is the point.
+
+**Step 1, measure.** Each representative job runs inside the image with `MAX_JOBS=1`
+and `MAX_WORKERS=1`. The container's cgroup is sampled for:
+
+- `memory.stat`: `anon`, `file`, `shmem`, at their peaks;
+- `memory.peak`, kept as a sanity ceiling;
+- `pids.peak`.
+
+The jobs:
 
 - `compress` of a 1080p, 10-minute clip;
 - `split` of a 1 GB file;
 - `ebook build --no-llm` over 200 mixed-format books;
 - `ebook convert` of the largest PDF in the test library.
 
-`mem_limit` = the largest `memory.peak` × 1.25, rounded up to 128 MiB, and
-`pids_limit` = the largest `pids.peak` × 2. The measurements and the
-resulting numbers are recorded in this spec before any compose file is reviewed. The
-owner decides where that memory comes from on `vps-default`.
+**Step 2, set the candidates.** `mem_limit` = the largest peak `anon + shmem` × 1.25,
+rounded up to 128 MiB, never above the largest `memory.peak`. `pids_limit` = the
+largest `pids.peak` × 2.
+
+**Step 3, prove.** Every representative job is re-run with the candidate
+`mem_limit`, `memswap_limit` and `cpus: "1.0"` applied. The candidate stands only when
+every job completes, `docker inspect` reports `OOMKilled=false`, and wall time is within
+1.5× of the unconstrained run, so reclaim does not turn into thrashing. If a job fails
+this, the cap goes up by 128 MiB and step 3 repeats. The inferred number is a
+hypothesis; the run is the evidence.
+
+A table in this spec records, for each job, the `anon`, `file`, `shmem`,
+`memory.peak`, `pids.peak`, both wall times, and the validation run's `OOMKilled`. It
+goes before any compose file is reviewed. The owner decides where that memory comes
+from on `vps-default`.
 
 ### Network
 
