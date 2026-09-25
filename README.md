@@ -458,6 +458,33 @@ the first time an actual Kindle is attached: read-only commands first, then a ba
 then a single book added, then a single book removed and restored. Work through it in
 order, and keep the backup it takes until everything on it has been checked.
 
+## Running in a container
+
+The `Dockerfile` builds a self-contained image. Everything media-tools calls ships
+inside it: Python, Calibre from Ubuntu's archive, the bundled ffmpeg and Deno. It has
+three targets:
+
+| target | what it is |
+| --- | --- |
+| `prod` | for a production host. `download` and `ebook kindle` are disabled by the image itself (see below) |
+| `local` | the same, with nothing disabled |
+| `test` | `local` plus the dev dependencies; runs the offline suite |
+
+```bash
+docker build --target local -t media-tools:local .
+docker run --rm -v "$PWD:/data" -e MEDIA_TOOLS_OUT=/data/media media-tools:local \
+    compress clip.mp4 --json
+```
+
+The image runs as uid/gid 10001 and works with a read-only root filesystem, given a
+writable `/tmp`. Its output root is `/data/out` unless `MEDIA_TOOLS_OUT` says
+otherwise. Dependencies are installed from `requirements.lock` with
+`pip install --require-hashes`. After changing `pyproject.toml` or `constraints.txt`,
+regenerate both lock files with `scripts/lock.sh` (it needs `uv`, pinned in the
+script). CI fails when the locks drift. CI also runs the whole offline suite inside
+the image, and on `main` pushes `ghcr.io/g-guerzoni/media-tools:<sha>` (prod) and
+`:<sha>-local`.
+
 ## The job API: `media-tools serve`
 
 Other apps on the same host can hand media-tools work over HTTP. The API is for an
