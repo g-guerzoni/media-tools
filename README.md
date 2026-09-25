@@ -484,7 +484,10 @@ reports (in `run.json`, for instance) are container paths under `/work`.
 
 To develop an app against the job API, `compose.local.yml` runs `serve` from the local
 image, published on `127.0.0.1:8080` only. The file's header has the three setup
-commands. The prod target starts `serve` by default.
+commands. The prod target starts `serve` by default. The container runs as uid 10001,
+so a caller's input files must be readable by that uid: world-readable (`0644`) or
+group-readable by a shared gid. A file copied in with `docker cp` keeps its host mode,
+and with every capability dropped nothing inside the container can change it.
 
 The image runs as uid/gid 10001 and works with a read-only root filesystem, given a
 writable `/tmp`. Its output root is `/data/out` unless `MEDIA_TOOLS_OUT` says
