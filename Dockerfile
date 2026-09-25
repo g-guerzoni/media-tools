@@ -78,3 +78,5 @@ RUN mkdir -p /usr/local/share/media-tools \
     && printf 'download\nebook-kindle\n' > /usr/local/share/media-tools/disabled-tasks \
     && chmod 0444 /usr/local/share/media-tools/disabled-tasks
 USER 10001:10001
+# Production runs the job API; any other command is still `docker run ... <task>`.
+CMD ["serve"]

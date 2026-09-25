@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Run media-tools from the LOCAL container image, on files under the current directory.
+#
+#   scripts/media-tools-docker compress clip.mp4 --json
+#
+# It is the same image production runs, minus the tasks production disables: here
+# `download` works. The current directory is mounted at /work, output lands in
+# ./media (as a native run's would), and the container runs as YOUR uid, so what it
+# writes belongs to you. Paths must be relative to (and inside) the current directory,
+# since nothing else is mounted.
+#
+# Build the image first:  docker build --target local -t media-tools:local .
+# Another image:          MEDIA_TOOLS_IMAGE=ghcr.io/g-guerzoni/media-tools:<sha>-local
+set -euo pipefail
+
+image="${MEDIA_TOOLS_IMAGE:-media-tools:local}"
+tty=()
+[[ -t 0 && -t 1 ]] && tty=(-t)
+
+exec docker run --rm -i "${tty[@]}" \
+    --read-only --tmpfs /tmp:size=2g \
+    --cap-drop ALL --security-opt no-new-privileges:true \
+    --user "$(id -u):$(id -g)" \
+    -v "$PWD:/work" -w /work \
+    -e HOME=/tmp/home -e MEDIA_TOOLS_OUT=/work/media \
+    "$image" "$@"
