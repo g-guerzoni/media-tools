@@ -1,8 +1,9 @@
 # media-tools: container image and internal job service — design
 
 **Date:** 2026-09-25
-**Status:** draft. The owner has decided D-NET, the scope and the deploy boundary. The
-decisions marked *proposed* in the table below still wait on the owner.
+**Status:** decided. The owner decided every item in the table on 2026-09-25, except
+D-FILES, which MAC_VPS_SEC_REVIEW endorsed and the owner did not contest. D-CEIL is
+deliberately deferred until the measurements exist.
 MAC_VPS_SEC_REVIEW reviewed `4a01f4f`, and all four of its findings are applied here:
 job scratch moved from tmpfs to the volume; the disabled-task set baked into the image,
 with the environment able only to widen it; the network split in two; and the janitor
@@ -31,12 +32,12 @@ resolves secrets, and the tool is installed in a per-checkout `.venv` that is no
 | D-FEAT | Which features does prod keep? | Every task except `download` and `ebook kindle` (no USB in a container). | owner, 2026-09-25 |
 | D-EXPOSE | Who can reach it? | Apps on the same host only, over an internal Docker network. No Caddy route, no host port. | owner, 2026-09-25 |
 | D-DEPLOY | Does this work deploy to `vps-default`? | **No.** The owner owns capacity and deployment there. This work ends at an image in GHCR plus a reviewed compose file. | owner, 2026-09-25 |
-| D-API | How do callers submit work? | An HTTP job API built on the Python standard library, served by a new `media-tools serve` subcommand. | *proposed* |
-| D-FILES | How do files move? | Through a shared named volume. There is no upload endpoint. | *proposed* |
-| D-AUTH | How is a caller identified? | One bearer token per calling app, each read from its own secret file. | *proposed* |
-| D-RET | How long is data kept? | 72 h per job, plus a hard size cap on the volume. | *proposed* |
-| D-CEIL | What is the most memory the container may ever ask for? | `MEM_CEILING`, the stop condition for sizing (see "Resources") | *owner to set* |
-| D-LOCAL | How does the box run it? | The native `.venv` put on `PATH` (full features, including Kindle and `download`), plus the same image through a wrapper script. | *proposed* |
+| D-API | How do callers submit work? | An HTTP job API built on the Python standard library, served by a new `media-tools serve` subcommand. | owner, 2026-09-25 |
+| D-FILES | How do files move? | Through a shared named volume. There is no upload endpoint. | endorsed by MAC_VPS_SEC_REVIEW |
+| D-AUTH | How is a caller identified? | One bearer token per calling app, each read from its own secret file. | owner, 2026-09-25 |
+| D-RET | How long is data kept? | **30 days** per job, and a hard **30 GB** cap on the volume. | owner, 2026-09-25 |
+| D-CEIL | What is the most memory the container may ever ask for? | `MEM_CEILING`, the stop condition for sizing (see "Resources"). **Measure first:** steps 1 and 2 run with no ceiling, and the owner sets `MEM_CEILING` from the resulting table, before step 3's loop is allowed to grow the cap. | owner, 2026-09-25: deferred |
+| D-LOCAL | How does the box run it? | The native `.venv` put on `PATH` (full features, including Kindle and `download`), plus the same image through a wrapper script. The `PATH` entry is a box change, registered as the box contract requires. | owner, 2026-09-25 |
 
 ## Architecture
 
@@ -177,9 +178,9 @@ Rules:
 - **Volume:** `media-tools_data`, mounted at `/data`. A caller mounts the same volume
   and writes its inputs under `in/<caller>/`.
 - **Retention:** a janitor thread in `serve` deletes `jobs/<id>/` and that job's batch
-  directory `MEDIA_TOOLS_RETENTION_HOURS` (default 72) after the job finishes. It
+  directory `MEDIA_TOOLS_RETENTION_HOURS` (default 720, i.e. 30 days) after the job finishes. It
   deletes anything under `in/` older than the same limit.
-- **Size bound:** `MEDIA_TOOLS_MAX_DATA_BYTES`. When `/data` is over it, `POST /v1/jobs`
+- **Size bound:** `MEDIA_TOOLS_MAX_DATA_BYTES` (default 30 GB, i.e. 30 × 10^9 bytes). When `/data` is over it, `POST /v1/jobs`
   returns `507` and no job starts. The janitor runs first. Nothing else watches volume
   growth on the host, so the service bounds itself.
 - **The janitor is observable.** Both the retention sweep and the size check live in
