@@ -50,3 +50,49 @@ jobs:
           grep -vE '^#|^$' constraints.txt > /tmp/pinned.txt
           diff -u /tmp/pinned.txt /tmp/now.txt || true
       - run: pytest -m "not network and not llm and not device" -q
+
+  # The container image (docs/specs/2026-09-25-media-tools-container-design.md). It runs
+  # the offline suite INSIDE the image, as its runtime user on a read-only root with
+  # every capability dropped. That is also the only place the Calibre-gated tests run in
+  # CI, since the runners above have no Calibre. On main it pushes to GHCR; nothing here
+  # deploys it.
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # The locks must describe exactly pyproject.toml + constraints.txt. uv is pinned,
+      # like every other third-party tool here.
+      - run: pip install uv==0.12.19
+      - run: scripts/lock.sh --check
+      - run: docker build --target test -t media-tools:test .
+      - run: >
+          docker run --rm --read-only --tmpfs /tmp:size=512m
+          --cap-drop ALL --security-opt no-new-privileges:true
+          media-tools:test -q
+      - run: docker build --target prod -t media-tools:prod .
+      - run: docker build --target local -t media-tools:local .
+      # The prod image must refuse download even with the variable set to empty: the
+      # baked file, not the environment, is the control.
+      - name: prod refuses download
+        run: |
+          set +e
+          docker run --rm --read-only --tmpfs /tmp:size=64m --cap-drop ALL \
+            --security-opt no-new-privileges:true -e MEDIA_TOOLS_DISABLED_TASKS= \
+            media-tools:prod download https://example.com/v --json
+          test "$?" -eq 2
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        name: push to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker tag media-tools:prod "$repo:${GITHUB_SHA}"
+          docker tag media-tools:local "$repo:${GITHUB_SHA}-local"
+          docker push -q "$repo:${GITHUB_SHA}"
+          docker push -q "$repo:${GITHUB_SHA}-local"
+          echo "prod image: $(docker inspect --format '{{index .RepoDigests 0}}' "$repo:${GITHUB_SHA}")" | tee -a "$GITHUB_STEP_SUMMARY"

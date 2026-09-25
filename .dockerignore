@@ -1,0 +1,13 @@
+# Only what the Dockerfile COPYs matters; keep everything else out of the build context
+# (the venv alone is ~270 MB, and media/ holds generated output).
+*
+!pyproject.toml
+!README.md
+!CLAUDE.md
+!LICENSE
+!requirements.lock
+!requirements-dev.lock
+!src/
+!tests/
+!.claude/settings.json
+**/__pycache__

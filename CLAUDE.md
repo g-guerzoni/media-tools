@@ -449,6 +449,18 @@ media-tools status              # every batch under the output root
 media-tools status <batch>      # one batch: counts, failed items + reasons, pending items
 ```
 
+### The container image
+
+`Dockerfile` targets: `prod` (bakes `/usr/local/share/media-tools/disabled-tasks` with
+`download` and `ebook-kindle`), `local` (nothing disabled), and `test` (runs the offline
+suite in the image). The base is Ubuntu 24.04, pinned by digest, with Calibre 7.6 from
+the archive, never upstream's installer. It runs as uid/gid 10001, never 1000. The
+image installs from `requirements.lock` / `requirements-dev.lock` with
+`--require-hashes`. **Changing `pyproject.toml` or `constraints.txt` means re-running
+`scripts/lock.sh`** (it needs uv 0.12.19); CI's `image` job runs `scripts/lock.sh
+--check` and fails on drift. `/data` is owned by 10001 in the image, because a named
+volume is initialised from it and would otherwise be unwritable.
+
 ### `serve`: the internal job API
 
 `media-tools serve` (`tasks/serve/`) is a stdlib HTTP job API for other apps on the
