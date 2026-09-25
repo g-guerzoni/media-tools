@@ -716,3 +716,14 @@ def test_kindle_mtp_driver_probe_marker_never_matches_by_accident(monkeypatch):
         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
     )
     assert doctor_task._kindle_mtp_driver_check(_mtp_kindle(), PROBE_RUNS).status == "warn"
+
+
+def test_openrouter_check_names_a_broken_key_file_without_its_content(tmp_path):
+    from media_tools.tasks import doctor as doctor_module
+
+    key_file = tmp_path / "openrouter"
+    key_file.write_text("")
+    check = doctor_module._openrouter_check(env={"OPENROUTER_API_KEY_FILE": str(key_file)})
+    assert check.status == "warn"
+    assert str(key_file) in check.detail
+    assert "empty" in check.detail

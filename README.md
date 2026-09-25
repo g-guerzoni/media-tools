@@ -261,9 +261,10 @@ compares books across languages.
 
 **The LLM pass costs about one request per 30 books**, and every answer is cached, so a
 rebuild that adds no new books doesn't re-pay for the ones it already classified. It
-needs an OpenRouter API key, which you can provide any of three ways:
+needs an OpenRouter API key, which you can provide any of four ways:
 
 ```bash
+export OPENROUTER_API_KEY_FILE=/run/secrets/key  # a file holding the key (containers)
 export OPENROUTER_API_KEY=sk-...                 # a literal key
 export OPENROUTER_API_KEY=op://vault/item/field  # a 1Password reference
 media-tools ebook build books/ --op-item NAME    # a named 1Password item
@@ -456,6 +457,25 @@ evidence about hardware. `docs/kindle-first-run.md` is the checklist to work thr
 the first time an actual Kindle is attached: read-only commands first, then a backup,
 then a single book added, then a single book removed and restored. Work through it in
 order, and keep the backup it takes until everything on it has been checked.
+
+## Disabling tasks in a deployment
+
+A deployment can switch tasks off. The prod container image does this for `download`
+(it fetches arbitrary URLs and runs their JavaScript, which a shared production host
+must not do) and for `ebook kindle` (there is no USB in a container). Both stay
+available when media-tools is installed and run locally.
+
+The disabled set is the **union** of two sources:
+
+- `/usr/local/share/media-tools/disabled-tasks`, one id per line, baked into the prod
+  image;
+- `MEDIA_TOOLS_DISABLED_TASKS`, comma-separated.
+
+The environment can disable more tasks, but can never re-enable one the image
+disables. Valid ids: `compress`, `convert`, `split`, `download`, `ebook`,
+`ebook-kindle`. A disabled task exits 2 with a `usage` error before doing anything.
+`media-tools formats --json` lists the disabled set under `disabled_tasks`, and
+`media-tools doctor` reports it and flags an id it does not recognise.
 
 ## Where output goes
 

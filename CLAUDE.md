@@ -193,7 +193,7 @@ reaches its normal end; a batch conflict or a Ctrl+C returns before it would be 
 `formats`, `status` and `doctor` are reports, not multi-item runs: under `--json` each
 prints exactly one line, `{"v": 1, "type": ..., ...}`:
 
-- `formats --json` → `{"v": 1, "type": "formats", "formats": [ {task, engine, inputs, outputs, requires}, ... ]}`
+- `formats --json` → `{"v": 1, "type": "formats", "formats": [ {task, engine, inputs, outputs, requires}, ... ], "disabled_tasks": [...]}`
 - `status --json` (no batch) → `{"v": 1, "type": "status", "batches": [ {batch, task, status, updated_at, active, counts, readable}, ... ]}`
 - `status <batch> --json` → `{"v": 1, "type": "status", "batch": {..., "failed": [...], "pending": [...]}}` — note the key is `"batch"` (singular object) here, `"batches"` (list) above.
 - `doctor --json` → `{"v": 1, "type": "doctor", "exit_code": ..., "checks": [...]}`
@@ -449,6 +449,32 @@ media-tools status              # every batch under the output root
 media-tools status <batch>      # one batch: counts, failed items + reasons, pending items
 ```
 
+### Disabled tasks (deployments)
+
+A deployment can refuse tasks. The disabled set is the UNION of
+`/usr/local/share/media-tools/disabled-tasks` (baked into the prod image, one id per line)
+and `MEDIA_TOOLS_DISABLED_TASKS` (comma-separated). The environment can widen the set
+and never narrow it. That is deliberate: the prod compose file is writable by a non-root
+deploy principal, and a control that one edit there could remove would be only as
+strong as that file. Ids: `compress`, `convert`, `split`, `download`, `ebook`,
+`ebook-kindle` (disabling `ebook` also disables `ebook-kindle`). The prod image
+disables `download` and `ebook-kindle`; a local install disables nothing.
+
+- The check is in `cli.main`, before dispatch (`core/disabled.py`), not only in the
+  job API. So a shell inside the container cannot run a disabled task either.
+- A disabled task exits **2** with `error` code `usage`, then `result`, and writes
+  nothing.
+- A baked file that exists but cannot be read fails CLOSED: every task that does work
+  exits **3** with `config_missing`. `doctor`, `formats` and `status` still run, so the
+  problem can be seen.
+- `formats --json` carries `disabled_tasks` (a sorted list). `--markdown` is unchanged,
+  because it is the docs table and describes the tool, not one deployment of it.
+- The `doctor` check `disabled-tasks` is `ok` whether or not anything is disabled. It
+  is `warn` only for an unreadable file or an id that matches no task.
+
+If a command is refused as disabled, do not look for a way around it. Run it where it
+is enabled: a local install.
+
 ### Output rules
 
 Output root: `-o`/`--output-dir` > `MEDIA_TOOLS_OUT` env var > the checkout's own
@@ -638,6 +664,9 @@ produce for that one book (worked example: `examples/ebook-list.json`):
 books**, batched and cached — a rebuild that adds no new books re-pays nothing. It
 needs a key, resolved in this order:
 
+0. `OPENROUTER_API_KEY_FILE=/path` — a file holding the key, which is how a container
+   receives it. When this is set it is the ONLY source consulted: a missing, unreadable
+   or empty file is `config_missing`, never a fall-through to the sources below.
 1. `OPENROUTER_API_KEY=sk-...` — a literal key.
 2. `OPENROUTER_API_KEY=op://vault/item/field` — resolved via `op read` (the 1Password
    CLI must be installed and signed in).

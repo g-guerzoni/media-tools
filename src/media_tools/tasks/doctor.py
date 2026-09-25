@@ -40,6 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from media_tools.core import disabled
 from media_tools.core.events import EXIT_DEPENDENCY, EXIT_OK, EXIT_USAGE
 from media_tools.core.ffmpeg import ffmpeg_exe
 from media_tools.core.paths import output_root
@@ -261,9 +262,18 @@ def _openrouter_check(op_item: str | None = None, *, env=None, runner=None) -> C
     # --json or the human table to leak.
     hint = (
         f"export {OPENROUTER_ENV}=... (a literal key or an op://vault/item/field "
-        "reference) or pass --op-item NAME; needed by `media-tools ebook build`'s "
+        f"reference), {openrouter.KEY_FILE_ENV}=<path to a file holding it>, or pass "
+        "--op-item NAME; needed by `media-tools ebook build`'s "
         "LLM-assisted normalize/dedup stages, or pass --no-llm to skip them"
     )
+    environ = os.environ if env is None else env
+    if (environ.get(openrouter.KEY_FILE_ENV) or "").strip():
+        # A named key file that fails is a misconfiguration, not an absent key: say
+        # what is wrong with it. The message names the path, never the content.
+        try:
+            openrouter.resolve_key(op_item, env=environ, runner=runner)
+        except openrouter.OpenRouterError as error:
+            return Check("openrouter-key", "warn", str(error), hint=hint)
     if openrouter.key_present(op_item, env=env, runner=runner, timeout=_OP_ITEM_LOOKUP_TIMEOUT_S):
         return Check(
             "openrouter-key",
@@ -272,6 +282,36 @@ def _openrouter_check(op_item: str | None = None, *, env=None, runner=None) -> C
             hint="used by `media-tools ebook build`'s LLM-assisted normalize/dedup stages",
         )
     return Check("openrouter-key", "warn", "not configured", hint=hint)
+
+
+def _disabled_tasks_check(env=None, path=None) -> Check:
+    """What this deployment refuses. `ok` either way: a disabled task is a deliberate
+    property of the deployment, not a problem. Only an unreadable baked file (every
+    working task is refused) or a name that matches no task (a typo that disables
+    nothing) is worth a warn."""
+    loaded = disabled.load(env=env, path=path)
+    if loaded.unreadable:
+        return Check(
+            "disabled-tasks",
+            "warn",
+            f"unreadable: {loaded.unreadable}; every task that does work is refused",
+            hint="the image is damaged or mounted wrongly; rebuild or re-pull it",
+        )
+    if loaded.unknown:
+        return Check(
+            "disabled-tasks",
+            "warn",
+            f"unknown task ids ignored: {', '.join(sorted(loaded.unknown))}",
+            hint=f"valid ids: {', '.join(sorted(disabled.KNOWN_IDS))}",
+        )
+    if not loaded.ids:
+        return Check("disabled-tasks", "ok", "none")
+    parts = []
+    if loaded.baked:
+        parts.append(f"by the image: {', '.join(sorted(loaded.baked))}")
+    if loaded.env - loaded.baked:
+        parts.append(f"by {disabled.ENV_VAR}: {', '.join(sorted(loaded.env - loaded.baked))}")
+    return Check("disabled-tasks", "ok", "; ".join(parts))
 
 
 # -- the Kindle section: never a failure, and never a warn with no action ------------
@@ -586,6 +626,7 @@ def check_all(
         _deno_check(),
         _calibre_check(),
         _openrouter_check(op_item),
+        _disabled_tasks_check(),
         # Detection first, because the driver probe is gated on what it found.
         kindle_device_check,
         _kindle_mtp_driver_check(kindle_device, kindle_skip_reason),

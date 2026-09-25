@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 
+from media_tools.core import disabled
 from media_tools.core.events import EXIT_OK
 from media_tools.tasks import compress, convert, download, ebook, split
 
@@ -94,11 +95,17 @@ def _as_plain_table(rows: list[dict], *, header: bool) -> str:
 
 def run(args) -> int:
     rows = collect()
+    # What this deployment refuses, so a caller can find out without trying. Kept out
+    # of the rows themselves: `--markdown` is the docs table, which describes the tool,
+    # not one deployment of it.
+    off = sorted(disabled.load().ids)
     if args.json_mode:
-        envelope = {"v": 1, "type": "formats", "formats": rows}
+        envelope = {"v": 1, "type": "formats", "formats": rows, "disabled_tasks": off}
         print(json.dumps(envelope, ensure_ascii=False))
     elif args.markdown:
         print(as_markdown(rows), end="")
     else:
         print(_as_plain_table(rows, header=not args.quiet), end="")
+        if off:
+            print(f"\ndisabled in this deployment: {', '.join(off)}")
     return EXIT_OK
