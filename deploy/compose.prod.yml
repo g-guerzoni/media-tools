@@ -1,0 +1,70 @@
+# media-tools on a production host: the job API for other apps on the SAME host.
+# Design and every rule below: docs/specs/2026-09-25-media-tools-container-design.md
+#
+# NOT deployed by this repository. The owner decides the host, its capacity and its
+# deploy wrapper. This file is what goes to /srv/apps/media-tools/ there, reviewed by
+# MAC_VPS_SEC_REVIEW together with the measured limits.
+#
+# Callers:
+#   - join `media_int` (Internal=true: reachability, no egress);
+#   - never join `media_egress` (media-tools is its only member);
+#   - mount `media-tools_data` with a subpath: in/<caller> read-write and
+#     out/<caller> read-only. Never the whole volume, which would expose other
+#     callers' files.
+#   - write inputs readable by uid 10001 (0644, or a shared gid).
+name: media-tools
+
+services:
+  media-tools:
+    image: ghcr.io/g-guerzoni/media-tools@sha256:<digest of the reviewed prod image>
+    command: ["serve"]
+    user: "10001:10001"
+    read_only: true
+    # The server's own tiny scratch only. Job scratch is /data/tmp/<id> on the volume:
+    # tmpfs is charged to mem_limit and cannot swap under memswap_limit == mem_limit.
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: <measured; see the spec's Resources table>
+    # No swap: a CPU-bound batch job that pages slows the live app next to it; an OOM
+    # kill is a clean, retryable job failure instead.
+    memswap_limit: <same as mem_limit>
+    cpus: "1.0"          # leaves a core for the host's web app
+    pids_limit: <measured pids.peak x 2>
+    restart: unless-stopped
+    group_add: ["<gid owning /srv/secrets/media-tools>"]   # spec 036 layout; never 1000
+    environment:
+      MEDIA_TOOLS_CALLER_TOKENS: /run/secrets
+      OPENROUTER_API_KEY_FILE: /run/secrets/openrouter
+      MEDIA_TOOLS_MAX_JOBS: "1"
+      MEDIA_TOOLS_MAX_WORKERS: "1"
+      MEDIA_TOOLS_RETENTION_HOURS: "720"       # 30 days (owner, D-RET)
+      MEDIA_TOOLS_MAX_DATA_BYTES: "30000000000" # 30 GB (owner, D-RET)
+    secrets:
+      - openrouter
+      - caller-example          # one per calling app: caller-<name>
+    volumes: ["data:/data"]
+    networks: [media_int, media_egress]
+    # No `ports:`. Nothing is published on the host.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+secrets:
+  openrouter:
+    file: /srv/secrets/media-tools/openrouter     # its own vault item, never wf's
+  caller-example:
+    file: /srv/secrets/media-tools/caller-example
+
+volumes:
+  data:
+
+networks:
+  media_int:
+    name: media_int
+    internal: true
+  media_egress:
+    name: media_egress
