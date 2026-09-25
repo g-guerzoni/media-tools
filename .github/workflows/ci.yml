@@ -23,7 +23,30 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install --upgrade pip
-      - run: pip install -e . --group dev
+      - run: pip install -e . --group dev -c constraints.txt
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest -m "not network and not llm and not device" -v
+
+  # The matrix above installs against constraints.txt, so it tests a known set. This
+  # job deliberately does NOT, so an upstream release that breaks the project (or
+  # changes the Deno sandbox flags constraints.txt exists to protect) still shows up
+  # instead of being hidden by the pin. It is allowed to fail: a red canary is a
+  # signal to look, not a reason to block a merge.
+  latest-deps:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e . --group dev
+      # Show what drifted from the pinned set. Comments and blank lines are
+      # stripped first, or the diff would always report the header block.
+      - run: |
+          pip freeze --exclude-editable | sort > /tmp/now.txt
+          grep -vE '^#|^$' constraints.txt > /tmp/pinned.txt
+          diff -u /tmp/pinned.txt /tmp/now.txt || true
+      - run: pytest -m "not network and not llm and not device" -q
