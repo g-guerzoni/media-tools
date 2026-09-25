@@ -458,6 +458,48 @@ the first time an actual Kindle is attached: read-only commands first, then a ba
 then a single book added, then a single book removed and restored. Work through it in
 order, and keep the backup it takes until everything on it has been checked.
 
+## The job API: `media-tools serve`
+
+Other apps on the same host can hand media-tools work over HTTP. The API is for an
+internal Docker network only: it is never exposed to the web.
+
+```bash
+media-tools serve --data /data --tokens /run/secrets   # defaults shown
+```
+
+Each calling app has a token in `<tokens>/caller-<name>` (32+ characters), and `<name>`
+is its identity. An app writes its inputs under `<data>/in/<name>/` and gets its output
+under `<data>/out/<name>/`. It never sees another app's jobs or files.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -d '{"task": "convert", "inputs": ["talk.mp4"],
+      "options": {"to": "mp3"}}' http://media-tools:8080/v1/jobs          # -> 202 {"id": ...}
+curl -H "Authorization: Bearer $TOKEN" http://media-tools:8080/v1/jobs/<id>           # status + result
+curl -H "Authorization: Bearer $TOKEN" "http://media-tools:8080/v1/jobs/<id>/events?after=0"
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://media-tools:8080/v1/jobs/<id> # cancel
+curl http://media-tools:8080/healthz
+```
+
+- **A request is `{task, command?, inputs, options}`.** `task` is one of `compress`,
+  `convert`, `split`, `download` or `ebook`, and `command` is the ebook subcommand.
+  `options` keys are the task's own long flags (`"max-size": "25MB"`,
+  `"no-llm": true`). A job's events are exactly the CLI's `--json` events.
+- **The server owns the output location.** Flags that choose where output goes, or
+  reach a secret, are refused: `output-dir`, `json`, `quiet`, `summary-json` and
+  `op-item`. `ebook kindle` is never reachable through the API.
+- **Inputs are confined.** Every input path, including those inside a `--list` file,
+  must resolve (symlinks followed) inside the caller's input directory.
+- **Limits.** Jobs run `MEDIA_TOOLS_MAX_JOBS` at a time (default 1), and a job's
+  `--workers` is capped at `MEDIA_TOOLS_MAX_WORKERS` (default 1). A job is interrupted
+  after `MEDIA_TOOLS_JOB_TIMEOUT` seconds (default 6 h).
+- **Retention.** A finished job, and its batch, are deleted after
+  `MEDIA_TOOLS_RETENTION_HOURS` (default 720, i.e. 30 days), and so are inputs older
+  than that. When the data root exceeds `MEDIA_TOOLS_MAX_DATA_BYTES` (default 30 GB),
+  new jobs get `507`. `/healthz` fails when the janitor that enforces both has
+  stopped running.
+- **Not a backup.** Everything under the data root is transient. Callers keep copies
+  of what they need.
+
 ## Disabling tasks in a deployment
 
 A deployment can switch tasks off. The prod container image does this for `download`

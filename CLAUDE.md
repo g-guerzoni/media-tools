@@ -449,6 +449,32 @@ media-tools status              # every batch under the output root
 media-tools status <batch>      # one batch: counts, failed items + reasons, pending items
 ```
 
+### `serve`: the internal job API
+
+`media-tools serve` (`tasks/serve/`) is a stdlib HTTP job API for other apps on the
+same host, on an internal network only. The README has the surface. Contracts an
+agent changing it must keep:
+
+- **A job is a subprocess of this CLI** (`python -m media_tools ...`). Its stdout is
+  the job's `events.jsonl`, unchanged, so the event contract above IS the API's event
+  contract. Never re-implement a task inside `serve`.
+- **Requests map to flags through the task's own argparse parser** (`requests.py`):
+  no hand-kept allowlist to drift. `FORBIDDEN_DESTS` lists what a caller may never
+  set. Values are passed as `--flag=value` and positionals after `--`, so no value can
+  become a flag.
+- **Confinement is at the point of use.** `serve` sets `MEDIA_TOOLS_INPUT_ROOT` for
+  every job, and `core.inputs.expand_inputs` refuses any source that resolves outside
+  it. Keep the check there. A check only at submission misses a symlink planted
+  afterwards.
+- **Cancellation is SIGINT to the job's process group**, so the tool's own exit-130
+  path runs. `serve` resets SIGINT to Python's default at startup, because a server
+  started by a non-interactive shell inherits it as *ignored*, and every job would
+  then ignore cancellation.
+- **The janitor is the only code in this project that deletes output**, and only under
+  the data root. It never deletes a batch that a job still inside retention names,
+  nor any batch of a caller with a job queued or running. `/healthz` fails when its
+  last run is older than two sweep intervals.
+
 ### Disabled tasks (deployments)
 
 A deployment can refuse tasks. The disabled set is the UNION of
