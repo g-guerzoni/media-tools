@@ -3,6 +3,10 @@
 **Date:** 2026-09-25
 **Status:** draft. The owner has decided D-NET, the scope and the deploy boundary. The
 decisions marked *proposed* in the table below still wait on the owner.
+MAC_VPS_SEC_REVIEW reviewed `4a01f4f`, and all four of its findings are applied here:
+job scratch moved from tmpfs to the volume; the disabled-task set baked into the image,
+with the environment able only to widen it; the network split in two; and the janitor
+made observable through `/healthz`.
 **Scope:** one self-contained Docker image with no host dependencies, and a small job
 service inside it that other apps on the same host can call. The image runs the same way
 on `vps-remote-desktop` for the owner and the agents.
@@ -37,15 +41,20 @@ resolves secrets, and the tool is installed in a per-checkout `.venv` that is no
 
 ```
 caller app A ─┐                          ┌──────────────── media-tools container ────────────────┐
-caller app B ─┼── media net (internal ──▶│ media-tools serve  (stdlib HTTP, :8080, no host port)   │
-              │   to the host)           │   ├─ auth: bearer token per caller                    │
+caller app B ─┼── media_int ────────────▶│ media-tools serve  (stdlib HTTP, :8080, no host port)   │
+              │   (Internal=true)        │   ├─ auth: bearer token per caller                    │
               │                          │   ├─ job queue (in-process, MAX_JOBS workers)         │
               │                          │   └─ each job = subprocess `media-tools <task> --json`│
-              │                          └──────────────────────┬────────────────────────────────┘
-              └──── mounts the same named volume ───────────────┤ /data
+              │                          └───────────┬──────────────────────────┬────────────────┘
+              │                                      │ media_egress              │
+              │                                      │ (media-tools ONLY)        │
+              │                                      ▼                           │
+              │                           OpenRouter, metadata providers         │
+              └──── mounts the same named volume ────────────────────────────────┤ /data
                                                                 ├─ in/<caller>/...   (caller writes)
                                                                 ├─ out/<caller>/     (per-caller output root)
-                                                                └─ jobs/<id>/        (request, events.jsonl, status)
+                                                                ├─ jobs/<id>/        (request, events.jsonl, status)
+                                                                └─ tmp/<id>/         (the job's TMPDIR and HOME)
 ```
 
 ### The image
@@ -74,13 +83,27 @@ caller app B ─┼── media net (internal ──▶│ media-tools serve  (s
   1.2–1.5 GB. `ebook-convert` in a headless container may need `QT_QPA_PLATFORM=offscreen`;
   verify this rather than assume it.
 
-### Disabling a task: `MEDIA_TOOLS_DISABLED_TASKS`
+### Disabling a task: baked into the image, widened by the environment
 
-A new environment variable holds a comma-separated list: `download`, `ebook-kindle`. The
-prod image sets `MEDIA_TOOLS_DISABLED_TASKS=download,ebook-kindle`, and the local run
-leaves it unset.
+The whole egress design rests on `download` being off in prod. On `vps-default` the
+compose file is writable by the non-root `deploy` principal. So the control must not
+be an environment variable that a compose edit can remove.
 
-- `cli.main` checks the list before dispatch. A disabled task raises `UsageError`, so it
+- **Baked in.** The prod image target writes
+  `/usr/local/share/media-tools/disabled-tasks` (`download`, `ebook-kindle`, one per
+  line) at build time. The file sits on the read-only root filesystem and is part of the
+  digest-pinned image.
+- **Widened, never narrowed.** The disabled set is the **union** of that file and
+  `MEDIA_TOOLS_DISABLED_TASKS` (comma-separated). The environment can disable more
+  tasks. Nothing at runtime can re-enable a task the image disables, so the image
+  defends itself whatever its deployment says.
+- **Gate belt.** The `gate-media-consumers` change proposed below also asserts that
+  the running media-tools container's image is the prod target. A local image carries
+  no file.
+- The **local** image target writes no file, and the local run leaves the variable
+  unset. There, `download` and everything else work.
+
+- `cli.main` checks the set before dispatch. A disabled task raises `UsageError`, so it
   gets the normal `error` (code `usage`) plus `result` pair and exit 2. The message
   names the variable and says the task is disabled in this deployment. The code
   registry does not change.
@@ -114,7 +137,7 @@ endpoints and no body parser beyond `json.loads` with a size cap.
 | `GET` | `/v1/jobs/{id}` | Status, plus the final `result` event once finished |
 | `GET` | `/v1/jobs/{id}/events?after=N` | The job's JSON Lines events from line N, so callers can poll progress |
 | `DELETE` | `/v1/jobs/{id}` | Cancel: SIGINT to the subprocess, so the tool's own exit-130 path runs |
-| `GET` | `/healthz` | `200` when the server is up and the startup `doctor` found nothing `missing` |
+| `GET` | `/healthz` | `200` when the server is up, the startup `doctor` found nothing `missing`, **and the janitor's last successful run is under 2 sweep intervals old**. Reports `janitor_last_run` either way |
 
 Rules:
 
@@ -133,6 +156,13 @@ Rules:
   ebook build cannot take every core.
 - **Timeout:** `MEDIA_TOOLS_JOB_TIMEOUT` (default 6 h) sends SIGINT, then SIGKILL after
   a grace period.
+- **Scratch lives on the volume, not in memory.** Each job runs with `TMPDIR` and
+  `HOME` set to `/data/tmp/<id>/`. Calibre's scratch, ffmpeg intermediates and
+  `tempfile` all land on disk. They count against `MEDIA_TOOLS_MAX_DATA_BYTES` and are
+  removed with the job. A tmpfs would be charged to `mem_limit` and cannot swap under
+  `memswap_limit == mem_limit`, so a job writing large intermediates would OOM the
+  container whatever its RSS. On a host with no spare RAM and ~54 GB free disk, disk
+  is the right side to spend on.
 - **Restart:** job state lives in `/data/jobs/<id>/`. On startup a job found `running` is
   marked `interrupted`. Re-submitting the same request resumes it, because the default
   batch name is a hash of task, options and inputs.
@@ -151,6 +181,10 @@ Rules:
 - **Size bound:** `MEDIA_TOOLS_MAX_DATA_BYTES`. When `/data` is over it, `POST /v1/jobs`
   returns `507` and no job starts. The janitor runs first. Nothing else watches volume
   growth on the host, so the service bounds itself.
+- **The janitor is observable.** Both the retention sweep and the size check live in
+  one thread. If it died, the bound and the cleanup would disappear while the API kept
+  accepting jobs. So `/healthz` fails when its last successful run is stale, and the
+  container's healthcheck turns unhealthy.
 - **Not backed up.** Everything in the volume is transient working data by design.
   Callers keep their own copies of anything they need.
 
@@ -165,7 +199,8 @@ Every item below is required by `vps-gate box` or proposed on top of it:
 ```yaml
 user: "10001:10001"
 read_only: true
-tmpfs: ["/tmp:size=2g,mode=1777"]          # Calibre scratch + HOME
+tmpfs: ["/tmp:size=64m,mode=1777"]         # the server's own tiny scratch only;
+                                          # job scratch is /data/tmp/<id> (see serve)
 environment: {HOME: /tmp/home, MEDIA_TOOLS_OUT: /data/out}
 cap_drop: [ALL]
 security_opt: ["no-new-privileges:true"]
@@ -178,31 +213,45 @@ pids_limit: <measured>
 restart: unless-stopped
 healthcheck: {test: ["CMD", "python3", "-c", "...GET http://127.0.0.1:8080/healthz..."]}
 image: ghcr.io/g-guerzoni/media-tools@sha256:<digest>
-networks: [media]                         # no ports:
+networks: [media_int, media_egress]      # no ports:
 ```
 
 ### Resources
 
-Limits come from **measurement, not estimates**. During implementation, the peak RSS
-and process count of each representative job are measured inside the image with
-`MAX_JOBS=1` and `MAX_WORKERS=1`:
+Limits come from **measurement, not estimates**. During implementation, each
+representative job is run inside the image with `MAX_JOBS=1` and `MAX_WORKERS=1`, and
+the container's own cgroup is sampled: **`memory.peak`** (RSS plus page cache,
+including anything written to tmpfs) and `pids.peak`. Peak RSS alone is not enough,
+because it misses every byte charged to the cgroup that is not process memory. The
+jobs:
 
 - `compress` of a 1080p, 10-minute clip;
 - `split` of a 1 GB file;
 - `ebook build --no-llm` over 200 mixed-format books;
 - `ebook convert` of the largest PDF in the test library.
 
-`mem_limit` = the largest peak × 1.25, rounded up to 128 MiB. The measurements and the
+`mem_limit` = the largest `memory.peak` × 1.25, rounded up to 128 MiB, and
+`pids_limit` = the largest `pids.peak` × 2. The measurements and the
 resulting numbers are recorded in this spec before any compose file is reviewed. The
 owner decides where that memory comes from on `vps-default`.
 
 ### Network
 
-`media` is a dedicated Docker network whose members are media-tools and the registered
-callers. It **cannot be `Internal=true`**, because OpenRouter and the metadata
-providers need egress. That is accepted under D-NET, since no arbitrary-URL fetcher
-exists in prod. Membership needs enforcement, not convention: a
-`gate-media-consumers` registry checked the way rule N6 checks `ai`. That is a
+There are two networks, because Docker egress follows network membership. A single
+non-internal network shared with callers would give every caller a second path to the
+internet.
+
+- **`media_int`**: `Internal=true`. Members are media-tools and the registered callers.
+  It carries only the API traffic, and has the same shape as `ai`.
+- **`media_egress`**: not internal, and **media-tools is its only member**. It carries
+  OpenRouter and the metadata providers. Callers stay off it, so they get reachability
+  without inheriting egress. An RCE in `ebook-convert` finds only media-tools itself
+  on the network that leads out.
+
+This egress is accepted under D-NET, since no arbitrary-URL fetcher exists in prod.
+Membership needs enforcement, not convention: a `gate-media-consumers` registry checked
+the way rule N6 checks `ai`. It asserts that `media_egress` has exactly one member,
+and that the media-tools image is the prod target (see "Disabling a task"). That is a
 `vps-gate` change for MAC_VPS_SEC_REVIEW to review separately. So is registering a
 service that has no hostname or edge route, which the current `gate-registry` schema
 cannot express.
@@ -219,8 +268,9 @@ Two ways, for two jobs:
    `CANDIDATES`, with `rdesk-gate` at 0 fail. **That is a box change and needs the
    owner's approval.**
 2. **Image (prod parity):** `scripts/media-tools-docker`, in the repo, runs the image
-   with the current directory mounted at `/work`, `MEDIA_TOOLS_OUT=/work/media` and
-   `MEDIA_TOOLS_DISABLED_TASKS` unset. So `download` works here too. `compose.local.yml`
+   **local image target** (no baked-in disabled-tasks file) with the current directory
+   mounted at `/work`, `MEDIA_TOOLS_OUT=/work/media` and `MEDIA_TOOLS_DISABLED_TASKS`
+   unset. So `download` works here too. `compose.local.yml`
    runs `serve` with its port published on `127.0.0.1` only, as the box's
    `desktop-ingress-guard` requires, so a local app can be developed against the real
    API.
@@ -237,8 +287,10 @@ Two ways, for two jobs:
 
 ## Testing
 
-- `MEDIA_TOOLS_DISABLED_TASKS`: a disabled task exits 2 with `error`+`result` and runs
-  nothing; `formats`/`doctor` report it; an unset variable changes nothing.
+- Disabled tasks: a disabled task exits 2 with `error`+`result` and runs nothing;
+  `formats`/`doctor` report it; an unset variable changes nothing. **A task in the
+  baked-in file stays disabled when `MEDIA_TOOLS_DISABLED_TASKS` is set to anything,
+  including empty.** The environment can add a task to the set and never remove one.
 - `OPENROUTER_API_KEY_FILE`: it wins over the other sources; an unreadable file is
   `config_missing`, never a crash; the key never appears in any output.
 - `serve`, without Docker, by starting the server on an ephemeral port in-process:
@@ -249,6 +301,8 @@ Two ways, for two jobs:
   - a disabled task gets 403;
   - cancellation reaches the subprocess, and its `result` shows exit code 130;
   - a job found `running` at startup becomes `interrupted`;
+  - a job's `tempfile` scratch lands in `/data/tmp/<id>/` and is removed with the job;
+  - `/healthz` fails once the janitor's last run is stale;
   - retention deletes an expired job and nothing newer;
   - the size bound returns 507.
 - **Image smoke test** in CI: `doctor --json` inside the image reports no `missing`, and
