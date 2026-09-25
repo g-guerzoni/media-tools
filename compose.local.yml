@@ -1,0 +1,40 @@
+# media-tools serve, for developing an app against the real job API on a workstation.
+#
+#   docker build --target local -t media-tools:local .
+#   mkdir -p .secrets && python3 -c "import secrets;print(secrets.token_hex(24))" > .secrets/caller-dev
+#   chmod 0444 .secrets/caller-dev   # compose bind-mounts it as-is; the container user must read it
+#   docker compose -f compose.local.yml up -d
+#   curl -H "Authorization: Bearer $(cat .secrets/caller-dev)" http://127.0.0.1:8080/healthz
+#
+# The local image disables nothing, so `download` works here. The port is published on
+# 127.0.0.1 ONLY: on vps-remote-desktop anything else is dropped by
+# desktop-ingress-guard, and must never be needed. Production does not use this file.
+name: media-tools-local
+
+services:
+  media-tools:
+    image: media-tools:local
+    command: ["serve"]
+    user: "10001:10001"
+    read_only: true
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      MEDIA_TOOLS_CALLER_TOKENS: /run/secrets
+    secrets: [caller-dev]
+    volumes: ["data:/data"]
+    ports: ["127.0.0.1:8080:8080"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+secrets:
+  caller-dev:
+    file: ./.secrets/caller-dev
+
+volumes:
+  data:
