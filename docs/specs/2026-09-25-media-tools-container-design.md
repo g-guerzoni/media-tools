@@ -264,8 +264,28 @@ reported as **"does not fit at this concurrency"**, naming the job that forced i
 rather than as a larger number. `MAX_JOBS=1`, `MAX_WORKERS=1` and `cpus: "1.0"` are
 already the smallest configuration, so there is no other setting left to reduce.
 
+**Measured on one host, sized for another.** Measurement runs on `vps-remote-desktop`,
+and the limit is meant for a production host. The two hosts are identical on every
+setting the measurement depends on (checked 2026-09-25: the first row on this box, the
+second by MAC_VPS_SEC_REVIEW on its box):
+
+| host | vCPU | RAM | kernel | swap | swappiness | cgroup |
+| --- | --- | --- | --- | --- | --- | --- |
+| `vps-remote-desktop` | 2 | 7940 MiB | 6.8.0-142-generic | 8 GiB | 10 | cgroup2 |
+| `vps-default` | 2 | 7940 MiB | 6.8.0-142-generic | 8 GiB | 10 | cgroup2 |
+
+So `memory.stat`, `memory.peak`, `pids.peak`, reclaim and wall times carry across.
+**This is a tripwire:** if the hosts ever differ on any column, the numbers have to be
+re-taken.
+
+**A known leniency.** Step 1 has no memory cap, so a baseline run may use swap, while
+step 3 cannot (`memswap_limit == mem_limit`). A baseline that pages inflates its own
+wall time and makes the 1.5× gate easier to pass. That is the safe direction, so it
+stays. But each step-1 run records whether it swapped (the cgroup's `memory.swap.peak`).
+A baseline that swapped is re-taken on a quieter host, never accepted.
+
 A table in this spec records, for each job, the `anon`, `file`, `shmem`,
-`memory.peak`, `pids.peak`, both wall times, and the validation run's `OOMKilled`. It
+`memory.peak`, `pids.peak`, the baseline's `memory.swap.peak`, both wall times, and the validation run's `OOMKilled`. It
 goes before any compose file is reviewed. The owner decides where that memory comes
 from on `vps-default`.
 
