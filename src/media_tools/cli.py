@@ -15,10 +15,20 @@ from media_tools.core.events import (
     Reporter,
 )
 from media_tools.core.runner import empty_result
-from media_tools.tasks import compress, convert, doctor, download, ebook, formats, split, status
+from media_tools.tasks import (
+    compress,
+    convert,
+    doctor,
+    download,
+    ebook,
+    formats,
+    serve,
+    split,
+    status,
+)
 from media_tools.tasks.common import UsageError
 
-TASKS = [compress, convert, split, download, ebook, formats, doctor, status]
+TASKS = [compress, convert, split, download, ebook, formats, doctor, status, serve]
 
 
 class _JSONAwareArgumentParser(argparse.ArgumentParser):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,19 @@ from media_tools.core.paths import RESERVED_ROOT_ENTRIES
 
 class InputError(ValueError):
     """Raised when the given inputs cannot be used."""
+
+
+# Set by `media-tools serve` for every job it runs: the caller's own input directory.
+# Every source must resolve, symlinks followed, inside it. Checked here, where the
+# sources are decided, rather than only when the API accepts the request, so that a
+# symlink planted after submission, or a folder scan, still cannot reach out of it.
+INPUT_ROOT_ENV = "MEDIA_TOOLS_INPUT_ROOT"
+
+
+def _confine(sources: list[Source], root: Path) -> None:
+    for source in sources:
+        if not _is_inside(source.path, root):
+            raise InputError(f"input resolves outside the permitted input directory: {source.path}")
 
 
 @dataclass(frozen=True)
@@ -107,6 +121,9 @@ def expand_inputs(
                 continue
             sources.append(Source(path=candidate, root=given))
 
+    confine_to = os.environ.get(INPUT_ROOT_ENV)
+    if confine_to:
+        _confine(sources, Path(confine_to))
     sources.sort(key=lambda s: str(s.path).lower())
     if include:
         needle = include.lower()
