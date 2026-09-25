@@ -35,6 +35,7 @@ resolves secrets, and the tool is installed in a per-checkout `.venv` that is no
 | D-FILES | How do files move? | Through a shared named volume. There is no upload endpoint. | *proposed* |
 | D-AUTH | How is a caller identified? | One bearer token per calling app, each read from its own secret file. | *proposed* |
 | D-RET | How long is data kept? | 72 h per job, plus a hard size cap on the volume. | *proposed* |
+| D-CEIL | What is the most memory the container may ever ask for? | `MEM_CEILING`, the stop condition for sizing (see "Resources") | *owner to set* |
 | D-LOCAL | How does the box run it? | The native `.venv` put on `PATH` (full features, including Kindle and `download`), plus the same image through a wrapper script. | *proposed* |
 
 ## Architecture
@@ -225,8 +226,13 @@ reclaims under pressure rather than OOM-killing. `memory.peak` counts that cache
 its own it over-sizes the limit. On a host with no spare memory, over-sizing is not the
 safe direction: the number feeds a capacity decision, and its precision is the point.
 
-**Step 1, measure.** Each representative job runs inside the image with `MAX_JOBS=1`
-and `MAX_WORKERS=1`. The container's cgroup is sampled for:
+**The general rule: the metric has to follow the architecture, and each comparison
+moves one variable.** A measurement where two variables change at once cannot support a
+conclusion about either.
+
+**Step 1, measure.** Each representative job runs inside the image with `MAX_JOBS=1`,
+`MAX_WORKERS=1` and **`cpus: "1.0"`**, the same CPU cap it will have in prod, but with
+no memory cap. The container's cgroup is sampled for:
 
 - `memory.stat`: `anon`, `file`, `shmem`, at their peaks;
 - `memory.peak`, kept as a sanity ceiling;
@@ -246,9 +252,17 @@ largest `pids.peak` × 2.
 **Step 3, prove.** Every representative job is re-run with the candidate
 `mem_limit`, `memswap_limit` and `cpus: "1.0"` applied. The candidate stands only when
 every job completes, `docker inspect` reports `OOMKilled=false`, and wall time is within
-1.5× of the unconstrained run, so reclaim does not turn into thrashing. If a job fails
-this, the cap goes up by 128 MiB and step 3 repeats. The inferred number is a
-hypothesis; the run is the evidence.
+1.5× of its step-1 run. Both runs have the same CPU cap, so the only difference between
+them is the memory cap, and a slowdown can be blamed on reclaim turning into
+thrashing. If a job fails this, the cap goes up by 128 MiB and step 3 repeats. The
+inferred number is a hypothesis; the run is the evidence.
+
+**Stop condition.** The loop never goes above **`MEM_CEILING`** (decision D-CEIL, set
+by the owner from what could plausibly be freed on the target host, not from what is
+free today). If a candidate would exceed it, measurement stops. The result is then
+reported as **"does not fit at this concurrency"**, naming the job that forced it,
+rather than as a larger number. `MAX_JOBS=1`, `MAX_WORKERS=1` and `cpus: "1.0"` are
+already the smallest configuration, so there is no other setting left to reduce.
 
 A table in this spec records, for each job, the `anon`, `file`, `shmem`,
 `memory.peak`, `pids.peak`, both wall times, and the validation run's `OOMKilled`. It
