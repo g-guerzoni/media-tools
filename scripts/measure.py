@@ -56,6 +56,21 @@ def _stat(cgroup: Path) -> dict[str, int]:
     return values
 
 
+def _host() -> tuple[int, int]:
+    """(MemAvailable in bytes, pages swapped in+out since boot) for the whole host."""
+    avail = swapped = 0
+    with open("/proc/meminfo") as meminfo:
+        for line in meminfo:
+            if line.startswith("MemAvailable:"):
+                avail = int(line.split()[1]) * 1024
+    with open("/proc/vmstat") as vmstat:
+        for line in vmstat:
+            key, _, value = line.partition(" ")
+            if key in ("pswpin", "pswpout"):
+                swapped += int(value)
+    return avail, swapped
+
+
 def _parse_time(stamp: str) -> datetime:
     # Docker reports nanoseconds; fromisoformat takes at most microseconds.
     head, _, frac = stamp.rstrip("Z").partition(".")
@@ -69,6 +84,13 @@ def main() -> int:
     parser.add_argument("--memory", help="memory cap (step 3); memswap is set equal")
     parser.add_argument("--cpus", default="1.0")
     parser.add_argument("--label", default="")
+    parser.add_argument(
+        "--min-host-available",
+        type=int,
+        default=500,
+        help="MiB; below this the job is stopped and the row marked aborted (default 500). "
+        "This box is also a desktop: a measurement must never starve it.",
+    )
     parser.add_argument("job", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     job = args.job[1:] if args.job[:1] == ["--"] else args.job
@@ -90,6 +112,10 @@ def main() -> int:
     cid = _docker(*run, args.image, *job)
     cgroup = CGROUP_ROOT / f"docker-{cid}.scope"
 
+    mib = 1024 * 1024
+    floor = args.min_host_available * mib
+    host_min, swap_start = _host()
+    aborted = False
     peaks = dict.fromkeys(STAT_KEYS, 0)
     watermarks: dict[str, int | None] = {}
     while True:
@@ -100,9 +126,15 @@ def main() -> int:
             value = _read_int(cgroup / name)
             if value is not None:
                 watermarks[name] = value
+        avail, _ = _host()
+        host_min = min(host_min, avail)
+        if avail < floor and not aborted:
+            aborted = True
+            _docker("stop", "-t", "30", cid)
         if _docker("inspect", "--format", "{{.State.Running}}", cid) != "true":
             break
         time.sleep(SAMPLE_S)
+    host_swap_pages = _host()[1] - swap_start
 
     state = json.loads(_docker("inspect", "--format", "{{json .State}}", cid))
     logs = subprocess.run(["docker", "logs", cid], capture_output=True, text=True).stdout
@@ -114,7 +146,6 @@ def main() -> int:
         result = json.loads(last)
     except json.JSONDecodeError:
         result = {}
-    mib = 1024 * 1024
     row = {
         "label": args.label,
         "job": " ".join(job),
@@ -130,6 +161,11 @@ def main() -> int:
         "memory_peak_mib": round((watermarks.get("memory.peak") or 0) / mib, 1),
         "swap_peak_mib": round((watermarks.get("memory.swap.peak") or 0) / mib, 1),
         "pids_peak": watermarks.get("pids.peak"),
+        # Host conditions: a run during which the host swapped, or that had to be
+        # stopped to protect the desktop, is not a valid baseline.
+        "host_available_min_mib": round(host_min / mib, 1),
+        "host_swap_pages": host_swap_pages,
+        "aborted_host_pressure": aborted,
     }
     print(json.dumps(row))
     return 0
