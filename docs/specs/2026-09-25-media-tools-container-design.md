@@ -290,6 +290,62 @@ A table in this spec records, for each job, the `anon`, `file`, `shmem`,
 goes before any compose file is reviewed. The owner decides where that memory comes
 from on `vps-default`.
 
+### Measured (2026-09-25/26)
+
+Measured with `scripts/measure.py` on `vps-remote-desktop`, using the `local` image
+built from `7721f0d`. The prod image differs only in its baked disabled-tasks file and
+its default command. Every run used `cpus: "1.0"`, `MAX_WORKERS=1`, a read-only root,
+`cap_drop: ALL`, and scratch on the volume.
+
+**Step 1: no memory cap.**
+
+| job | anon | shmem | file | memory.peak | swap.peak | pids.peak | wall |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `compress`, 1080p, 10 min, 986 MB | **614.6 MiB** | 0.0 | 1268.1 MiB | 1901.3 MiB | 0.0 | 22 | 3667.3 s |
+| `ebook build --no-llm`, 201 books (azw3, 223 MB) | 326.7 MiB | 0.0 | 495.1 MiB | 667.6 MiB | 0.0 | 19 | 2105.4 s |
+| `convert --to epub`, largest book (13.7 MB) | 100.8 MiB | 0.0 | 40.0 MiB | 149.1 MiB | 0.0 | 6 | 3.5 s |
+| `split --max-size 25MB`, 986 MB | 26.9 MiB | 0.0 | 973.6 MiB | 1028.5 MiB | 0.0 | 6 | 6.3 s |
+
+**Candidates.** `mem_limit` = (614.6 + 0.0) × 1.25 = 768.25, rounded up to the next
+128 MiB = **896 MiB**. `pids_limit` = 22 × 2 = **44**.
+
+**Step 3: `mem_limit` = `memswap_limit` = 896 MiB.**
+
+| job | exit | OOMKilled | memory.peak | anon | file | wall | vs step 1 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `compress` | 0 | false | 896.0 MiB | 613.7 MiB | 281.6 MiB | 3436.2 s | 0.94× |
+| `ebook build` | 0 | false | 594.6 MiB | 297.9 MiB | 427.4 MiB | 1910.0 s | 0.91× |
+| `convert`, largest | 0 | false | 149.2 MiB | 100.8 MiB | 40.7 MiB | 3.6 s | 1.03× |
+| `split` | 0 | false | 896.0 MiB | 26.9 MiB | 856.9 MiB | 8.1 s | 1.29× |
+
+**Result: 896 MiB and 44 pids stand.** Every job completed, none was OOM-killed, and
+none exceeded 1.5× its step-1 wall time.
+
+**How to read this:**
+
+- **`file` is not a requirement.** Page cache grows to fill whatever memory is spare,
+  and is evicted under pressure. `compress` held 1.27 GB of it unconstrained and
+  281.6 MiB under the cap, and ran in 0.94× the time: the cap costs it nothing.
+  Do not "fix" a `mem_limit` below a job's unconstrained `file` column.
+- **Host state.**
+  - The first `compress` baseline swapped (40.3 MiB) while sharing the box with a test
+    suite, and was discarded per the rule above. Its re-take started with 4494 MiB
+    available on the host.
+  - Host available memory never fell below 3197 MiB in any run that counted, and no
+    run was aborted by the host guard.
+  - The host itself swapped during the long runs: 36626 pages during the capped
+    `compress`, 22337 during the `ebook build` baseline. The cgroups did not.
+- **The `ebook build` pair is not a clean one-variable comparison.** The step-3 run
+  reused the metadata and cover caches the step-1 run had filled, so it made no
+  cover-fetch calls (pids 6 against 19), and its 0.91× is partly that. Its memory
+  conclusion holds with room to spare: anon 297.9 MiB against a 896 MiB cap.
+- **Not measured: a PDF.** The owner's sample held no PDF, and PDF is Calibre's
+  heaviest input. A large PDF should be run through step 3 before this limit is
+  trusted for PDF-heavy work.
+
+**Stop condition (D-CEIL).** The owner is to set `MEM_CEILING` from this table. No
+step-3 iteration was needed, so no run has approached any ceiling yet.
+
 ### Network
 
 There are two networks, because Docker egress follows network membership. A single

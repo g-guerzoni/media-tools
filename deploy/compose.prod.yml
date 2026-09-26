@@ -16,7 +16,7 @@ name: media-tools
 
 services:
   media-tools:
-    image: ghcr.io/g-guerzoni/media-tools@sha256:<digest of the reviewed prod image>
+    image: ghcr.io/g-guerzoni/media-tools@sha256:23a01c7b285afbfc49cced44b51f0ad5e31ab55ef7a0342397c9c0b399e4659a  # main 5d63139
     command: ["serve"]
     user: "10001:10001"
     read_only: true
@@ -25,12 +25,12 @@ services:
     tmpfs: ["/tmp:size=64m,mode=1777"]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    mem_limit: <measured; see the spec's Resources table>
+    mem_limit: 896m        # measured: spec, "Resources" -> "Measured"
     # No swap: a CPU-bound batch job that pages slows the live app next to it; an OOM
     # kill is a clean, retryable job failure instead.
-    memswap_limit: <same as mem_limit>
+    memswap_limit: 896m
     cpus: "1.0"          # leaves a core for the host's web app
-    pids_limit: <measured pids.peak x 2>
+    pids_limit: 44         # pids.peak 22 x 2
     restart: unless-stopped
     group_add: ["<gid owning /srv/secrets/media-tools>"]   # spec 036 layout; never 1000
     environment:
